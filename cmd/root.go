@@ -11,8 +11,8 @@ func Run(args []string) error {
 	}
 
 	switch args[0] {
-	case "init":
-		return runInit(args[1:])
+	case "app":
+		return runApp(args[1:])
 	case "version", "--version", "-v":
 		fmt.Println("mirrorstack", version)
 		return nil
@@ -24,14 +24,64 @@ func Run(args []string) error {
 	}
 }
 
+func runApp(args []string) error {
+	if len(args) == 0 {
+		printAppUsage()
+		return nil
+	}
+
+	switch args[0] {
+	case "module":
+		return runAppModule(args[1:])
+	case "help", "--help", "-h":
+		printAppUsage()
+		return nil
+	default:
+		return fmt.Errorf("unknown command: mirrorstack app %s\nRun 'mirrorstack app help' for usage", args[0])
+	}
+}
+
+func runAppModule(args []string) error {
+	if len(args) == 0 {
+		printAppModuleUsage()
+		return nil
+	}
+
+	switch args[0] {
+	case "init":
+		return runInit(args[1:])
+	case "help", "--help", "-h":
+		printAppModuleUsage()
+		return nil
+	default:
+		return fmt.Errorf("unknown command: mirrorstack app module %s\nRun 'mirrorstack app module help' for usage", args[0])
+	}
+}
+
 func printUsage() {
-	fmt.Println(`MirrorStack CLI — scaffold, develop, and deploy modules
+	fmt.Println(`MirrorStack CLI
 
 Usage:
-  mirrorstack <command> [arguments]
+  mirrorstack <command>
 
 Commands:
-  init <name>     Scaffold a new module
-  version         Show CLI version
-  help            Show this help`)
+  app         App and module management
+  version     Show CLI version
+  help        Show this help`)
+}
+
+func printAppUsage() {
+	fmt.Println(`Usage:
+  mirrorstack app <command>
+
+Commands:
+  module      Module management`)
+}
+
+func printAppModuleUsage() {
+	fmt.Println(`Usage:
+  mirrorstack app module <command>
+
+Commands:
+  init <name>     Scaffold a new module`)
 }

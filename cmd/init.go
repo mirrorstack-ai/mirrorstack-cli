@@ -8,7 +8,7 @@ import (
 
 func runInit(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: mirrorstack init <module-name>")
+		return fmt.Errorf("usage: mirrorstack app module init <module-name>")
 	}
 
 	name := args[0]
