@@ -22,23 +22,35 @@ fn pkce_unique_across_calls() {
 
 #[test]
 fn authorize_url_carries_required_params() {
-    let p = Pkce { verifier: "v".into(), challenge: "abc".into() };
+    let p = Pkce {
+        verifier: "v".into(),
+        challenge: "abc".into(),
+    };
     let raw = authorize_url("https://example.com", "STATE", &p);
     let u = url::Url::parse(&raw).expect("parse");
     assert_eq!(u.path(), "/authorize");
 
     let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
     assert_eq!(q.get("client_id").map(String::as_str), Some(CLIENT_ID));
-    assert_eq!(q.get("redirect_uri").map(String::as_str), Some(REDIRECT_URI));
+    assert_eq!(
+        q.get("redirect_uri").map(String::as_str),
+        Some(REDIRECT_URI)
+    );
     assert_eq!(q.get("response_type").map(String::as_str), Some("code"));
     assert_eq!(q.get("code_challenge").map(String::as_str), Some("abc"));
-    assert_eq!(q.get("code_challenge_method").map(String::as_str), Some("S256"));
+    assert_eq!(
+        q.get("code_challenge_method").map(String::as_str),
+        Some("S256")
+    );
     assert_eq!(q.get("state").map(String::as_str), Some("STATE"));
 }
 
 #[test]
 fn authorize_url_trims_trailing_slash() {
-    let p = Pkce { verifier: "v".into(), challenge: "c".into() };
+    let p = Pkce {
+        verifier: "v".into(),
+        challenge: "c".into(),
+    };
     let raw = authorize_url("https://example.com/", "s", &p);
     assert!(
         raw.starts_with("https://example.com/authorize?"),
@@ -79,7 +91,10 @@ mod exchange {
             )
             .create();
 
-        let pkce = Pkce { verifier: "VERIFIER".into(), challenge: "C".into() };
+        let pkce = Pkce {
+            verifier: "VERIFIER".into(),
+            challenge: "C".into(),
+        };
         let tr = exchange_code(&http(), &server.url(), "AUTHCODE", &pkce).expect("ok");
         m.assert();
         assert_eq!(tr.access_token, "AT");
@@ -106,7 +121,10 @@ mod exchange {
                 &http(),
                 &server.url(),
                 "X",
-                &Pkce { verifier: "v".into(), challenge: "c".into() },
+                &Pkce {
+                    verifier: "v".into(),
+                    challenge: "c".into(),
+                },
             )
             .unwrap_err();
             let actual = format!("{err:?}");
@@ -130,7 +148,10 @@ mod exchange {
             &http(),
             &server.url(),
             "X",
-            &Pkce { verifier: "v".into(), challenge: "c".into() },
+            &Pkce {
+                verifier: "v".into(),
+                challenge: "c".into(),
+            },
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::Server { .. }), "got {err:?}");
@@ -149,9 +170,15 @@ mod exchange {
             &http(),
             &server.url(),
             "X",
-            &Pkce { verifier: "v".into(), challenge: "c".into() },
+            &Pkce {
+                verifier: "v".into(),
+                challenge: "c".into(),
+            },
         )
         .unwrap_err();
-        assert!(matches!(err, AuthError::Other { ref code, .. } if code == "made_up"), "got {err:?}");
+        assert!(
+            matches!(err, AuthError::Other { ref code, .. } if code == "made_up"),
+            "got {err:?}"
+        );
     }
 }

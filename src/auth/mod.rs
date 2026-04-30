@@ -44,7 +44,10 @@ impl Pkce {
     pub fn generate() -> Result<Self, AuthError> {
         let verifier = random_b64url(32)?;
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-        Ok(Self { verifier, challenge })
+        Ok(Self {
+            verifier,
+            challenge,
+        })
     }
 }
 

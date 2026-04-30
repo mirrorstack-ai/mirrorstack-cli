@@ -50,7 +50,9 @@ pub fn save(creds: &Credentials) -> Result<()> {
 
     let mut tmp = NamedTempFile::new_in(parent).context("credentials: tempfile")?;
     let json = serde_json::to_vec_pretty(creds).context("credentials: encode")?;
-    tmp.as_file_mut().write_all(&json).context("credentials: write")?;
+    tmp.as_file_mut()
+        .write_all(&json)
+        .context("credentials: write")?;
     tmp.as_file_mut().flush().context("credentials: flush")?;
 
     #[cfg(unix)]

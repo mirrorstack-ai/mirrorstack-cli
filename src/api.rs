@@ -37,9 +37,7 @@ pub enum ApiError {
 /// GET /v1/auth/me — returns the authenticated user's identity.
 pub fn me(api_base: &str, access_token: &str) -> Result<Identity, ApiError> {
     let endpoint = format!("{}/v1/auth/me", api_base.trim_end_matches('/'));
-    let http = Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()?;
+    let http = Client::builder().timeout(Duration::from_secs(15)).build()?;
 
     let resp = http
         .get(&endpoint)
