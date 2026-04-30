@@ -15,7 +15,12 @@ import (
 )
 
 const (
-	defaultAPIBase = "https://account.mirrorstack.ai"
+	// defaultAPIBase is the api-platform service. Distinct from the web
+	// frontend at defaultWebBase — the CLI talks to the API directly.
+	defaultAPIBase = "https://api.mirrorstack.ai"
+	// defaultWebBase is the account.mirrorstack.ai consent page. The CLI
+	// only sends the user here to approve; it never POSTs against this
+	// host itself.
 	defaultWebBase = "https://account.mirrorstack.ai"
 )
 
@@ -30,7 +35,7 @@ Sign in to MirrorStack via OAuth.
 
 Environment overrides (for local development):
   MIRRORSTACK_API_URL    API base URL (default ` + defaultAPIBase + `)
-  MIRRORSTACK_WEB_URL    Web base URL (default = API)`)
+  MIRRORSTACK_WEB_URL    Web base URL (default ` + defaultWebBase + `)`)
 			return nil
 		default:
 			return fmt.Errorf("login: unexpected argument %q (run `mirrorstack login help`)", args[0])
@@ -41,9 +46,7 @@ Environment overrides (for local development):
 	if v := os.Getenv("MIRRORSTACK_API_URL"); v != "" {
 		apiBase = v
 	}
-	// Web is co-located with the API service in production. Override
-	// independently when running against a split local dev setup.
-	webBase := apiBase
+	webBase := defaultWebBase
 	if v := os.Getenv("MIRRORSTACK_WEB_URL"); v != "" {
 		webBase = v
 	}
