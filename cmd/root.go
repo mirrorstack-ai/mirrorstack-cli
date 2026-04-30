@@ -13,6 +13,8 @@ func Run(args []string) error {
 	switch args[0] {
 	case "app":
 		return runApp(args[1:])
+	case "login":
+		return runLogin(args[1:])
 	case "version", "--version", "-v":
 		fmt.Println("mirrorstack", version)
 		return nil
@@ -65,6 +67,7 @@ Usage:
   mirrorstack <command>
 
 Commands:
+  login       Sign in to MirrorStack
   app         App and module management
   version     Show CLI version
   help        Show this help`)
