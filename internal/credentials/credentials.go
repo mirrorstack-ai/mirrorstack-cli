@@ -1,9 +1,11 @@
 // Package credentials reads and writes the CLI's persisted OAuth tokens.
 //
-// File location is os.UserConfigDir() + "/mirrorstack/credentials.json"
+// File location is os.UserConfigDir() + "/mirrorstack/cli/credentials.json"
 // (~/.config on Linux, ~/Library/Application Support on macOS,
-// %APPDATA% on Windows). Mode 0600 — same trust level as ~/.aws/credentials
-// and ~/.npmrc.
+// %APPDATA% on Windows). The `cli` segment namespaces this away from
+// any future MirrorStack tools (SDKs, daemons, GUIs) that might also
+// want config under ~/.config/mirrorstack/. Mode 0600 — same trust
+// level as ~/.aws/credentials.
 package credentials
 
 import (
@@ -34,7 +36,7 @@ func Path() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("credentials: locate config dir: %w", err)
 	}
-	return filepath.Join(dir, "mirrorstack", "credentials.json"), nil
+	return filepath.Join(dir, "mirrorstack", "cli", "credentials.json"), nil
 }
 
 // Save writes creds atomically with mode 0600. Atomic = write to a

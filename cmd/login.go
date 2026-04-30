@@ -37,10 +37,16 @@ Environment overrides (for local development):
 		}
 	}
 
-	apiBase := getenvOr("MIRRORSTACK_API_URL", defaultAPIBase)
+	apiBase := defaultAPIBase
+	if v := os.Getenv("MIRRORSTACK_API_URL"); v != "" {
+		apiBase = v
+	}
 	// Web is co-located with the API service in production. Override
 	// independently when running against a split local dev setup.
-	webBase := getenvOr("MIRRORSTACK_WEB_URL", apiBase)
+	webBase := apiBase
+	if v := os.Getenv("MIRRORSTACK_WEB_URL"); v != "" {
+		webBase = v
+	}
 
 	pkce, err := auth.NewPKCE()
 	if err != nil {
@@ -108,9 +114,3 @@ func readLine(r *os.File) (string, error) {
 	return s.Text(), nil
 }
 
-func getenvOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}

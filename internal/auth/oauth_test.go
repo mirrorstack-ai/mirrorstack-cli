@@ -128,18 +128,63 @@ func TestExchangeCode_InvalidGrant(t *testing.T) {
 	}
 }
 
-func TestExchangeCode_OtherError(t *testing.T) {
+func TestExchangeCode_TypedSentinels(t *testing.T) {
+	cases := []struct {
+		oauthError string
+		want       error
+	}{
+		{"invalid_grant", ErrInvalidGrant},
+		{"invalid_request", ErrInvalidRequest},
+		{"invalid_client", ErrInvalidClient},
+		{"unsupported_grant_type", ErrUnsupportedGrant},
+	}
+	for _, tc := range cases {
+		t.Run(tc.oauthError, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error":             tc.oauthError,
+					"error_description": "test",
+				})
+			}))
+			defer srv.Close()
+
+			_, err := ExchangeCode(srv.Client(), srv.URL, "X", PKCE{Verifier: "v"})
+			if !errors.Is(err, tc.want) {
+				t.Errorf("got %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestExchangeCode_ServerError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
+		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"error":             "invalid_request",
-			"error_description": "missing client_id",
+			"error":             "server_error",
+			"error_description": "boom",
 		})
 	}))
 	defer srv.Close()
 
 	_, err := ExchangeCode(srv.Client(), srv.URL, "X", PKCE{Verifier: "v"})
-	if err == nil || !strings.Contains(err.Error(), "invalid_request") {
-		t.Errorf("got %v, want error containing invalid_request", err)
+	if !errors.Is(err, ErrServerError) {
+		t.Errorf("got %v, want ErrServerError", err)
+	}
+}
+
+func TestExchangeCode_UnknownError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error":             "made_up_code",
+			"error_description": "x",
+		})
+	}))
+	defer srv.Close()
+
+	_, err := ExchangeCode(srv.Client(), srv.URL, "X", PKCE{Verifier: "v"})
+	if err == nil || !strings.Contains(err.Error(), "made_up_code") {
+		t.Errorf("got %v, want error containing made_up_code", err)
 	}
 }

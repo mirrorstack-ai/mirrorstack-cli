@@ -131,15 +131,19 @@ func ExchangeCode(httpClient *http.Client, apiBase, code string, p PKCE) (TokenR
 		return tr, nil
 	}
 
-	// Try to parse RFC 6749 §5.2 error body so we can map invalid_grant
-	// to ErrInvalidGrant.
+	// Parse RFC 6749 §5.2 error body and map known codes to typed
+	// sentinels so callers can branch (login command swaps in friendly
+	// messages; future commands may retry on transient server errors).
 	var errBody struct {
 		Error            string `json:"error"`
 		ErrorDescription string `json:"error_description"`
 	}
 	_ = json.Unmarshal(body, &errBody)
-	if errBody.Error == "invalid_grant" {
-		return TokenResponse{}, ErrInvalidGrant
+	if sentinel, ok := errSentinels[errBody.Error]; ok {
+		return TokenResponse{}, sentinel
+	}
+	if resp.StatusCode >= 500 {
+		return TokenResponse{}, fmt.Errorf("%w: %d %s", ErrServerError, resp.StatusCode, errBody.ErrorDescription)
 	}
 	if errBody.Error != "" {
 		return TokenResponse{}, fmt.Errorf("auth: %s: %s", errBody.Error, errBody.ErrorDescription)
@@ -147,10 +151,24 @@ func ExchangeCode(httpClient *http.Client, apiBase, code string, p PKCE) (TokenR
 	return TokenResponse{}, fmt.Errorf("auth: unexpected response %d: %s", resp.StatusCode, string(body))
 }
 
-// ErrInvalidGrant maps to the OAuth invalid_grant error. The login
-// command catches this to suggest re-running rather than dumping a
-// raw protocol error.
-var ErrInvalidGrant = errors.New("auth: code is invalid, expired, or already used")
+// Typed errors map to the RFC 6749 §5.2 token-endpoint error codes
+// callers may want to distinguish. ErrServerError covers 5xx responses
+// regardless of whether they carry an OAuth error body — useful when
+// future commands want to retry on transient failures.
+var (
+	ErrInvalidGrant        = errors.New("auth: code is invalid, expired, or already used")
+	ErrInvalidRequest      = errors.New("auth: malformed token request")
+	ErrInvalidClient       = errors.New("auth: client authentication failed")
+	ErrUnsupportedGrant    = errors.New("auth: grant_type not supported")
+	ErrServerError         = errors.New("auth: server error")
+)
+
+var errSentinels = map[string]error{
+	"invalid_grant":          ErrInvalidGrant,
+	"invalid_request":        ErrInvalidRequest,
+	"invalid_client":         ErrInvalidClient,
+	"unsupported_grant_type": ErrUnsupportedGrant,
+}
 
 func randomB64URL(n int) (string, error) {
 	b := make([]byte, n)
