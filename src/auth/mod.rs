@@ -5,15 +5,22 @@
 //! displayed on the consent page back into the terminal. Custom-scheme
 //! and per-OS handler registration is the follow-up tracked at #7.
 
+use std::io::Read;
+
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::TryRngCore;
 use rand::rngs::OsRng;
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
+
+/// Cap on response bodies we'll deserialize. /token and /me return
+/// sub-1KB JSON in practice; 64 KiB is generous slack and protects
+/// against a hostile endpoint trying to OOM the CLI.
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
 /// Identifies the CLI to the platform; matches the seed in
 /// api-platform migration `011_oauth.up.sql`.
@@ -99,13 +106,16 @@ pub fn exchange_code(
         .map_err(AuthError::Http)?;
 
     let status = resp.status();
-    let body = resp.text().map_err(AuthError::Http)?;
 
     if status.is_success() {
-        return serde_json::from_str(&body).map_err(|e| AuthError::Decode(e.to_string()));
+        return resp
+            .json::<TokenResponse>()
+            .map_err(|e| AuthError::Decode(e.to_string()));
     }
 
     // RFC 6749 §5.2 error body — map known codes to typed sentinels.
+    // Cap body so a hostile endpoint can't OOM us with a giant response.
+    let body = read_capped(resp)?;
     let parsed: ErrorBody = serde_json::from_str(&body).unwrap_or_default();
     match parsed.error.as_deref() {
         Some("invalid_grant") => Err(AuthError::InvalidGrant),
@@ -161,6 +171,17 @@ fn random_b64url(n: usize) -> Result<String, AuthError> {
     let mut buf = vec![0u8; n];
     OsRng.try_fill_bytes(&mut buf).map_err(AuthError::Random)?;
     Ok(URL_SAFE_NO_PAD.encode(buf))
+}
+
+/// Read a response body into memory with a hard size cap. Truncated
+/// bodies are returned as-is — the JSON parse downstream will fail
+/// loudly rather than silently misinterpret a partial document.
+fn read_capped(resp: Response) -> Result<String, AuthError> {
+    let mut buf = Vec::with_capacity(1024);
+    resp.take(MAX_RESPONSE_BYTES)
+        .read_to_end(&mut buf)
+        .map_err(|e| AuthError::Decode(e.to_string()))?;
+    String::from_utf8(buf).map_err(|e| AuthError::Decode(e.to_string()))
 }
 
 #[cfg(test)]

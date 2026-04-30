@@ -17,10 +17,7 @@ use crate::auth::{self, AuthError};
 use crate::browser;
 use crate::credentials::{self, Credentials};
 
-const DEFAULT_API_BASE: &str = "https://api.mirrorstack.ai";
-const DEFAULT_WEB_BASE: &str = "https://account.mirrorstack.ai";
-const ENV_API_URL: &str = "MIRRORSTACK_API_URL";
-const ENV_WEB_URL: &str = "MIRRORSTACK_WEB_URL";
+use super::{DEFAULT_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_WEB_URL};
 
 #[derive(Args)]
 pub struct LoginArgs {}

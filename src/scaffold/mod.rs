@@ -3,6 +3,7 @@
 //! a TS web frontend skeleton.
 
 use std::fs;
+use std::io;
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
@@ -12,8 +13,16 @@ mod validate;
 
 pub fn run_init(name: &str) -> Result<()> {
     validate::name(name)?;
-    if Path::new(name).exists() {
-        return Err(anyhow!("directory {name:?} already exists"));
+
+    // Try to create the root directory first; if it already exists,
+    // refuse rather than scribbling files over a non-empty tree. This
+    // sidesteps the TOCTOU pre-check `Path::exists()` would have made.
+    match fs::create_dir(name) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(anyhow!("directory {name:?} already exists"));
+        }
+        Err(e) => return Err(e).with_context(|| format!("create dir {name}")),
     }
 
     println!("Creating module: {name}\n");

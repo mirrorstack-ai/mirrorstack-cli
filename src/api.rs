@@ -1,11 +1,14 @@
 //! Authenticated calls to the api-platform account service. Endpoints
 //! that require a session expect `Authorization: Bearer <access_token>`.
 
+use std::io::Read;
 use std::time::Duration;
 
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use thiserror::Error;
+
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)] // profile_url is part of the API surface; whoami doesn't print it yet
@@ -29,8 +32,6 @@ pub enum ApiError {
     Decode(#[from] serde_json::Error),
     #[error("api: unexpected response {status}: {body}")]
     Unexpected { status: u16, body: String },
-    #[error("api: build HTTP client")]
-    BuildClient,
 }
 
 /// GET /v1/auth/me — returns the authenticated user's identity.
@@ -38,8 +39,7 @@ pub fn me(api_base: &str, access_token: &str) -> Result<Identity, ApiError> {
     let endpoint = format!("{}/v1/auth/me", api_base.trim_end_matches('/'));
     let http = Client::builder()
         .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|_| ApiError::BuildClient)?;
+        .build()?;
 
     let resp = http
         .get(&endpoint)
@@ -48,14 +48,22 @@ pub fn me(api_base: &str, access_token: &str) -> Result<Identity, ApiError> {
         .send()?;
 
     let status = resp.status();
-    let body = resp.text()?;
 
     if status.is_success() {
-        return Ok(serde_json::from_str(&body)?);
+        return Ok(resp.json::<Identity>()?);
     }
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         return Err(ApiError::Unauthenticated);
     }
+    // Bound the error-path body so a hostile endpoint can't OOM us.
+    let mut body = Vec::with_capacity(1024);
+    resp.take(MAX_RESPONSE_BYTES)
+        .read_to_end(&mut body)
+        .map_err(|e| ApiError::Unexpected {
+            status: status.as_u16(),
+            body: format!("(read body failed: {e})"),
+        })?;
+    let body = String::from_utf8_lossy(&body).into_owned();
     Err(ApiError::Unexpected {
         status: status.as_u16(),
         body,

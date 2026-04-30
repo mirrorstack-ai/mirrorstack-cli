@@ -11,8 +11,7 @@ use clap::Args;
 use crate::api::{self, ApiError};
 use crate::credentials::{self, LoadError};
 
-const DEFAULT_API_BASE: &str = "https://api.mirrorstack.ai";
-const ENV_API_URL: &str = "MIRRORSTACK_API_URL";
+use super::{DEFAULT_API_BASE, ENV_API_URL};
 
 #[derive(Args)]
 pub struct WhoamiArgs {}
