@@ -1,6 +1,6 @@
 # MirrorStack CLI
 
-Scaffold, develop, and deploy MirrorStack modules.
+Official command-line tool for the MirrorStack platform.
 
 ## Install
 
@@ -13,20 +13,14 @@ Pre-built releases (brew, scoop, deb) coming with the next milestone.
 ## Commands
 
 ```bash
-mirrorstack login                       # Sign in via OAuth (PKCE)
-mirrorstack app module init <name>      # Scaffold a new module
-mirrorstack --help                      # Show help
-mirrorstack --version                   # Show CLI version
+mirrorstack login           # Sign in via OAuth (PKCE)
+mirrorstack whoami          # Print the currently signed-in user
+mirrorstack --help          # Show help
+mirrorstack --version       # Show CLI version
 ```
 
-## Quick start
-
-```bash
-mirrorstack login
-mirrorstack app module init my-module
-cd my-module
-# Edit api/, web/, sql/ as needed
-```
+Module scaffolding (`app module init`) is tracked separately and lands
+in a follow-up PR.
 
 ## Local development
 

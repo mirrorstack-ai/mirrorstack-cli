@@ -4,7 +4,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-mod app;
 mod login;
 mod whoami;
 
@@ -32,8 +31,6 @@ enum Command {
     Login(login::LoginArgs),
     /// Print the currently signed-in user.
     Whoami(whoami::WhoamiArgs),
-    /// App and module management.
-    App(app::AppArgs),
 }
 
 impl Cli {
@@ -41,7 +38,6 @@ impl Cli {
         match self.command {
             Command::Login(args) => login::run(args),
             Command::Whoami(args) => whoami::run(args),
-            Command::App(args) => app::run(args),
         }
     }
 }
