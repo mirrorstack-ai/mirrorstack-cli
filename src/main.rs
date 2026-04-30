@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
+mod api;
 mod auth;
 mod browser;
 mod commands;
