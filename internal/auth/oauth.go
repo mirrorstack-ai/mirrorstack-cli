@@ -20,7 +20,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 )
 
 const (
@@ -113,9 +112,6 @@ func ExchangeCode(httpClient *http.Client, apiBase, code string, p PKCE) (TokenR
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
-	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 30 * time.Second}
-	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return TokenResponse{}, fmt.Errorf("auth: token request: %w", err)

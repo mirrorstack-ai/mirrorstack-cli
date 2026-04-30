@@ -54,12 +54,9 @@ func Save(c Credentials) error {
 		return fmt.Errorf("credentials: temp file: %w", err)
 	}
 	tmpPath := tmp.Name()
-	defer func() {
-		// Best-effort cleanup if we error out before the rename.
-		if _, statErr := os.Stat(tmpPath); statErr == nil {
-			_ = os.Remove(tmpPath)
-		}
-	}()
+	// Best-effort cleanup if we error out before the rename. After a
+	// successful Rename below the temp is gone and Remove is a no-op.
+	defer func() { _ = os.Remove(tmpPath) }()
 
 	if err := tmp.Chmod(0o600); err != nil {
 		_ = tmp.Close()

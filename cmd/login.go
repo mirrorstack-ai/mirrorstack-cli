@@ -19,7 +19,24 @@ const (
 	defaultWebBase = "https://account.mirrorstack.ai"
 )
 
-func runLogin(_ []string) error {
+func runLogin(args []string) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "help", "--help", "-h":
+			fmt.Println(`Usage:
+  mirrorstack login
+
+Sign in to MirrorStack via OAuth.
+
+Environment overrides (for local development):
+  MIRRORSTACK_API_URL    API base URL (default ` + defaultAPIBase + `)
+  MIRRORSTACK_WEB_URL    Web base URL (default = API)`)
+			return nil
+		default:
+			return fmt.Errorf("login: unexpected argument %q (run `mirrorstack login help`)", args[0])
+		}
+	}
+
 	apiBase := getenvOr("MIRRORSTACK_API_URL", defaultAPIBase)
 	// Web is co-located with the API service in production. Override
 	// independently when running against a split local dev setup.
@@ -82,9 +99,11 @@ func readLine(r *os.File) (string, error) {
 	s := bufio.NewScanner(r)
 	if !s.Scan() {
 		if err := s.Err(); err != nil {
-			return "", err
+			return "", fmt.Errorf("read input: %w", err)
 		}
-		return "", errors.New("input closed")
+		// Scan returned false with no error → EOF. Most common cause is
+		// a non-interactive shell (CI, script piping nothing). Hint at it.
+		return "", errors.New("read input: end of input (no code provided)")
 	}
 	return s.Text(), nil
 }
