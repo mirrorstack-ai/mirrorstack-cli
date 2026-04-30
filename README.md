@@ -37,7 +37,15 @@ cargo build
 cargo test
 ```
 
-Run against local services:
+Run against local services. Easiest is a `.env` file in the project
+root — copy `.env.example` and edit:
+
+```bash
+cp .env.example .env
+cargo run -- login
+```
+
+Or set the env vars per-invocation (these always win over `.env`):
 
 ```bash
 MIRRORSTACK_API_URL=http://localhost:8081 \
