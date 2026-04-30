@@ -10,6 +10,7 @@ mod auth;
 mod browser;
 mod commands;
 mod credentials;
+mod http;
 
 fn main() -> ExitCode {
     // Load .env from CWD if present. Process env vars still take precedence

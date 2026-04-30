@@ -11,11 +11,11 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
-use reqwest::blocking::Client;
 
 use crate::auth::{self, AuthError};
 use crate::browser;
 use crate::credentials::{self, Credentials};
+use crate::http;
 
 use super::{DEFAULT_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_WEB_URL};
 
@@ -44,10 +44,7 @@ pub fn run(_args: LoginArgs) -> Result<()> {
         return Err(anyhow!("login: no code entered"));
     }
 
-    let http = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("login: build HTTP client")?;
+    let http = http::client(Duration::from_secs(30)).context("login: build HTTP client")?;
 
     let tokens = match auth::exchange_code(&http, &api_base, code, &pkce) {
         Ok(t) => t,
