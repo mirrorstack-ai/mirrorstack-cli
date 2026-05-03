@@ -4,9 +4,10 @@
 use std::io::Read;
 use std::time::Duration;
 
-use reqwest::blocking::Client;
 use serde::Deserialize;
 use thiserror::Error;
+
+use crate::http;
 
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
@@ -37,7 +38,7 @@ pub enum ApiError {
 /// GET /v1/auth/me — returns the authenticated user's identity.
 pub fn me(api_base: &str, access_token: &str) -> Result<Identity, ApiError> {
     let endpoint = format!("{}/v1/auth/me", api_base.trim_end_matches('/'));
-    let http = Client::builder().timeout(Duration::from_secs(15)).build()?;
+    let http = http::client(Duration::from_secs(15))?;
 
     let resp = http
         .get(&endpoint)
