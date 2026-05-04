@@ -18,8 +18,7 @@ const MAIN_GO: &str = include_str!("../../../templates/module/main.go.tmpl");
 const MCP_GO: &str = include_str!("../../../templates/module/mcp.go.tmpl");
 const ROUTES_GO: &str = include_str!("../../../templates/module/routes.go.tmpl");
 const GO_MOD: &str = include_str!("../../../templates/module/go.mod.tmpl");
-const SQL_INIT: &str =
-    include_str!("../../../templates/module/sql/app/0001_init.up.sql.tmpl");
+const SQL_INIT: &str = include_str!("../../../templates/module/sql/app/0001_init.up.sql.tmpl");
 
 // Placeholder tokens. Kept in one place so the contract between the .tmpl
 // files and this renderer is auditable from a single grep.
