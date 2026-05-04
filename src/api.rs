@@ -4,7 +4,7 @@
 use std::io::Read;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::http;
@@ -33,6 +33,45 @@ pub enum ApiError {
     Decode(#[from] serde_json::Error),
     #[error("api: unexpected response {status}: {body}")]
     Unexpected { status: u16, body: String },
+    /// Server returned a structured error envelope. The `code` is the
+    /// machine-readable identifier (e.g. `slug_taken`); callers branch on it.
+    #[error("api: {code}: {message}")]
+    Server {
+        status: u16,
+        code: String,
+        message: String,
+    },
+}
+
+/// Subset of the platform's structured error body. The platform consistently
+/// wraps errors as `{"error": {"code": "...", "message": "..."}}` for any
+/// 4xx the application layer produces; we only need those two fields.
+#[derive(Deserialize)]
+struct ErrorEnvelope {
+    error: ErrorBody,
+}
+#[derive(Deserialize)]
+struct ErrorBody {
+    code: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // name / owner_id / created_at are part of the API surface
+pub struct Module {
+    pub id: String,
+    pub name: String,
+    pub slug: String,
+    #[serde(default)]
+    pub owner_id: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateModuleInput<'a> {
+    pub name: &'a str,
+    pub slug: &'a str,
 }
 
 /// GET /v1/auth/me — returns the authenticated user's identity.
@@ -66,6 +105,53 @@ pub fn me(api_base: &str, access_token: &str) -> Result<Identity, ApiError> {
     Err(ApiError::Unexpected {
         status: status.as_u16(),
         body,
+    })
+}
+
+/// POST /v1/modules — create a developer-owned module.
+pub fn create_module(
+    api_base: &str,
+    access_token: &str,
+    input: &CreateModuleInput,
+) -> Result<Module, ApiError> {
+    let endpoint = format!("{}/v1/modules", api_base.trim_end_matches('/'));
+    let http = http::client(Duration::from_secs(15))?;
+
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .json(input)
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<Module>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+
+    // 4xx with platform error-envelope: surface code + message so callers
+    // can branch on `slug_taken` / `slug_reserved` / `slug_invalid` without
+    // re-parsing the body.
+    let mut body = Vec::with_capacity(1024);
+    resp.take(MAX_RESPONSE_BYTES)
+        .read_to_end(&mut body)
+        .map_err(|e| ApiError::Unexpected {
+            status: status.as_u16(),
+            body: format!("(read body failed: {e})"),
+        })?;
+    if let Ok(env) = serde_json::from_slice::<ErrorEnvelope>(&body) {
+        return Err(ApiError::Server {
+            status: status.as_u16(),
+            code: env.error.code,
+            message: env.error.message,
+        });
+    }
+    Err(ApiError::Unexpected {
+        status: status.as_u16(),
+        body: String::from_utf8_lossy(&body).into_owned(),
     })
 }
 
@@ -111,5 +197,69 @@ mod tests {
 
         let err = me(&server.url(), "expired").unwrap_err();
         assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
+    }
+
+    #[test]
+    fn create_module_success() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules")
+            .match_header("authorization", "Bearer AT")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"name":"Media","slug":"media"}"#.into(),
+            ))
+            .with_status(201)
+            .with_body(
+                json!({
+                    "id": "m-1",
+                    "name": "Media",
+                    "slug": "media",
+                    "owner_id": "u-1",
+                    "created_at": "2026-05-04T00:00:00Z"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let m = create_module(
+            &server.url(),
+            "AT",
+            &CreateModuleInput {
+                name: "Media",
+                slug: "media",
+            },
+        )
+        .expect("ok");
+        assert_eq!(m.slug, "media");
+        assert_eq!(m.id, "m-1");
+    }
+
+    #[test]
+    fn create_module_409_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules")
+            .with_status(409)
+            .with_body(
+                r#"{"error":{"code":"slug_taken","message":"slug already taken for this owner"}}"#,
+            )
+            .create();
+
+        let err = create_module(
+            &server.url(),
+            "AT",
+            &CreateModuleInput {
+                name: "Media",
+                slug: "media",
+            },
+        )
+        .unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 409);
+                assert_eq!(code, "slug_taken");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
     }
 }

@@ -1,0 +1,306 @@
+//! `mirrorstack app module …` — developer module management.
+//!
+//! Today: only `app module init` (register a module on the platform). Filesystem
+//! scaffolding (templates, SDK pull) is intentionally out of scope per the
+//! current product direction — modules are developed locally with whatever
+//! tooling the developer prefers, and `mirrorstack dev` (future) opens a WSS
+//! tunnel into the platform.
+
+use std::io::{self, BufRead, Write};
+
+use anyhow::{Result, anyhow};
+use clap::{Args, Subcommand};
+
+use crate::api::{self, ApiError, CreateModuleInput};
+use crate::credentials::{self, LoadError};
+
+use super::{DEFAULT_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_WEB_URL};
+
+#[derive(Args)]
+pub struct AppArgs {
+    #[command(subcommand)]
+    command: AppCommand,
+}
+
+#[derive(Subcommand)]
+enum AppCommand {
+    /// Manage developer modules (the per-developer reusable units installed
+    /// into apps).
+    Module(ModuleArgs),
+}
+
+#[derive(Args)]
+pub struct ModuleArgs {
+    #[command(subcommand)]
+    command: ModuleCommand,
+}
+
+#[derive(Subcommand)]
+enum ModuleCommand {
+    /// Register a new module on the platform. Interactive by default;
+    /// pass --yes for non-interactive use.
+    Init(InitArgs),
+}
+
+#[derive(Args)]
+pub struct InitArgs {
+    /// Module name (human-readable). When omitted, prompts interactively.
+    #[arg(long)]
+    name: Option<String>,
+    /// URL slug. When omitted, derived from --name. The platform regex is
+    /// 3-40 chars, must start with a letter, end with a letter or digit,
+    /// lowercase + hyphen only.
+    #[arg(long)]
+    slug: Option<String>,
+    /// Skip prompts. Requires --name; --slug optional (derived from name).
+    #[arg(long, short)]
+    yes: bool,
+    /// If the slug is already registered to you, treat that as success and
+    /// continue. Useful for re-running init in CI without conditional logic.
+    #[arg(long)]
+    used: bool,
+}
+
+pub fn run(args: AppArgs) -> Result<()> {
+    match args.command {
+        AppCommand::Module(m) => match m.command {
+            ModuleCommand::Init(i) => init(i),
+        },
+    }
+}
+
+fn init(args: InitArgs) -> Result<()> {
+    let creds = match credentials::load() {
+        Ok(c) => c,
+        Err(LoadError::NotFound) => {
+            return Err(anyhow!(
+                "not signed in. Run `mirrorstack login` to sign in."
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let api_base = std::env::var(ENV_API_URL).unwrap_or_else(|_| DEFAULT_API_BASE.into());
+    let web_base = std::env::var(ENV_WEB_URL).unwrap_or_else(|_| DEFAULT_WEB_BASE.into());
+
+    // The platform stores ownership by user id, but the CLI surfaces the
+    // full namespaced `@<username>/<slug>` — so we refuse to POST until the
+    // caller has claimed a username, and point them at the web flow.
+    let identity = match api::me(&api_base, &creds.access_token) {
+        Ok(id) => id,
+        Err(ApiError::Unauthenticated) => {
+            return Err(anyhow!(
+                "session expired. Run `mirrorstack login` to sign in again."
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let Some(username) = identity.slug.as_deref().filter(|s| !s.is_empty()) else {
+        return Err(anyhow!(
+            "no username set on this account. Visit {web_base}/me to claim one before creating modules."
+        ));
+    };
+
+    let (name, slug) = collect_name_and_slug(&args)?;
+
+    if !slug_valid(&slug) {
+        return Err(anyhow!(
+            "slug '{slug}' is invalid: must be 3-40 chars, start with a letter, end with a letter or digit, lowercase + hyphen only."
+        ));
+    }
+
+    if !args.yes {
+        println!();
+        println!("  Module: {name}");
+        println!("  Slug:   @{username}/{slug}");
+        if !confirm("Create this module?", true)? {
+            println!("aborted.");
+            return Ok(());
+        }
+    }
+
+    match api::create_module(
+        &api_base,
+        &creds.access_token,
+        &CreateModuleInput {
+            name: &name,
+            slug: &slug,
+        },
+    ) {
+        Ok(m) => {
+            println!("✓ created @{username}/{}", m.slug);
+            println!("  id: {}", m.id);
+            Ok(())
+        }
+        Err(ApiError::Server { code, .. }) if code == "slug_taken" && args.used => {
+            println!("✓ @{username}/{slug} already exists; --used set, continuing.");
+            Ok(())
+        }
+        Err(ApiError::Server { code, message, .. }) => Err(anyhow!(
+            "{code}: {message}{hint}",
+            hint = slug_error_hint(&code)
+        )),
+        Err(ApiError::Unauthenticated) => Err(anyhow!(
+            "session expired. Run `mirrorstack login` to sign in again."
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn collect_name_and_slug(args: &InitArgs) -> Result<(String, String)> {
+    let name = if let Some(n) = args
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        n.to_string()
+    } else if args.yes {
+        return Err(anyhow!(
+            "--yes requires --name (cannot prompt in non-interactive mode)"
+        ));
+    } else {
+        prompt("Module name: ")?
+    };
+
+    let slug = if let Some(s) = args
+        .slug
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        s.to_string()
+    } else {
+        let suggested = derive_slug(&name);
+        if args.yes {
+            // Non-interactive: trust the derivation. If the format check fails
+            // downstream the caller sees a clear error.
+            suggested
+        } else {
+            let prompt_text = format!("Slug [{suggested}]: ");
+            let raw = prompt(&prompt_text)?;
+            if raw.is_empty() { suggested } else { raw }
+        }
+    };
+
+    Ok((name, slug))
+}
+
+/// Same regex as the platform service and api-client-shared:
+/// `^[a-z][a-z0-9-]{1,38}[a-z0-9]$`. Inlined as a manual check to avoid a
+/// `regex` dependency for one pattern — the rule is small enough.
+fn slug_valid(s: &str) -> bool {
+    let len = s.len();
+    if !(3..=40).contains(&len) {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    if !bytes[0].is_ascii_lowercase() {
+        return false;
+    }
+    let last = bytes[len - 1];
+    if !(last.is_ascii_lowercase() || last.is_ascii_digit()) {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+/// Lowercase, replace runs of non-[a-z0-9] with single hyphens, trim leading
+/// and trailing hyphens. Mirrors the web client's auto-suggest in
+/// `useCreateModuleForm` so CLI users see the same default as web users.
+fn derive_slug(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_dash = true; // skip leading hyphens
+    for c in name.chars() {
+        let lc = c.to_ascii_lowercase();
+        if lc.is_ascii_lowercase() || lc.is_ascii_digit() {
+            out.push(lc);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+fn slug_error_hint(code: &str) -> &'static str {
+    match code {
+        "slug_taken" => " (pass --used to ignore when re-running)",
+        "slug_reserved" => " (try a different slug — this name is reserved)",
+        "slug_invalid" => "",
+        _ => "",
+    }
+}
+
+fn prompt(label: &str) -> Result<String> {
+    print!("{label}");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
+fn confirm(label: &str, default_yes: bool) -> Result<bool> {
+    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
+    let raw = prompt(&format!("{label} {suffix} "))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(default_yes);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        _ => Ok(default_yes),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slug_valid_accepts() {
+        for s in ["media", "my-mod", "abc123", "a1-b2-c3", "ana-lytics"] {
+            assert!(slug_valid(s), "expected {s:?} valid");
+        }
+    }
+
+    #[test]
+    fn slug_valid_rejects() {
+        for s in ["", "ab", "AB", "1abc", "media-", "-media", "ab_cd"] {
+            assert!(!slug_valid(s), "expected {s:?} invalid");
+        }
+    }
+
+    #[test]
+    fn slug_valid_rejects_too_long() {
+        let s = "a".repeat(41);
+        assert!(!slug_valid(&s));
+    }
+
+    #[test]
+    fn derive_slug_basic() {
+        assert_eq!(derive_slug("Analytics"), "analytics");
+        assert_eq!(derive_slug("My Cool Module"), "my-cool-module");
+        assert_eq!(derive_slug("  Media!! "), "media");
+        assert_eq!(derive_slug("foo___bar"), "foo-bar");
+        assert_eq!(derive_slug("foo--bar"), "foo-bar");
+    }
+
+    #[test]
+    fn derive_slug_strips_leading_and_trailing_hyphens() {
+        assert_eq!(derive_slug("--media"), "media");
+        assert_eq!(derive_slug("media--"), "media");
+    }
+
+    #[test]
+    fn slug_error_hint_for_taken() {
+        assert!(slug_error_hint("slug_taken").contains("--used"));
+    }
+}
