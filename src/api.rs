@@ -179,6 +179,44 @@ pub fn create_module(
     })
 }
 
+/// DELETE /v1/auth/sessions/current — revoke the supplied refresh token
+/// (CLI flow: token in body, not cookie). The platform treats a missing
+/// or already-revoked session as success, so callers can call this
+/// idempotently. A 401 means the access token is gone but does NOT
+/// necessarily mean the refresh token is — surface as Unauthenticated
+/// and let the caller decide whether to still wipe local creds.
+pub fn revoke_session(
+    http: &Client,
+    api_base: &str,
+    access_token: &str,
+    refresh_token: &str,
+) -> Result<(), ApiError> {
+    #[derive(Serialize)]
+    struct Body<'a> {
+        refresh_token: &'a str,
+    }
+    let endpoint = format!(
+        "{}/v1/auth/sessions/current",
+        api_base.trim_end_matches('/')
+    );
+
+    let resp = http
+        .delete(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .json(&Body { refresh_token })
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(unexpected_body_error(resp))
+}
+
 /// Common tail for unexpected (non-success, non-typed) responses: read
 /// the body with [`http::read_capped`] and wrap as `ApiError::Unexpected`.
 /// If reading fails, the io error is folded into the body for diagnosis.
@@ -378,6 +416,33 @@ mod tests {
             }
             other => panic!("expected Server, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn revoke_session_204_is_ok() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("DELETE", "/v1/auth/sessions/current")
+            .match_header("authorization", "Bearer AT")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"refresh_token":"RT"}"#.into(),
+            ))
+            .with_status(204)
+            .create();
+
+        revoke_session(&test_client(), &server.url(), "AT", "RT").expect("ok");
+    }
+
+    #[test]
+    fn revoke_session_401_is_unauthenticated() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("DELETE", "/v1/auth/sessions/current")
+            .with_status(401)
+            .create();
+
+        let err = revoke_session(&test_client(), &server.url(), "expired", "RT").unwrap_err();
+        assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
     }
 
     #[test]

@@ -90,6 +90,17 @@ pub fn load_or_login_hint() -> Result<Credentials> {
     }
 }
 
+/// Wipe the credentials file. Idempotent — a missing file is treated as
+/// success so callers don't need to special-case "already logged out".
+pub fn delete() -> Result<()> {
+    let p = path().context("credentials: path")?;
+    match fs::remove_file(&p) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::anyhow!("credentials: remove: {e}")),
+    }
+}
+
 /// Encode `SystemTime` as RFC 3339 in JSON. Avoids pulling chrono just
 /// for this; serde_json's default for SystemTime is a tagged struct
 /// which is ugly on disk.

@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod login;
+mod logout;
 mod module;
 mod whoami;
 
@@ -43,6 +44,8 @@ pub struct Cli {
 enum Command {
     /// Sign in to MirrorStack via OAuth.
     Login(login::LoginArgs),
+    /// Sign out: revoke the current session and remove local credentials.
+    Logout(logout::LogoutArgs),
     /// Print the currently signed-in user.
     Whoami(whoami::WhoamiArgs),
     /// Manage developer modules (the per-developer reusable units installed
@@ -54,6 +57,7 @@ impl Cli {
     pub fn run(self) -> Result<()> {
         match self.command {
             Command::Login(args) => login::run(args),
+            Command::Logout(args) => logout::run(args),
             Command::Whoami(args) => whoami::run(args),
             Command::Module(args) => module::run(args),
         }
