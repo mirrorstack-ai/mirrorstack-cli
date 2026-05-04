@@ -16,7 +16,7 @@ use dialoguer::{Confirm, Input, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::api::{self, ApiError, CreateModuleInput};
-use crate::credentials::{self, LoadError};
+use crate::credentials;
 
 use super::{
     DEFAULT_API_BASE, DEFAULT_APPS_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_APPS_API_URL,
@@ -64,16 +64,7 @@ pub fn run(args: ModuleArgs) -> Result<()> {
 fn init(args: InitArgs) -> Result<()> {
     let theme = ColorfulTheme::default();
 
-    let creds = match credentials::load() {
-        Ok(c) => c,
-        Err(LoadError::NotFound) => {
-            return Err(anyhow!(
-                "not signed in. Run `mirrorstack login` to sign in."
-            ));
-        }
-        Err(e) => return Err(e.into()),
-    };
-
+    let creds = credentials::load_or_login_hint()?;
     let api_base = resolve_base(ENV_API_URL, DEFAULT_API_BASE);
     let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
     let web_base = resolve_base(ENV_WEB_URL, DEFAULT_WEB_BASE);

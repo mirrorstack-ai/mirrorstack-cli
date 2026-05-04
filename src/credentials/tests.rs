@@ -33,6 +33,13 @@ fn credentials_lifecycle() {
     // load() before save() returns NotFound.
     assert!(matches!(load(), Err(LoadError::NotFound)));
 
+    // load_or_login_hint() before save() surfaces the login hint.
+    let hint_err = load_or_login_hint().unwrap_err();
+    assert!(
+        hint_err.to_string().contains("mirrorstack login"),
+        "expected login hint, got: {hint_err}"
+    );
+
     // save → load roundtrip preserves token strings + expires_at.
     let want = Credentials {
         access_token: "AT".into(),
@@ -41,6 +48,10 @@ fn credentials_lifecycle() {
     };
     save(&want).expect("save");
     let got = load().expect("load");
+
+    // load_or_login_hint() after save() returns the same data as load().
+    let got_hint = load_or_login_hint().expect("load_or_login_hint");
+    assert_eq!(got_hint, got);
     assert_eq!(got.access_token, want.access_token);
     assert_eq!(got.refresh_token, want.refresh_token);
     let skew = got
