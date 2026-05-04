@@ -108,13 +108,57 @@ pub fn me(api_base: &str, access_token: &str) -> Result<Identity, ApiError> {
     })
 }
 
+/// GET /v1/modules/{slug} — returns the caller's module by slug.
+/// `Ok(None)` on 404 (caller has no module with that slug). Note this
+/// only checks ownership by the *current* user — module slugs are scoped
+/// per-owner, so 404 here does NOT mean the platform-wide name is unique
+/// (reserved/format checks still happen on POST).
+pub fn get_module(
+    apps_base: &str,
+    access_token: &str,
+    slug: &str,
+) -> Result<Option<Module>, ApiError> {
+    // Slug is pre-validated against `^[a-z][a-z0-9-]{1,38}[a-z0-9]$` before
+    // this call, so it's URL-safe with no encoding needed.
+    let endpoint = format!("{}/v1/modules/{}", apps_base.trim_end_matches('/'), slug);
+    let http = http::client(Duration::from_secs(15))?;
+
+    let resp = http
+        .get(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(Some(resp.json::<Module>()?));
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ApiError::Unauthenticated);
+    }
+    let mut body = Vec::with_capacity(1024);
+    resp.take(MAX_RESPONSE_BYTES)
+        .read_to_end(&mut body)
+        .map_err(|e| ApiError::Unexpected {
+            status: status.as_u16(),
+            body: format!("(read body failed: {e})"),
+        })?;
+    Err(ApiError::Unexpected {
+        status: status.as_u16(),
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
+}
+
 /// POST /v1/modules — create a developer-owned module.
 pub fn create_module(
-    api_base: &str,
+    apps_base: &str,
     access_token: &str,
     input: &CreateModuleInput,
 ) -> Result<Module, ApiError> {
-    let endpoint = format!("{}/v1/modules", api_base.trim_end_matches('/'));
+    let endpoint = format!("{}/v1/modules", apps_base.trim_end_matches('/'));
     let http = http::client(Duration::from_secs(15))?;
 
     let resp = http
@@ -232,6 +276,41 @@ mod tests {
         .expect("ok");
         assert_eq!(m.slug, "media");
         assert_eq!(m.id, "m-1");
+    }
+
+    #[test]
+    fn get_module_200_returns_some() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/modules/media")
+            .match_header("authorization", "Bearer AT")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "id": "m-1",
+                    "name": "Media",
+                    "slug": "media",
+                    "owner_id": "u-1",
+                })
+                .to_string(),
+            )
+            .create();
+
+        let m = get_module(&server.url(), "AT", "media").expect("ok");
+        assert!(m.is_some());
+        assert_eq!(m.unwrap().slug, "media");
+    }
+
+    #[test]
+    fn get_module_404_returns_none() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/modules/none")
+            .with_status(404)
+            .create();
+
+        let m = get_module(&server.url(), "AT", "none").expect("ok");
+        assert!(m.is_none());
     }
 
     #[test]

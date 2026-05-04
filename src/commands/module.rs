@@ -6,15 +6,21 @@
 //! tooling the developer prefers, and `mirrorstack dev` (future) opens a WSS
 //! tunnel into the platform.
 
-use std::io::{self, BufRead, Write};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use clap::{Args, Subcommand};
+use console::style;
+use dialoguer::{Confirm, Input, theme::ColorfulTheme};
+use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::api::{self, ApiError, CreateModuleInput};
 use crate::credentials::{self, LoadError};
 
-use super::{DEFAULT_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_WEB_URL};
+use super::{
+    DEFAULT_API_BASE, DEFAULT_APPS_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_APPS_API_URL,
+    ENV_WEB_URL,
+};
 
 #[derive(Args)]
 pub struct ModuleArgs {
@@ -55,6 +61,8 @@ pub fn run(args: ModuleArgs) -> Result<()> {
 }
 
 fn init(args: InitArgs) -> Result<()> {
+    let theme = ColorfulTheme::default();
+
     let creds = match credentials::load() {
         Ok(c) => c,
         Err(LoadError::NotFound) => {
@@ -66,6 +74,8 @@ fn init(args: InitArgs) -> Result<()> {
     };
 
     let api_base = std::env::var(ENV_API_URL).unwrap_or_else(|_| DEFAULT_API_BASE.into());
+    let apps_base =
+        std::env::var(ENV_APPS_API_URL).unwrap_or_else(|_| DEFAULT_APPS_API_BASE.into());
     let web_base = std::env::var(ENV_WEB_URL).unwrap_or_else(|_| DEFAULT_WEB_BASE.into());
 
     // The platform stores ownership by user id, but the CLI surfaces the
@@ -86,7 +96,7 @@ fn init(args: InitArgs) -> Result<()> {
         ));
     };
 
-    let (name, slug) = collect_name_and_slug(&args)?;
+    let (name, slug) = collect_name_and_slug(&theme, &args)?;
 
     if !slug_valid(&slug) {
         return Err(anyhow!(
@@ -94,31 +104,68 @@ fn init(args: InitArgs) -> Result<()> {
         ));
     }
 
+    // Pre-flight: reject early if the caller already owns this slug. Catches
+    // the common "I forgot I made this last week" case before we POST.
+    // Reserved/invalid still surface server-side from the POST below.
+    let pre_check = with_spinner("Checking availability…", || {
+        api::get_module(&apps_base, &creds.access_token, &slug)
+    });
+    match pre_check {
+        Ok(Some(existing)) if args.used => {
+            print_already_exists(username, &existing.slug, &existing.id);
+            return Ok(());
+        }
+        Ok(Some(_)) => {
+            return Err(anyhow!(
+                "@{username}/{slug} already exists{hint}",
+                hint = slug_error_hint("slug_taken")
+            ));
+        }
+        Ok(None) => {}
+        Err(ApiError::Unauthenticated) => {
+            return Err(anyhow!(
+                "session expired. Run `mirrorstack login` to sign in again."
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    }
+
     if !args.yes {
-        println!();
-        println!("  Module: {name}");
-        println!("  Slug:   @{username}/{slug}");
-        if !confirm("Create this module?", true)? {
-            println!("aborted.");
+        eprintln!();
+        eprintln!("  {} {}", style("Module:").dim(), style(&name).bold());
+        eprintln!(
+            "  {}   {}",
+            style("Slug:").dim(),
+            style(format!("@{username}/{slug}")).cyan().bold()
+        );
+        let confirmed = Confirm::with_theme(&theme)
+            .with_prompt("Create this module?")
+            .default(true)
+            .interact()?;
+        if !confirmed {
+            eprintln!("{}", style("aborted.").yellow());
             return Ok(());
         }
     }
 
-    match api::create_module(
-        &api_base,
-        &creds.access_token,
-        &CreateModuleInput {
-            name: &name,
-            slug: &slug,
-        },
-    ) {
+    let create_result = with_spinner("Creating module…", || {
+        api::create_module(
+            &apps_base,
+            &creds.access_token,
+            &CreateModuleInput {
+                name: &name,
+                slug: &slug,
+            },
+        )
+    });
+
+    match create_result {
         Ok(m) => {
-            println!("✓ created @{username}/{}", m.slug);
-            println!("  id: {}", m.id);
+            print_created(username, &m.slug, &m.id);
             Ok(())
         }
         Err(ApiError::Server { code, .. }) if code == "slug_taken" && args.used => {
-            println!("✓ @{username}/{slug} already exists; --used set, continuing.");
+            print_already_exists(username, &slug, "(unknown id)");
             Ok(())
         }
         Err(ApiError::Server { code, message, .. }) => Err(anyhow!(
@@ -132,7 +179,7 @@ fn init(args: InitArgs) -> Result<()> {
     }
 }
 
-fn collect_name_and_slug(args: &InitArgs) -> Result<(String, String)> {
+fn collect_name_and_slug(theme: &ColorfulTheme, args: &InitArgs) -> Result<(String, String)> {
     let name = if let Some(n) = args
         .name
         .as_deref()
@@ -145,7 +192,11 @@ fn collect_name_and_slug(args: &InitArgs) -> Result<(String, String)> {
             "--yes requires --name (cannot prompt in non-interactive mode)"
         ));
     } else {
-        prompt("Module name: ")?
+        Input::<String>::with_theme(theme)
+            .with_prompt("Module name")
+            .interact_text()?
+            .trim()
+            .to_string()
     };
 
     let slug = if let Some(s) = args
@@ -162,13 +213,56 @@ fn collect_name_and_slug(args: &InitArgs) -> Result<(String, String)> {
             // downstream the caller sees a clear error.
             suggested
         } else {
-            let prompt_text = format!("Slug [{suggested}]: ");
-            let raw = prompt(&prompt_text)?;
-            if raw.is_empty() { suggested } else { raw }
+            Input::<String>::with_theme(theme)
+                .with_prompt("Slug")
+                .default(suggested)
+                .interact_text()?
+                .trim()
+                .to_string()
         }
     };
 
     Ok((name, slug))
+}
+
+/// Wrap a blocking call with a tick-driven spinner. Spinner is suppressed
+/// when stderr isn't a TTY so CI logs stay clean.
+fn with_spinner<T, F>(message: &str, f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    pb.enable_steady_tick(Duration::from_millis(80));
+    pb.set_message(message.to_string());
+    let result = f();
+    pb.finish_and_clear();
+    result
+}
+
+fn print_created(username: &str, slug: &str, id: &str) {
+    eprintln!(
+        "{} created {}",
+        style("✓").green().bold(),
+        style(format!("@{username}/{slug}")).cyan().bold(),
+    );
+    eprintln!("  {} {}", style("id:").dim(), id);
+}
+
+fn print_already_exists(username: &str, slug: &str, id: &str) {
+    eprintln!(
+        "{} {} already exists; {} continuing.",
+        style("✓").green().bold(),
+        style(format!("@{username}/{slug}")).cyan().bold(),
+        style("--used set,").dim(),
+    );
+    if id != "(unknown id)" {
+        eprintln!("  {} {}", style("id:").dim(), id);
+    }
 }
 
 /// Same regex as the platform service and api-client-shared:
@@ -220,28 +314,6 @@ fn slug_error_hint(code: &str) -> &'static str {
         "slug_reserved" => " (try a different slug — this name is reserved)",
         "slug_invalid" => "",
         _ => "",
-    }
-}
-
-fn prompt(label: &str) -> Result<String> {
-    print!("{label}");
-    io::stdout().flush()?;
-    let mut line = String::new();
-    io::stdin().lock().read_line(&mut line)?;
-    Ok(line.trim().to_string())
-}
-
-fn confirm(label: &str, default_yes: bool) -> Result<bool> {
-    let suffix = if default_yes { "[Y/n]" } else { "[y/N]" };
-    let raw = prompt(&format!("{label} {suffix} "))?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(default_yes);
-    }
-    match trimmed.to_ascii_lowercase().as_str() {
-        "y" | "yes" => Ok(true),
-        "n" | "no" => Ok(false),
-        _ => Ok(default_yes),
     }
 }
 

@@ -8,14 +8,20 @@ mod login;
 mod module;
 mod whoami;
 
-/// Default api-platform host. Override per-invocation with
+/// Default api-platform account-service host. Override per-invocation with
 /// `MIRRORSTACK_API_URL` (or via `.env`).
 pub(crate) const DEFAULT_API_BASE: &str = "https://api.mirrorstack.ai";
+
+/// Default api-platform applications-service host. Modules and apps live
+/// here (separate Lambda from the account service). Override with
+/// `MIRRORSTACK_APPS_API_URL`.
+pub(crate) const DEFAULT_APPS_API_BASE: &str = "https://apps-api.mirrorstack.ai";
 
 /// Default web-account host. Override with `MIRRORSTACK_WEB_URL`.
 pub(crate) const DEFAULT_WEB_BASE: &str = "https://account.mirrorstack.ai";
 
 pub(crate) const ENV_API_URL: &str = "MIRRORSTACK_API_URL";
+pub(crate) const ENV_APPS_API_URL: &str = "MIRRORSTACK_APPS_API_URL";
 pub(crate) const ENV_WEB_URL: &str = "MIRRORSTACK_WEB_URL";
 
 /// Official command-line tool for the MirrorStack platform.
