@@ -13,9 +13,11 @@ mod whoami;
 pub(crate) const DEFAULT_API_BASE: &str = "https://api.mirrorstack.ai";
 
 /// Default api-platform applications-service host. Modules and apps live
-/// here (separate Lambda from the account service). Override with
-/// `MIRRORSTACK_APPS_API_URL`.
-pub(crate) const DEFAULT_APPS_API_BASE: &str = "https://apps-api.mirrorstack.ai";
+/// on a separate Lambda from the account service, but in prod both are
+/// exposed under the same `api.mirrorstack.ai` hostname (path-routed at
+/// the ingress). Local dev uses port 8082 — set via `.env`. Override
+/// with `MIRRORSTACK_APPS_API_URL`.
+pub(crate) const DEFAULT_APPS_API_BASE: &str = "https://api.mirrorstack.ai";
 
 /// Default web-account host. Override with `MIRRORSTACK_WEB_URL`.
 pub(crate) const DEFAULT_WEB_BASE: &str = "https://account.mirrorstack.ai";
