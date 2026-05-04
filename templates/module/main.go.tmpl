@@ -1,0 +1,51 @@
+// Package main is a MirrorStack module. All features live in sibling files
+// which register themselves via postInitHooks — main.go never changes when
+// the CLI adds or removes features.
+package main
+
+import (
+	"embed"
+	"log"
+
+	ms "github.com/mirrorstack-ai/app-module-sdk"
+	"github.com/mirrorstack-ai/app-module-sdk/system"
+)
+
+//go:embed sql/*
+var sqlFS embed.FS
+
+// postInitHooks is the extension point every feature file registers into via
+// its own init(). Hooks run after ms.Init (so the default module exists) and
+// before ms.Start (so registrations complete before routes mount).
+//
+// This indirection is the reason the CLI can drop any feature file without
+// editing main.go.
+var postInitHooks []func()
+
+func main() {
+	if err := ms.Init(ms.Config{
+		ID:   "__MS_SLUG__",
+		Name: "__MS_NAME__",
+		Icon: "extension",
+		SQL:  sqlFS,
+		Versions: map[string]system.MigrationVersions{
+			"v0.1.0": {App: "0001"},
+		},
+	}); err != nil {
+		log.Fatalf("mirrorstack: init failed: %v", err)
+	}
+
+	ms.Describe("Replace this description with your module's purpose.")
+
+	// Required deps go here — these become install-time preconditions.
+	//
+	//	ms.DependsOn("oauth-core")
+
+	for _, hook := range postInitHooks {
+		hook()
+	}
+
+	if err := ms.Start(); err != nil {
+		log.Fatalf("mirrorstack: start failed: %v", err)
+	}
+}

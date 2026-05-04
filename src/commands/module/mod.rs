@@ -1,15 +1,14 @@
 //! `mirrorstack module …` — developer module management.
 //!
-//! Today: only `module init` (register a module on the platform). Filesystem
-//! scaffolding (templates, SDK pull) is intentionally out of scope per the
-//! current product direction — modules are developed locally with whatever
-//! tooling the developer prefers, and `mirrorstack dev` (future) opens a WSS
-//! tunnel into the platform.
+//! Today: `module init` registers the module on the platform AND scaffolds a
+//! local source tree from the SDK template. The scaffolded tree is what
+//! `mirrorstack dev` (future) launches and tunnels into the platform.
 
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::{Args, Subcommand};
 use console::style;
 use dialoguer::{Confirm, Input, theme::ColorfulTheme};
@@ -18,6 +17,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use crate::api::{self, ApiError, CreateModuleInput};
 use crate::credentials;
 use crate::http;
+
+mod scaffold;
 
 use super::{
     DEFAULT_API_BASE, DEFAULT_APPS_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_APPS_API_URL,
@@ -54,6 +55,13 @@ pub struct InitArgs {
     /// continue. Useful for re-running init in CI without conditional logic.
     #[arg(long)]
     used: bool,
+    /// Skip filesystem scaffolding. Only register the module on the platform.
+    #[arg(long)]
+    no_scaffold: bool,
+    /// Where to scaffold the new module source tree. Defaults to ./<slug>/
+    /// in the current directory. Pass `.` to scaffold into the cwd directly.
+    #[arg(long)]
+    dir: Option<PathBuf>,
 }
 
 pub fn run(args: ModuleArgs) -> Result<()> {
@@ -93,73 +101,133 @@ fn init(args: InitArgs) -> Result<()> {
         ));
     }
 
+    // Pre-flight: scaffold target. If the caller wants scaffolding, fail now
+    // (before any remote POST) so we never leave a registered module with no
+    // local tree because of e.g. a non-empty target dir.
+    let scaffold_target = if args.no_scaffold {
+        None
+    } else {
+        let target = resolve_scaffold_target(args.dir.as_deref(), &slug);
+        scaffold::ensure_target_writable(&target)?;
+        Some(target)
+    };
+
     // Pre-flight: reject early if the caller already owns this slug. Catches
     // the common "I forgot I made this last week" case before we POST.
     // Reserved/invalid still surface server-side from the POST below.
     let pre_check = with_spinner("Checking availability…", || {
         api::get_module(&client, &apps_base, &creds.access_token, &slug)
     });
-    match pre_check {
+    // Determine whether we still need to POST. `--used` + already-exists
+    // short-circuits without prompting for confirmation again.
+    let needs_create = match pre_check {
         Ok(Some(existing)) if args.used => {
             print_already_exists(username, &existing.slug, Some(&existing.id));
-            return Ok(());
+            false
         }
         Ok(Some(_)) => {
             return Err(anyhow!(
                 "@{username}/{slug} already exists (pass --used to ignore when re-running)"
             ));
         }
-        Ok(None) => {}
+        Ok(None) => true,
         Err(ApiError::Unauthenticated) => return Err(session_expired()),
         Err(e) => return Err(e.into()),
-    }
+    };
 
-    if !args.yes {
-        eprintln!();
-        eprintln!("  {} {}", style("Module:").dim(), style(&name).bold());
-        eprintln!(
-            "  {}   {}",
-            style("Slug:").dim(),
-            style(format!("@{username}/{slug}")).cyan().bold()
-        );
-        let confirmed = Confirm::with_theme(&theme)
-            .with_prompt("Create this module?")
-            .default(true)
-            .interact()?;
-        if !confirmed {
-            eprintln!("{}", style("aborted.").yellow());
-            return Ok(());
+    if needs_create {
+        if !args.yes {
+            eprintln!();
+            eprintln!("  {} {}", style("Module:").dim(), style(&name).bold());
+            eprintln!(
+                "  {}   {}",
+                style("Slug:").dim(),
+                style(format!("@{username}/{slug}")).cyan().bold()
+            );
+            let confirmed = Confirm::with_theme(&theme)
+                .with_prompt("Create this module?")
+                .default(true)
+                .interact()?;
+            if !confirmed {
+                eprintln!("{}", style("aborted.").yellow());
+                return Ok(());
+            }
+        }
+
+        let create_result = with_spinner("Creating module…", || {
+            api::create_module(
+                &client,
+                &apps_base,
+                &creds.access_token,
+                &CreateModuleInput {
+                    name: &name,
+                    slug: &slug,
+                },
+            )
+        });
+
+        match create_result {
+            Ok(m) => print_created(username, &m.slug, &m.id),
+            Err(ApiError::Server { code, .. }) if code == "slug_taken" && args.used => {
+                print_already_exists(username, &slug, None);
+            }
+            Err(ApiError::Server { code, message, .. }) => {
+                return Err(anyhow!(
+                    "{code}: {message}{hint}",
+                    hint = slug_error_hint(&code)
+                ));
+            }
+            Err(ApiError::Unauthenticated) => return Err(session_expired()),
+            Err(e) => return Err(e.into()),
         }
     }
 
-    let create_result = with_spinner("Creating module…", || {
-        api::create_module(
-            &client,
-            &apps_base,
-            &creds.access_token,
-            &CreateModuleInput {
-                name: &name,
-                slug: &slug,
-            },
-        )
-    });
+    scaffold_if_requested(
+        scaffold_target.as_deref(),
+        &scaffold::Inputs {
+            slug: &slug,
+            name: &name,
+        },
+    )
+}
 
-    match create_result {
-        Ok(m) => {
-            print_created(username, &m.slug, &m.id);
-            Ok(())
-        }
-        Err(ApiError::Server { code, .. }) if code == "slug_taken" && args.used => {
-            print_already_exists(username, &slug, None);
-            Ok(())
-        }
-        Err(ApiError::Server { code, message, .. }) => Err(anyhow!(
-            "{code}: {message}{hint}",
-            hint = slug_error_hint(&code)
-        )),
-        Err(ApiError::Unauthenticated) => Err(session_expired()),
-        Err(e) => Err(e.into()),
+/// Resolve the target dir for scaffolding. `--dir <path>` wins; otherwise
+/// default to `./<slug>/`. Pass `--dir .` to scaffold into the cwd directly.
+fn resolve_scaffold_target(dir: Option<&Path>, slug: &str) -> PathBuf {
+    match dir {
+        Some(d) => d.to_path_buf(),
+        None => PathBuf::from(slug),
     }
+}
+
+fn scaffold_if_requested(target: Option<&Path>, inputs: &scaffold::Inputs<'_>) -> Result<()> {
+    let Some(target) = target else { return Ok(()) };
+    scaffold::write_tree(target, inputs)
+        .with_context(|| format!("scaffold into {}", target.display()))?;
+    print_scaffold_summary(target);
+    Ok(())
+}
+
+fn print_scaffold_summary(target: &Path) {
+    eprintln!(
+        "{} scaffolded {}",
+        ok_mark(),
+        style(target.display()).cyan().bold()
+    );
+    let next = if is_cwd(target) {
+        "go mod tidy && mirrorstack dev".to_string()
+    } else {
+        format!("cd {} && go mod tidy && mirrorstack dev", target.display())
+    };
+    eprintln!("  {} {next}", style("next:").dim());
+}
+
+/// Robust check for "scaffold into the current dir." Catches both `.` and
+/// `./` (and other normalizations of the same path) — bare `target.as_os_str()
+/// == "."` would miss `./` and trailing-slash variants.
+fn is_cwd(target: &Path) -> bool {
+    let mut comps = target.components();
+    matches!(comps.next(), Some(std::path::Component::CurDir)) && comps.next().is_none()
 }
 
 fn session_expired() -> anyhow::Error {
@@ -351,5 +419,19 @@ mod tests {
     #[test]
     fn slug_error_hint_for_taken() {
         assert!(slug_error_hint("slug_taken").contains("--used"));
+    }
+
+    #[test]
+    fn is_cwd_matches_cwd_variants() {
+        assert!(is_cwd(Path::new(".")));
+        assert!(is_cwd(Path::new("./")));
+    }
+
+    #[test]
+    fn is_cwd_rejects_non_cwd_paths() {
+        assert!(!is_cwd(Path::new("media")));
+        assert!(!is_cwd(Path::new("./media")));
+        assert!(!is_cwd(Path::new("a/b")));
+        assert!(!is_cwd(Path::new("/tmp")));
     }
 }
