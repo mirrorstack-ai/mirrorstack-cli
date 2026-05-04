@@ -17,14 +17,14 @@ use crate::browser;
 use crate::credentials::{self, Credentials};
 use crate::http;
 
-use super::{DEFAULT_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_WEB_URL};
+use super::{DEFAULT_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_WEB_URL, resolve_base};
 
 #[derive(Args)]
 pub struct LoginArgs {}
 
 pub fn run(_args: LoginArgs) -> Result<()> {
-    let api_base = std::env::var(ENV_API_URL).unwrap_or_else(|_| DEFAULT_API_BASE.into());
-    let web_base = std::env::var(ENV_WEB_URL).unwrap_or_else(|_| DEFAULT_WEB_BASE.into());
+    let api_base = resolve_base(ENV_API_URL, DEFAULT_API_BASE);
+    let web_base = resolve_base(ENV_WEB_URL, DEFAULT_WEB_BASE);
 
     let pkce = auth::Pkce::generate()?;
     let state = auth::random_state()?;

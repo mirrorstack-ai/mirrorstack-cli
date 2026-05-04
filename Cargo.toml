@@ -25,6 +25,9 @@ anyhow = "1"
 thiserror = "2"
 tempfile = "3"
 dotenvy = "0.15"
+dialoguer = { version = "0.11", default-features = false }
+console = "0.15"
+indicatif = "0.17"
 
 [dev-dependencies]
 mockito = "1.6"

@@ -15,12 +15,10 @@ Pre-built releases (brew, scoop, deb) coming with the next milestone.
 ```bash
 mirrorstack login           # Sign in via OAuth (PKCE)
 mirrorstack whoami          # Print the currently signed-in user
+mirrorstack module init     # Register a new module on the platform
 mirrorstack --help          # Show help
 mirrorstack --version       # Show CLI version
 ```
-
-Module scaffolding (`app module init`) is tracked separately and lands
-in a follow-up PR.
 
 ## Local development
 
