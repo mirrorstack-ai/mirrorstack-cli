@@ -11,7 +11,7 @@ use clap::Args;
 use crate::api::{self, ApiError};
 use crate::credentials::{self, LoadError};
 
-use super::{DEFAULT_API_BASE, ENV_API_URL};
+use super::{DEFAULT_API_BASE, ENV_API_URL, resolve_base};
 
 #[derive(Args)]
 pub struct WhoamiArgs {}
@@ -27,7 +27,7 @@ pub fn run(_args: WhoamiArgs) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
 
-    let api_base = std::env::var(ENV_API_URL).unwrap_or_else(|_| DEFAULT_API_BASE.into());
+    let api_base = resolve_base(ENV_API_URL, DEFAULT_API_BASE);
 
     match api::me(&api_base, &creds.access_token) {
         Ok(id) => {

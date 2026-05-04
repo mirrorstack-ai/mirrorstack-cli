@@ -24,6 +24,11 @@ pub(crate) const ENV_API_URL: &str = "MIRRORSTACK_API_URL";
 pub(crate) const ENV_APPS_API_URL: &str = "MIRRORSTACK_APPS_API_URL";
 pub(crate) const ENV_WEB_URL: &str = "MIRRORSTACK_WEB_URL";
 
+/// Look up a base URL from `env_var`, falling back to `default` when unset.
+pub(crate) fn resolve_base(env_var: &str, default: &str) -> String {
+    std::env::var(env_var).unwrap_or_else(|_| default.into())
+}
+
 /// Official command-line tool for the MirrorStack platform.
 #[derive(Parser)]
 #[command(name = "mirrorstack", version, about, long_about = None)]

@@ -6,6 +6,7 @@
 //! tooling the developer prefers, and `mirrorstack dev` (future) opens a WSS
 //! tunnel into the platform.
 
+use std::io::IsTerminal;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -19,7 +20,7 @@ use crate::credentials::{self, LoadError};
 
 use super::{
     DEFAULT_API_BASE, DEFAULT_APPS_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_APPS_API_URL,
-    ENV_WEB_URL,
+    ENV_WEB_URL, resolve_base,
 };
 
 #[derive(Args)]
@@ -73,21 +74,16 @@ fn init(args: InitArgs) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
 
-    let api_base = std::env::var(ENV_API_URL).unwrap_or_else(|_| DEFAULT_API_BASE.into());
-    let apps_base =
-        std::env::var(ENV_APPS_API_URL).unwrap_or_else(|_| DEFAULT_APPS_API_BASE.into());
-    let web_base = std::env::var(ENV_WEB_URL).unwrap_or_else(|_| DEFAULT_WEB_BASE.into());
+    let api_base = resolve_base(ENV_API_URL, DEFAULT_API_BASE);
+    let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
+    let web_base = resolve_base(ENV_WEB_URL, DEFAULT_WEB_BASE);
 
     // The platform stores ownership by user id, but the CLI surfaces the
     // full namespaced `@<username>/<slug>` — so we refuse to POST until the
     // caller has claimed a username, and point them at the web flow.
     let identity = match api::me(&api_base, &creds.access_token) {
         Ok(id) => id,
-        Err(ApiError::Unauthenticated) => {
-            return Err(anyhow!(
-                "session expired. Run `mirrorstack login` to sign in again."
-            ));
-        }
+        Err(ApiError::Unauthenticated) => return Err(session_expired()),
         Err(e) => return Err(e.into()),
     };
     let Some(username) = identity.slug.as_deref().filter(|s| !s.is_empty()) else {
@@ -112,21 +108,16 @@ fn init(args: InitArgs) -> Result<()> {
     });
     match pre_check {
         Ok(Some(existing)) if args.used => {
-            print_already_exists(username, &existing.slug, &existing.id);
+            print_already_exists(username, &existing.slug, Some(&existing.id));
             return Ok(());
         }
         Ok(Some(_)) => {
             return Err(anyhow!(
-                "@{username}/{slug} already exists{hint}",
-                hint = slug_error_hint("slug_taken")
+                "@{username}/{slug} already exists (pass --used to ignore when re-running)"
             ));
         }
         Ok(None) => {}
-        Err(ApiError::Unauthenticated) => {
-            return Err(anyhow!(
-                "session expired. Run `mirrorstack login` to sign in again."
-            ));
-        }
+        Err(ApiError::Unauthenticated) => return Err(session_expired()),
         Err(e) => return Err(e.into()),
     }
 
@@ -165,18 +156,20 @@ fn init(args: InitArgs) -> Result<()> {
             Ok(())
         }
         Err(ApiError::Server { code, .. }) if code == "slug_taken" && args.used => {
-            print_already_exists(username, &slug, "(unknown id)");
+            print_already_exists(username, &slug, None);
             Ok(())
         }
         Err(ApiError::Server { code, message, .. }) => Err(anyhow!(
             "{code}: {message}{hint}",
             hint = slug_error_hint(&code)
         )),
-        Err(ApiError::Unauthenticated) => Err(anyhow!(
-            "session expired. Run `mirrorstack login` to sign in again."
-        )),
+        Err(ApiError::Unauthenticated) => Err(session_expired()),
         Err(e) => Err(e.into()),
     }
+}
+
+fn session_expired() -> anyhow::Error {
+    anyhow!("session expired. Run `mirrorstack login` to sign in again.")
 }
 
 fn collect_name_and_slug(theme: &ColorfulTheme, args: &InitArgs) -> Result<(String, String)> {
@@ -225,12 +218,17 @@ fn collect_name_and_slug(theme: &ColorfulTheme, args: &InitArgs) -> Result<(Stri
     Ok((name, slug))
 }
 
-/// Wrap a blocking call with a tick-driven spinner. Spinner is suppressed
-/// when stderr isn't a TTY so CI logs stay clean.
+/// Wrap a blocking call with a tick-driven spinner. Skipped entirely when
+/// stderr isn't a TTY so CI logs and piped output stay clean — indicatif
+/// can detect a non-tty target but `enable_steady_tick` still spawns the
+/// timer thread, so we short-circuit before that.
 fn with_spinner<T, F>(message: &str, f: F) -> T
 where
     F: FnOnce() -> T,
 {
+    if !std::io::stderr().is_terminal() {
+        return f();
+    }
     let pb = ProgressBar::new_spinner();
     pb.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -253,14 +251,14 @@ fn print_created(username: &str, slug: &str, id: &str) {
     eprintln!("  {} {}", style("id:").dim(), id);
 }
 
-fn print_already_exists(username: &str, slug: &str, id: &str) {
+fn print_already_exists(username: &str, slug: &str, id: Option<&str>) {
     eprintln!(
         "{} {} already exists; {} continuing.",
         style("✓").green().bold(),
         style(format!("@{username}/{slug}")).cyan().bold(),
         style("--used set,").dim(),
     );
-    if id != "(unknown id)" {
+    if let Some(id) = id {
         eprintln!("  {} {}", style("id:").dim(), id);
     }
 }
