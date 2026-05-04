@@ -3,8 +3,10 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use console::{StyledObject, style};
 
 mod login;
+mod logout;
 mod module;
 mod whoami;
 
@@ -31,6 +33,16 @@ pub(crate) fn resolve_base(env_var: &str, default: &str) -> String {
     std::env::var(env_var).unwrap_or_else(|_| default.into())
 }
 
+/// Green bold "✓" — shared status prefix for success lines across commands.
+pub(crate) fn ok_mark() -> StyledObject<&'static str> {
+    style("✓").green().bold()
+}
+
+/// Yellow bold "warning:" — shared prefix for non-fatal advisory lines.
+pub(crate) fn warn_prefix() -> StyledObject<&'static str> {
+    style("warning:").yellow().bold()
+}
+
 /// Official command-line tool for the MirrorStack platform.
 #[derive(Parser)]
 #[command(name = "mirrorstack", version, about, long_about = None)]
@@ -43,6 +55,8 @@ pub struct Cli {
 enum Command {
     /// Sign in to MirrorStack via OAuth.
     Login(login::LoginArgs),
+    /// Sign out: revoke the current session and remove local credentials.
+    Logout(logout::LogoutArgs),
     /// Print the currently signed-in user.
     Whoami(whoami::WhoamiArgs),
     /// Manage developer modules (the per-developer reusable units installed
@@ -54,6 +68,7 @@ impl Cli {
     pub fn run(self) -> Result<()> {
         match self.command {
             Command::Login(args) => login::run(args),
+            Command::Logout(args) => logout::run(args),
             Command::Whoami(args) => whoami::run(args),
             Command::Module(args) => module::run(args),
         }

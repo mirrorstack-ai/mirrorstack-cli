@@ -14,6 +14,7 @@ Pre-built releases (brew, scoop, deb) coming with the next milestone.
 
 ```bash
 mirrorstack login           # Sign in via OAuth (PKCE)
+mirrorstack logout          # Revoke the current session and wipe local credentials
 mirrorstack whoami          # Print the currently signed-in user
 mirrorstack module init     # Register a new module on the platform
 mirrorstack --help          # Show help

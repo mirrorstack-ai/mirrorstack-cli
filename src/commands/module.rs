@@ -21,7 +21,7 @@ use crate::http;
 
 use super::{
     DEFAULT_API_BASE, DEFAULT_APPS_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_APPS_API_URL,
-    ENV_WEB_URL, resolve_base,
+    ENV_WEB_URL, ok_mark, resolve_base,
 };
 
 #[derive(Args)]
@@ -239,7 +239,7 @@ where
 fn print_created(username: &str, slug: &str, id: &str) {
     eprintln!(
         "{} created {}",
-        style("✓").green().bold(),
+        ok_mark(),
         style(format!("@{username}/{slug}")).cyan().bold(),
     );
     eprintln!("  {} {}", style("id:").dim(), id);
@@ -248,7 +248,7 @@ fn print_created(username: &str, slug: &str, id: &str) {
 fn print_already_exists(username: &str, slug: &str, id: Option<&str>) {
     eprintln!(
         "{} {} already exists; {} continuing.",
-        style("✓").green().bold(),
+        ok_mark(),
         style(format!("@{username}/{slug}")).cyan().bold(),
         style("--used set,").dim(),
     );

@@ -23,7 +23,6 @@ pub struct Credentials {
 }
 
 #[derive(Debug, Error)]
-#[allow(dead_code)] // NotFound is matched in load(); load() is API for future commands
 pub enum LoadError {
     #[error("credentials: not found (run `mirrorstack login`)")]
     NotFound,
@@ -87,6 +86,19 @@ pub fn load_or_login_hint() -> Result<Credentials> {
             "not signed in. Run `mirrorstack login` to sign in."
         )),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Wipe the credentials file. Idempotent — a missing file is treated as
+/// success so callers don't need to special-case "already logged out".
+/// On other errors (typically permissions) the path is included in the
+/// message so the user can act manually.
+pub fn delete() -> Result<()> {
+    let p = path().context("credentials: path")?;
+    match fs::remove_file(&p) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::anyhow!("credentials: remove {}: {e}", p.display())),
     }
 }
 

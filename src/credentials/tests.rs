@@ -69,4 +69,11 @@ fn credentials_lifecycle() {
         let mode = std::fs::metadata(&p).expect("stat").permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "got {mode:o}, want 0600");
     }
+
+    // delete() wipes the file; subsequent load() returns NotFound.
+    delete().expect("delete");
+    assert!(matches!(load(), Err(LoadError::NotFound)));
+
+    // delete() is idempotent — no error when called against missing file.
+    delete().expect("delete idempotent");
 }
