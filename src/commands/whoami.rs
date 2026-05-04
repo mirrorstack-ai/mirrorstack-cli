@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow};
 use clap::Args;
 
 use crate::api::{self, ApiError};
-use crate::credentials::{self, LoadError};
+use crate::credentials;
 
 use super::{DEFAULT_API_BASE, ENV_API_URL, resolve_base};
 
@@ -17,16 +17,7 @@ use super::{DEFAULT_API_BASE, ENV_API_URL, resolve_base};
 pub struct WhoamiArgs {}
 
 pub fn run(_args: WhoamiArgs) -> Result<()> {
-    let creds = match credentials::load() {
-        Ok(c) => c,
-        Err(LoadError::NotFound) => {
-            return Err(anyhow!(
-                "not signed in. Run `mirrorstack login` to sign in."
-            ));
-        }
-        Err(e) => return Err(e.into()),
-    };
-
+    let creds = credentials::load_or_login_hint()?;
     let api_base = resolve_base(ENV_API_URL, DEFAULT_API_BASE);
 
     match api::me(&api_base, &creds.access_token) {

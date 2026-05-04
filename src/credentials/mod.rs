@@ -77,6 +77,19 @@ pub fn load() -> Result<Credentials, LoadError> {
     }
 }
 
+/// Wrap [`load`] with the auth-required command idiom: a missing file
+/// becomes a "run `mirrorstack login`" hint instead of the raw error.
+/// Used by every command that needs an authenticated session.
+pub fn load_or_login_hint() -> Result<Credentials> {
+    match load() {
+        Ok(c) => Ok(c),
+        Err(LoadError::NotFound) => Err(anyhow::anyhow!(
+            "not signed in. Run `mirrorstack login` to sign in."
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Encode `SystemTime` as RFC 3339 in JSON. Avoids pulling chrono just
 /// for this; serde_json's default for SystemTime is a tagged struct
 /// which is ugly on disk.
