@@ -4,8 +4,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-mod app;
 mod login;
+mod module;
 mod whoami;
 
 /// Default api-platform host. Override per-invocation with
@@ -32,8 +32,9 @@ enum Command {
     Login(login::LoginArgs),
     /// Print the currently signed-in user.
     Whoami(whoami::WhoamiArgs),
-    /// Manage MirrorStack apps and modules.
-    App(app::AppArgs),
+    /// Manage developer modules (the per-developer reusable units installed
+    /// into apps).
+    Module(module::ModuleArgs),
 }
 
 impl Cli {
@@ -41,7 +42,7 @@ impl Cli {
         match self.command {
             Command::Login(args) => login::run(args),
             Command::Whoami(args) => whoami::run(args),
-            Command::App(args) => app::run(args),
+            Command::Module(args) => module::run(args),
         }
     }
 }

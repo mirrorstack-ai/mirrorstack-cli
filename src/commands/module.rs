@@ -1,6 +1,6 @@
-//! `mirrorstack app module …` — developer module management.
+//! `mirrorstack module …` — developer module management.
 //!
-//! Today: only `app module init` (register a module on the platform). Filesystem
+//! Today: only `module init` (register a module on the platform). Filesystem
 //! scaffolding (templates, SDK pull) is intentionally out of scope per the
 //! current product direction — modules are developed locally with whatever
 //! tooling the developer prefers, and `mirrorstack dev` (future) opens a WSS
@@ -15,19 +15,6 @@ use crate::api::{self, ApiError, CreateModuleInput};
 use crate::credentials::{self, LoadError};
 
 use super::{DEFAULT_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_WEB_URL};
-
-#[derive(Args)]
-pub struct AppArgs {
-    #[command(subcommand)]
-    command: AppCommand,
-}
-
-#[derive(Subcommand)]
-enum AppCommand {
-    /// Manage developer modules (the per-developer reusable units installed
-    /// into apps).
-    Module(ModuleArgs),
-}
 
 #[derive(Args)]
 pub struct ModuleArgs {
@@ -61,11 +48,9 @@ pub struct InitArgs {
     used: bool,
 }
 
-pub fn run(args: AppArgs) -> Result<()> {
+pub fn run(args: ModuleArgs) -> Result<()> {
     match args.command {
-        AppCommand::Module(m) => match m.command {
-            ModuleCommand::Init(i) => init(i),
-        },
+        ModuleCommand::Init(i) => init(i),
     }
 }
 
