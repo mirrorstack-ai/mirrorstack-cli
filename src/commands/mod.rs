@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use console::{StyledObject, style};
 
 mod login;
 mod logout;
@@ -30,6 +31,16 @@ pub(crate) const ENV_WEB_URL: &str = "MIRRORSTACK_WEB_URL";
 /// Look up a base URL from `env_var`, falling back to `default` when unset.
 pub(crate) fn resolve_base(env_var: &str, default: &str) -> String {
     std::env::var(env_var).unwrap_or_else(|_| default.into())
+}
+
+/// Green bold "✓" — shared status prefix for success lines across commands.
+pub(crate) fn ok_mark() -> StyledObject<&'static str> {
+    style("✓").green().bold()
+}
+
+/// Yellow bold "warning:" — shared prefix for non-fatal advisory lines.
+pub(crate) fn warn_prefix() -> StyledObject<&'static str> {
+    style("warning:").yellow().bold()
 }
 
 /// Official command-line tool for the MirrorStack platform.

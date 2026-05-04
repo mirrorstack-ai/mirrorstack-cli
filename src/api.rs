@@ -446,6 +446,25 @@ mod tests {
     }
 
     #[test]
+    fn revoke_session_5xx_is_unexpected() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("DELETE", "/v1/auth/sessions/current")
+            .with_status(503)
+            .with_body("upstream timeout")
+            .create();
+
+        let err = revoke_session(&test_client(), &server.url(), "AT", "RT").unwrap_err();
+        match err {
+            ApiError::Unexpected { status, body } => {
+                assert_eq!(status, 503);
+                assert!(body.contains("upstream timeout"), "got body {body:?}");
+            }
+            other => panic!("expected Unexpected, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn create_module_4xx_without_envelope_is_unexpected() {
         let mut server = Server::new();
         let _m = server

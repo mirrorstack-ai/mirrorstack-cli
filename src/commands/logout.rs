@@ -14,7 +14,7 @@ use crate::api::{self, ApiError};
 use crate::credentials::{self, LoadError};
 use crate::http;
 
-use super::{DEFAULT_API_BASE, ENV_API_URL, resolve_base};
+use super::{DEFAULT_API_BASE, ENV_API_URL, ok_mark, resolve_base, warn_prefix};
 
 #[derive(Args)]
 pub struct LogoutArgs {}
@@ -23,7 +23,7 @@ pub fn run(_args: LogoutArgs) -> Result<()> {
     let creds = match credentials::load() {
         Ok(c) => c,
         Err(LoadError::NotFound) => {
-            eprintln!("{} already signed out.", style("✓").green().bold());
+            eprintln!("{} already signed out.", ok_mark());
             return Ok(());
         }
         Err(e) => return Err(e.into()),
@@ -52,14 +52,14 @@ pub fn run(_args: LogoutArgs) -> Result<()> {
     if let Some(reason) = server_warn {
         eprintln!(
             "{} server revoke failed ({reason}); local credentials wiped.",
-            style("warning:").yellow().bold(),
+            warn_prefix(),
         );
         eprintln!(
             "  {}",
             style("the refresh token may still be valid until it expires.").dim(),
         );
     } else {
-        eprintln!("{} signed out.", style("✓").green().bold());
+        eprintln!("{} signed out.", ok_mark());
     }
     Ok(())
 }
