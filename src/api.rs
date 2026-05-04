@@ -1,15 +1,16 @@
-//! Authenticated calls to the api-platform account service. Endpoints
-//! that require a session expect `Authorization: Bearer <access_token>`.
+//! Authenticated calls to the api-platform account and applications
+//! services. Endpoints that require a session expect
+//! `Authorization: Bearer <access_token>`.
+//!
+//! Functions accept a `&Client` so a single command builds one client
+//! and reuses its connection pool across multiple calls (e.g. `me` +
+//! `get_module` + `create_module` from `module init`).
 
-use std::io::Read;
-use std::time::Duration;
-
+use reqwest::blocking::{Client, Response};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::http;
-
-const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)] // profile_url is part of the API surface; whoami doesn't print it yet
@@ -75,9 +76,8 @@ pub struct CreateModuleInput<'a> {
 }
 
 /// GET /v1/auth/me — returns the authenticated user's identity.
-pub fn me(api_base: &str, access_token: &str) -> Result<Identity, ApiError> {
+pub fn me(http: &Client, api_base: &str, access_token: &str) -> Result<Identity, ApiError> {
     let endpoint = format!("{}/v1/auth/me", api_base.trim_end_matches('/'));
-    let http = http::client(Duration::from_secs(15))?;
 
     let resp = http
         .get(&endpoint)
@@ -86,26 +86,13 @@ pub fn me(api_base: &str, access_token: &str) -> Result<Identity, ApiError> {
         .send()?;
 
     let status = resp.status();
-
     if status.is_success() {
         return Ok(resp.json::<Identity>()?);
     }
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         return Err(ApiError::Unauthenticated);
     }
-    // Bound the error-path body so a hostile endpoint can't OOM us.
-    let mut body = Vec::with_capacity(1024);
-    resp.take(MAX_RESPONSE_BYTES)
-        .read_to_end(&mut body)
-        .map_err(|e| ApiError::Unexpected {
-            status: status.as_u16(),
-            body: format!("(read body failed: {e})"),
-        })?;
-    let body = String::from_utf8_lossy(&body).into_owned();
-    Err(ApiError::Unexpected {
-        status: status.as_u16(),
-        body,
-    })
+    Err(unexpected_body_error(resp))
 }
 
 /// GET /v1/modules/{slug} — returns the caller's module by slug.
@@ -114,6 +101,7 @@ pub fn me(api_base: &str, access_token: &str) -> Result<Identity, ApiError> {
 /// per-owner, so 404 here does NOT mean the platform-wide name is unique
 /// (reserved/format checks still happen on POST).
 pub fn get_module(
+    http: &Client,
     apps_base: &str,
     access_token: &str,
     slug: &str,
@@ -121,7 +109,6 @@ pub fn get_module(
     // Slug is pre-validated against `^[a-z][a-z0-9-]{1,38}[a-z0-9]$` before
     // this call, so it's URL-safe with no encoding needed.
     let endpoint = format!("{}/v1/modules/{}", apps_base.trim_end_matches('/'), slug);
-    let http = http::client(Duration::from_secs(15))?;
 
     let resp = http
         .get(&endpoint)
@@ -139,27 +126,17 @@ pub fn get_module(
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         return Err(ApiError::Unauthenticated);
     }
-    let mut body = Vec::with_capacity(1024);
-    resp.take(MAX_RESPONSE_BYTES)
-        .read_to_end(&mut body)
-        .map_err(|e| ApiError::Unexpected {
-            status: status.as_u16(),
-            body: format!("(read body failed: {e})"),
-        })?;
-    Err(ApiError::Unexpected {
-        status: status.as_u16(),
-        body: String::from_utf8_lossy(&body).into_owned(),
-    })
+    Err(unexpected_body_error(resp))
 }
 
 /// POST /v1/modules — create a developer-owned module.
 pub fn create_module(
+    http: &Client,
     apps_base: &str,
     access_token: &str,
     input: &CreateModuleInput,
 ) -> Result<Module, ApiError> {
     let endpoint = format!("{}/v1/modules", apps_base.trim_end_matches('/'));
-    let http = http::client(Duration::from_secs(15))?;
 
     let resp = http
         .post(&endpoint)
@@ -179,32 +156,58 @@ pub fn create_module(
     // 4xx with platform error-envelope: surface code + message so callers
     // can branch on `slug_taken` / `slug_reserved` / `slug_invalid` without
     // re-parsing the body.
-    let mut body = Vec::with_capacity(1024);
-    resp.take(MAX_RESPONSE_BYTES)
-        .read_to_end(&mut body)
-        .map_err(|e| ApiError::Unexpected {
-            status: status.as_u16(),
-            body: format!("(read body failed: {e})"),
-        })?;
+    let status_u16 = status.as_u16();
+    let body = match http::read_capped(resp) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(ApiError::Unexpected {
+                status: status_u16,
+                body: format!("(read body failed: {e})"),
+            });
+        }
+    };
     if let Ok(env) = serde_json::from_slice::<ErrorEnvelope>(&body) {
         return Err(ApiError::Server {
-            status: status.as_u16(),
+            status: status_u16,
             code: env.error.code,
             message: env.error.message,
         });
     }
     Err(ApiError::Unexpected {
-        status: status.as_u16(),
+        status: status_u16,
         body: String::from_utf8_lossy(&body).into_owned(),
     })
+}
+
+/// Common tail for unexpected (non-success, non-typed) responses: read
+/// the body with [`http::read_capped`] and wrap as `ApiError::Unexpected`.
+/// If reading fails, the io error is folded into the body for diagnosis.
+fn unexpected_body_error(resp: Response) -> ApiError {
+    let status = resp.status().as_u16();
+    match http::read_capped(resp) {
+        Ok(bytes) => ApiError::Unexpected {
+            status,
+            body: String::from_utf8_lossy(&bytes).into_owned(),
+        },
+        Err(e) => ApiError::Unexpected {
+            status,
+            body: format!("(read body failed: {e})"),
+        },
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use std::time::Duration;
+
     use mockito::Server;
     use serde_json::json;
+
+    fn test_client() -> Client {
+        http::client(Duration::from_secs(15)).expect("client")
+    }
 
     #[test]
     fn me_success() {
@@ -225,7 +228,7 @@ mod tests {
             )
             .create();
 
-        let id = me(&server.url(), "AT").expect("ok");
+        let id = me(&test_client(), &server.url(), "AT").expect("ok");
         assert_eq!(id.email, "user@example.com");
         assert_eq!(id.slug.as_deref(), Some("test-user"));
     }
@@ -239,8 +242,27 @@ mod tests {
             .with_body(r#"{"error":{"code":"token_invalid"}}"#)
             .create();
 
-        let err = me(&server.url(), "expired").unwrap_err();
+        let err = me(&test_client(), &server.url(), "expired").unwrap_err();
         assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
+    }
+
+    #[test]
+    fn me_5xx_is_unexpected_with_body() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/auth/me")
+            .with_status(503)
+            .with_body("upstream timeout")
+            .create();
+
+        let err = me(&test_client(), &server.url(), "AT").unwrap_err();
+        match err {
+            ApiError::Unexpected { status, body } => {
+                assert_eq!(status, 503);
+                assert!(body.contains("upstream timeout"), "got body {body:?}");
+            }
+            other => panic!("expected Unexpected, got {other:?}"),
+        }
     }
 
     #[test]
@@ -266,6 +288,7 @@ mod tests {
             .create();
 
         let m = create_module(
+            &test_client(),
             &server.url(),
             "AT",
             &CreateModuleInput {
@@ -296,7 +319,7 @@ mod tests {
             )
             .create();
 
-        let m = get_module(&server.url(), "AT", "media").expect("ok");
+        let m = get_module(&test_client(), &server.url(), "AT", "media").expect("ok");
         assert!(m.is_some());
         assert_eq!(m.unwrap().slug, "media");
     }
@@ -306,11 +329,25 @@ mod tests {
         let mut server = Server::new();
         let _m = server
             .mock("GET", "/v1/modules/none")
+            .match_header("authorization", "Bearer AT")
             .with_status(404)
             .create();
 
-        let m = get_module(&server.url(), "AT", "none").expect("ok");
+        let m = get_module(&test_client(), &server.url(), "AT", "none").expect("ok");
         assert!(m.is_none());
+    }
+
+    #[test]
+    fn get_module_401_is_unauthenticated() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/modules/forbidden-slug")
+            .with_status(401)
+            .create();
+
+        let err =
+            get_module(&test_client(), &server.url(), "expired", "forbidden-slug").unwrap_err();
+        assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
     }
 
     #[test]
@@ -325,6 +362,7 @@ mod tests {
             .create();
 
         let err = create_module(
+            &test_client(),
             &server.url(),
             "AT",
             &CreateModuleInput {
@@ -339,6 +377,34 @@ mod tests {
                 assert_eq!(code, "slug_taken");
             }
             other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_module_4xx_without_envelope_is_unexpected() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules")
+            .with_status(400)
+            .with_body("not json")
+            .create();
+
+        let err = create_module(
+            &test_client(),
+            &server.url(),
+            "AT",
+            &CreateModuleInput {
+                name: "x",
+                slug: "x",
+            },
+        )
+        .unwrap_err();
+        match err {
+            ApiError::Unexpected { status, body } => {
+                assert_eq!(status, 400);
+                assert!(body.contains("not json"), "got body {body:?}");
+            }
+            other => panic!("expected Unexpected, got {other:?}"),
         }
     }
 }

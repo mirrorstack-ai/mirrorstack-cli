@@ -5,8 +5,6 @@
 //! displayed on the consent page back into the terminal. Custom-scheme
 //! and per-OS handler registration is the follow-up tracked at #7.
 
-use std::io::Read;
-
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::TryRngCore;
@@ -17,10 +15,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
-/// Cap on response bodies we'll deserialize. /token and /me return
-/// sub-1KB JSON in practice; 64 KiB is generous slack and protects
-/// against a hostile endpoint trying to OOM the CLI.
-const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
+use crate::http;
 
 /// Identifies the CLI to the platform; matches the seed in
 /// api-platform migration `011_oauth.up.sql`.
@@ -176,15 +171,10 @@ fn random_b64url(n: usize) -> Result<String, AuthError> {
     Ok(URL_SAFE_NO_PAD.encode(buf))
 }
 
-/// Read a response body into memory with a hard size cap. Truncated
-/// bodies are returned as-is — the JSON parse downstream will fail
-/// loudly rather than silently misinterpret a partial document.
+/// Wrap [`http::read_capped`] with auth-specific error mapping.
 fn read_capped(resp: Response) -> Result<String, AuthError> {
-    let mut buf = Vec::with_capacity(1024);
-    resp.take(MAX_RESPONSE_BYTES)
-        .read_to_end(&mut buf)
-        .map_err(|e| AuthError::Decode(e.to_string()))?;
-    String::from_utf8(buf).map_err(|e| AuthError::Decode(e.to_string()))
+    let bytes = http::read_capped(resp).map_err(|e| AuthError::Decode(e.to_string()))?;
+    String::from_utf8(bytes).map_err(|e| AuthError::Decode(e.to_string()))
 }
 
 #[cfg(test)]

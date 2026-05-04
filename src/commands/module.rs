@@ -17,6 +17,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::api::{self, ApiError, CreateModuleInput};
 use crate::credentials;
+use crate::http;
 
 use super::{
     DEFAULT_API_BASE, DEFAULT_APPS_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_APPS_API_URL,
@@ -68,11 +69,12 @@ fn init(args: InitArgs) -> Result<()> {
     let api_base = resolve_base(ENV_API_URL, DEFAULT_API_BASE);
     let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
     let web_base = resolve_base(ENV_WEB_URL, DEFAULT_WEB_BASE);
+    let client = http::client(Duration::from_secs(15))?;
 
     // The platform stores ownership by user id, but the CLI surfaces the
     // full namespaced `@<username>/<slug>` — so we refuse to POST until the
     // caller has claimed a username, and point them at the web flow.
-    let identity = match api::me(&api_base, &creds.access_token) {
+    let identity = match api::me(&client, &api_base, &creds.access_token) {
         Ok(id) => id,
         Err(ApiError::Unauthenticated) => return Err(session_expired()),
         Err(e) => return Err(e.into()),
@@ -95,7 +97,7 @@ fn init(args: InitArgs) -> Result<()> {
     // the common "I forgot I made this last week" case before we POST.
     // Reserved/invalid still surface server-side from the POST below.
     let pre_check = with_spinner("Checking availability…", || {
-        api::get_module(&apps_base, &creds.access_token, &slug)
+        api::get_module(&client, &apps_base, &creds.access_token, &slug)
     });
     match pre_check {
         Ok(Some(existing)) if args.used => {
@@ -132,6 +134,7 @@ fn init(args: InitArgs) -> Result<()> {
 
     let create_result = with_spinner("Creating module…", || {
         api::create_module(
+            &client,
             &apps_base,
             &creds.access_token,
             &CreateModuleInput {
