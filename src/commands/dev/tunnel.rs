@@ -13,11 +13,29 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio::net::TcpStream;
 use tokio::sync::Notify;
+use tokio::time::MissedTickBehavior;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use url::Url;
 use uuid_lite::uuid_v4_string;
+
+use super::super::warn_prefix;
+
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type WsSink = SplitSink<WsStream, Message>;
+type WsReader = SplitStream<WsStream>;
+
+/// Cap inbound frames at 1 MiB. tokio-tungstenite's default is 64 MiB —
+/// way too generous for our wire format (L1.5 says 128 KB per frame; 1 MiB
+/// gives an order of magnitude headroom for streaming row batches without
+/// exposing a memory-bomb surface to a misbehaving server.
+const MAX_INBOUND_FRAME_BYTES: usize = 1 << 20;
 
 mod uuid_lite {
     //! Tiny v4 UUID generator. We don't pull `uuid` for one call site — the
@@ -121,9 +139,12 @@ pub(super) struct RegisterAck {
 }
 
 /// Spawned-task handle. Drop or call [`shutdown`] to close the WSS.
+///
+/// `service_token` is intentionally NOT held here — it lives on the
+/// returned [`RegisterAck`] until a real consumer (the future RPC plane)
+/// needs it on the handle itself. Re-thread when wired.
 pub(super) struct TunnelHandle {
     pub session_id: String,
-    pub service_token: String,
     shutdown: Arc<Notify>,
 }
 
@@ -144,111 +165,151 @@ pub(super) async fn open(
     ttok: &str,
     register: RegisterPayload<'_>,
 ) -> Result<TunnelHandle> {
-    let url = if wss_url.contains('?') {
-        format!("{wss_url}&token={ttok}")
-    } else {
-        format!("{wss_url}?token={ttok}")
+    let url = with_token_param(wss_url, ttok)?;
+    let config = WebSocketConfig {
+        max_message_size: Some(MAX_INBOUND_FRAME_BYTES),
+        max_frame_size: Some(MAX_INBOUND_FRAME_BYTES),
+        ..Default::default()
     };
-    let (ws_stream, _resp) = tokio_tungstenite::connect_async(&url)
-        .await
-        .with_context(|| format!("dev: connect WSS {wss_url}"))?;
+    let (ws_stream, _resp) =
+        tokio_tungstenite::connect_async_with_config(&url, Some(config), false)
+            .await
+            .with_context(|| format!("dev: connect WSS {wss_url}"))?;
     let (mut sink, mut stream) = ws_stream.split();
 
-    // Send register.
-    let payload = serde_json::to_value(&register).context("dev: serialize register payload")?;
-    let register_frame = Frame::new(FrameType::Register, Some(payload));
+    let register_frame = Frame::new(
+        FrameType::Register,
+        Some(serde_json::to_value(&register).context("dev: serialize register payload")?),
+    );
     let register_id = register_frame.id.clone();
     sink.send(Message::Text(serde_json::to_string(&register_frame)?))
         .await
         .context("dev: send register frame")?;
 
-    // Await register_ack with a generous timeout.
-    let ack = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let next = stream
-                .next()
-                .await
-                .ok_or_else(|| anyhow!("stream closed before register_ack"))?;
-            let msg = next.context("dev: read register_ack")?;
-            let text = match msg {
-                Message::Text(t) => t.to_string(),
-                Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
-                Message::Ping(p) => {
-                    sink.send(Message::Pong(p)).await.ok();
-                    continue;
-                }
-                Message::Close(_) => return Err(anyhow!("server closed before register_ack")),
-                _ => continue,
-            };
-            let frame: Frame = serde_json::from_str(&text)
-                .with_context(|| format!("dev: parse server frame: {text}"))?;
-            if frame.frame_type == FrameType::RegisterAck
-                && frame.corr_id.as_deref() == Some(&register_id)
-            {
-                let ack_payload = frame
-                    .payload
-                    .ok_or_else(|| anyhow!("register_ack missing payload"))?;
-                let ack: RegisterAck =
-                    serde_json::from_value(ack_payload).context("dev: deserialize register_ack")?;
-                return Ok(ack);
-            }
-            // Ignore unrelated frames during handshake — server may send
-            // ping or status frames before our ack arrives.
-        }
-    })
+    let ack = tokio::time::timeout(
+        Duration::from_secs(10),
+        await_register_ack(&mut sink, &mut stream, &register_id),
+    )
     .await
     .context("dev: register_ack timeout")?
     .context("dev: register_ack")?;
 
     let shutdown = Arc::new(Notify::new());
-    let shutdown_clone = shutdown.clone();
-
-    // Background task: ping every 30s, respond to server pings, close on shutdown.
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        // First tick fires immediately; we don't want a ping at t=0.
-        interval.tick().await;
-        loop {
-            tokio::select! {
-                _ = shutdown_clone.notified() => {
-                    let close = Frame::new(FrameType::Close, None);
-                    if let Ok(body) = serde_json::to_string(&close) {
-                        let _ = sink.send(Message::Text(body)).await;
-                    }
-                    let _ = sink.close().await;
-                    return;
-                }
-                _ = interval.tick() => {
-                    let ping = Frame::new(FrameType::Ping, None);
-                    if let Ok(body) = serde_json::to_string(&ping) {
-                        if sink.send(Message::Text(body)).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-                msg = stream.next() => {
-                    match msg {
-                        Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) => {
-                            // Server frames (pong, future RPC responses) ignored
-                            // for now — Phase 1 doesn't act on them client-side.
-                        }
-                        Some(Ok(Message::Ping(p))) => {
-                            let _ = sink.send(Message::Pong(p)).await;
-                        }
-                        Some(Ok(Message::Pong(_))) => {}
-                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
-                        Some(Ok(Message::Frame(_))) => {}
-                    }
-                }
-            }
-        }
-    });
+    tokio::spawn(run_tunnel_loop(sink, stream, shutdown.clone()));
 
     Ok(TunnelHandle {
         session_id: ack.session_id,
-        service_token: ack.service_token,
         shutdown,
     })
+}
+
+/// Append `?token=<ttok>` (or `&token=<ttok>` if a query already exists) to
+/// `wss_url` using the `url` crate's parser — same pattern as
+/// `auth::authorize_url` for the OAuth consent URL. Avoids the fragile
+/// `?` vs `&` substring check the previous version did.
+fn with_token_param(wss_url: &str, ttok: &str) -> Result<String> {
+    let mut u = Url::parse(wss_url).with_context(|| format!("dev: parse wss_url {wss_url}"))?;
+    u.query_pairs_mut().append_pair("token", ttok);
+    Ok(u.into())
+}
+
+/// Read frames off `stream` until a `register_ack` correlated with
+/// `register_id` arrives. Server-side ping/binary/text-without-ack are
+/// tolerated — the server may send heartbeat or status frames before
+/// the ack lands. Wrapped in `tokio::time::timeout` by the caller.
+async fn await_register_ack(
+    sink: &mut WsSink,
+    stream: &mut WsReader,
+    register_id: &str,
+) -> Result<RegisterAck> {
+    loop {
+        let next = stream
+            .next()
+            .await
+            .ok_or_else(|| anyhow!("stream closed before register_ack"))?;
+        let msg = next.context("dev: read register_ack")?;
+        let text = match msg {
+            Message::Text(t) => t.to_string(),
+            Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
+            Message::Ping(p) => {
+                let _ = sink.send(Message::Pong(p)).await;
+                continue;
+            }
+            Message::Close(_) => return Err(anyhow!("server closed before register_ack")),
+            _ => continue,
+        };
+        let frame: Frame = serde_json::from_str(&text)
+            .with_context(|| format!("dev: parse server frame: {text}"))?;
+        if frame.frame_type == FrameType::RegisterAck
+            && frame.corr_id.as_deref() == Some(register_id)
+        {
+            let payload = frame
+                .payload
+                .ok_or_else(|| anyhow!("register_ack missing payload"))?;
+            return serde_json::from_value(payload).context("dev: deserialize register_ack");
+        }
+        // Other frames during handshake are ignored — see fn comment.
+    }
+}
+
+/// Long-running tunnel loop: ping every 30s, respond to server pings,
+/// shut down on signal. Surfaces transport failures via `warn_prefix()`
+/// so a silently-dying tunnel doesn't leave the user wondering why
+/// inbound calls stop arriving. (See issue #29 for upgrading this to a
+/// liveness signal callers can poll.)
+async fn run_tunnel_loop(mut sink: WsSink, mut stream: WsReader, shutdown: Arc<Notify>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    // The first tick fires immediately — consume it so the first ping is at
+    // t=30s, not t=0. Delay the missed-tick behavior so a paused runtime
+    // (e.g. laptop sleep) doesn't burst-ping on resume.
+    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    interval.tick().await;
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => {
+                let close = Frame::new(FrameType::Close, None);
+                if let Ok(body) = serde_json::to_string(&close) {
+                    let _ = sink.send(Message::Text(body)).await;
+                }
+                let _ = sink.close().await;
+                return;
+            }
+            _ = interval.tick() => {
+                let ping = Frame::new(FrameType::Ping, None);
+                if let Ok(body) = serde_json::to_string(&ping) {
+                    if let Err(e) = sink.send(Message::Text(body)).await {
+                        eprintln!("{} tunnel: ping send failed ({e}); closing tunnel", warn_prefix());
+                        return;
+                    }
+                }
+            }
+            msg = stream.next() => {
+                match msg {
+                    Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) => {
+                        // Server frames (pong, future RPC responses) ignored
+                        // for now — Phase 1 doesn't act on them client-side.
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = sink.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(reason))) => {
+                        eprintln!("{} tunnel closed by server: {reason:?}", warn_prefix());
+                        return;
+                    }
+                    Some(Err(e)) => {
+                        eprintln!("{} tunnel: read failed ({e}); closing tunnel", warn_prefix());
+                        return;
+                    }
+                    None => {
+                        eprintln!("{} tunnel: stream ended", warn_prefix());
+                        return;
+                    }
+                    Some(Ok(Message::Frame(_))) => {}
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -299,5 +360,25 @@ mod tests {
         let s = serde_json::to_string(&p).unwrap();
         assert!(s.contains("\"module_id\":\"m_abc\""));
         assert!(s.contains("\"local_url\":\"http://localhost:8080\""));
+    }
+
+    #[test]
+    fn with_token_param_appends_when_no_query() {
+        let got = with_token_param("wss://api.example/ws", "ttok_abc").unwrap();
+        assert_eq!(got, "wss://api.example/ws?token=ttok_abc");
+    }
+
+    #[test]
+    fn with_token_param_appends_when_query_present() {
+        let got = with_token_param("wss://api.example/ws?stage=prod", "ttok_abc").unwrap();
+        // url crate may reorder pairs; just assert both made it.
+        assert!(got.contains("stage=prod"));
+        assert!(got.contains("token=ttok_abc"));
+        assert!(got.starts_with("wss://api.example/ws?"));
+    }
+
+    #[test]
+    fn with_token_param_rejects_malformed_url() {
+        assert!(with_token_param("not a url", "ttok").is_err());
     }
 }
