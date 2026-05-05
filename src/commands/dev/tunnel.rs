@@ -117,11 +117,6 @@ impl Frame {
             payload,
         }
     }
-
-    pub(super) fn with_corr(mut self, corr_id: String) -> Self {
-        self.corr_id = Some(corr_id);
-        self
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -134,7 +129,14 @@ pub(super) struct RegisterPayload<'a> {
 #[derive(Debug, Deserialize)]
 pub(super) struct RegisterAck {
     pub session_id: String,
+    /// Carried by future RPC/SQL frames as the per-tunnel service token.
+    /// Phase 1 doesn't emit those frames yet; the field is held so the
+    /// returned handle stays a single source of truth for the ack.
+    #[allow(dead_code)]
     pub service_token: String,
+    /// RFC3339 — informational; the L1.5 reconnect contract makes the
+    /// client retry on any failure rather than expiry-driven refresh.
+    #[allow(dead_code)]
     pub expires_at: String,
 }
 

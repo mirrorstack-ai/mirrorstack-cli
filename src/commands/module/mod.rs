@@ -22,7 +22,7 @@ mod scaffold;
 
 use super::{
     DEFAULT_API_BASE, DEFAULT_APPS_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_APPS_API_URL,
-    ENV_WEB_URL, ok_mark, resolve_base,
+    ENV_WEB_URL, ok_mark, resolve_base, session_expired,
 };
 
 #[derive(Args)]
@@ -255,10 +255,6 @@ fn print_scaffold_summary(target: &Path) {
 fn is_cwd(target: &Path) -> bool {
     let mut comps = target.components();
     matches!(comps.next(), Some(std::path::Component::CurDir)) && comps.next().is_none()
-}
-
-fn session_expired() -> anyhow::Error {
-    anyhow!("session expired. Run `mirrorstack login` to sign in again.")
 }
 
 fn collect_name_and_slug(theme: &ColorfulTheme, args: &InitArgs) -> Result<(String, String)> {
