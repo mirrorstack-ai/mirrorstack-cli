@@ -1,7 +1,7 @@
 //! Top-level CLI surface. Each variant of `Command` maps to a subcommand
 //! module under this directory.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use console::{StyledObject, style};
 
@@ -49,6 +49,13 @@ pub(crate) fn ok_mark() -> StyledObject<&'static str> {
 /// Yellow bold "warning:" — shared prefix for non-fatal advisory lines.
 pub(crate) fn warn_prefix() -> StyledObject<&'static str> {
     style("warning:").yellow().bold()
+}
+
+/// Standard error returned by every command that hits a 401 from the
+/// platform. Centralized so the wording is identical across `module init`,
+/// `dev`, `whoami`, etc. — users see one message, not three slight variants.
+pub(crate) fn session_expired() -> anyhow::Error {
+    anyhow!("session expired. Run `mirrorstack login` to sign in again.")
 }
 
 /// Official command-line tool for the MirrorStack platform.

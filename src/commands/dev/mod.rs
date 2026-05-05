@@ -21,7 +21,9 @@ use anyhow::{Context, Result, anyhow};
 use clap::Args;
 use console::style;
 
-use super::{DEFAULT_DISPATCH_BASE, ENV_DISPATCH_URL, ok_mark, resolve_base, warn_prefix};
+use super::{
+    DEFAULT_DISPATCH_BASE, ENV_DISPATCH_URL, ok_mark, resolve_base, session_expired, warn_prefix,
+};
 use crate::{api, credentials, http};
 
 mod compose;
@@ -59,6 +61,10 @@ pub struct DevArgs {
 // the bundled compose can coexist with api-platform's own postgres on 5432).
 const DEFAULT_DB_URL: &str =
     "postgres://mirrorstack:mirrorstack@localhost:5433/mirrorstack?sslmode=disable";
+
+/// Default local URL the platform should 302 to for Leaf 1 routing. Matches
+/// the SDK's default HTTP listener port. Override with `--local-url`.
+const DEFAULT_LOCAL_URL: &str = "http://localhost:8080";
 
 pub fn run(args: DevArgs) -> Result<()> {
     let cwd = args
@@ -123,7 +129,7 @@ fn open_tunnel(
     let dispatch_base = resolve_base(ENV_DISPATCH_URL, DEFAULT_DISPATCH_BASE);
     let client = http::client(Duration::from_secs(15))?;
     let module_id = module_meta::read_module_id(module_dir)?;
-    let local_url = local_url.unwrap_or("http://localhost:8080");
+    let local_url = local_url.unwrap_or(DEFAULT_LOCAL_URL);
 
     eprintln!(
         "{} fetching tunnel token from {}",
@@ -132,14 +138,10 @@ fn open_tunnel(
     );
     let token = match api::tunnel_token(&client, &dispatch_base, &creds.access_token) {
         Ok(t) => t,
-        Err(api::ApiError::Unauthenticated) => {
-            return Err(anyhow!(
-                "session expired. Run `mirrorstack login` to sign in again."
-            ));
-        }
+        Err(api::ApiError::Unauthenticated) => return Err(session_expired()),
         Err(e) => {
-            // Account-service unreachable is a routine "platform isn't
-            // running yet" error — point the user at the right env var.
+            // Dispatch unreachable is a routine "platform isn't running yet"
+            // error — point the user at the right env var.
             return Err(anyhow!(
                 "dev: tunnel-token mint failed: {e}. Check {} (or {} env var) and that the dispatch service is running.",
                 dispatch_base,
