@@ -76,6 +76,41 @@ pub struct CreateModuleInput<'a> {
 }
 
 /// GET /v1/auth/me — returns the authenticated user's identity.
+/// Response shape from `POST /v1/tunnel/token`. The CLI follows up with
+/// a WebSocket connect against `wss_url` carrying `?token=<token>`.
+#[derive(Deserialize, Debug)]
+pub struct TunnelToken {
+    pub token: String,
+    pub wss_url: String,
+    /// RFC3339. Server-side TTL is short (60s); we don't act on this
+    /// value (any failure triggers a fresh mint), but it's surfaced for
+    /// diagnostic logging if the connect hangs.
+    #[allow(dead_code)]
+    pub expires_at: String,
+}
+
+/// POST /v1/tunnel/token — mint a connect token for the WSS dev tunnel.
+pub fn tunnel_token(
+    http: &Client,
+    dispatch_base: &str,
+    access_token: &str,
+) -> Result<TunnelToken, ApiError> {
+    let endpoint = format!("{}/v1/tunnel/token", dispatch_base.trim_end_matches('/'));
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<TunnelToken>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(unexpected_body_error(resp))
+}
+
 pub fn me(http: &Client, api_base: &str, access_token: &str) -> Result<Identity, ApiError> {
     let endpoint = format!("{}/v1/auth/me", api_base.trim_end_matches('/'));
 
