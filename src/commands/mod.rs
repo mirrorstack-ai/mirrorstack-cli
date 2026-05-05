@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use console::{StyledObject, style};
 
+mod dev;
 mod login;
 mod logout;
 mod module;
@@ -62,6 +63,9 @@ enum Command {
     /// Manage developer modules (the per-developer reusable units installed
     /// into apps).
     Module(module::ModuleArgs),
+    /// Run a module locally with its supporting services (Postgres in v1;
+    /// the WSS tunnel layer lands in a follow-up).
+    Dev(dev::DevArgs),
 }
 
 impl Cli {
@@ -71,6 +75,7 @@ impl Cli {
             Command::Logout(args) => logout::run(args),
             Command::Whoami(args) => whoami::run(args),
             Command::Module(args) => module::run(args),
+            Command::Dev(args) => dev::run(args),
         }
     }
 }
