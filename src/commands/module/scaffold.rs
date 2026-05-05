@@ -24,12 +24,17 @@ const SQL_INIT: &str = include_str!("../../../templates/module/sql/app/0001_init
 // files and this renderer is auditable from a single grep.
 const SLUG_TOKEN: &str = "__MS_SLUG__";
 const NAME_TOKEN: &str = "__MS_NAME__";
-const TABLE_PREFIX_TOKEN: &str = "__MS_TABLE_PREFIX__";
+const MODULE_ID_TOKEN: &str = "__MS_MODULE_ID__";
 
 /// Inputs collected by the caller before scaffolding.
+///
+/// `module_id` is the platform-assigned UUID — stable across slug renames,
+/// which is why both `Config.ID` and the table prefix derive from it rather
+/// than from the URL slug.
 pub(super) struct Inputs<'a> {
     pub slug: &'a str,
     pub name: &'a str,
+    pub module_id: &'a str,
 }
 
 /// Refuse if `target` already contains files. Empty dir or missing dir = OK.
@@ -82,31 +87,55 @@ fn write_file(target: &Path, rel: &str, body: &str, inputs: &Inputs<'_>) -> Resu
 fn render(body: &str, inputs: &Inputs<'_>) -> String {
     body.replace(SLUG_TOKEN, inputs.slug)
         .replace(NAME_TOKEN, inputs.name)
-        .replace(TABLE_PREFIX_TOKEN, &table_prefix(inputs.slug))
+        .replace(MODULE_ID_TOKEN, &sanitize_module_id(inputs.module_id))
 }
 
-/// Convert a module slug (`my-mod`) into a valid Postgres identifier prefix
-/// (`my_mod`). The SQL template appends `_items` etc. — caller controls the
-/// suffix.
-fn table_prefix(slug: &str) -> String {
-    slug.replace('-', "_")
+/// Convert a platform UUID (`bb8a3f8b-1234-5678-9abc-def012345678`) into a
+/// valid Postgres identifier and `Config.ID`: strip hyphens, prepend a
+/// literal `m` so the result always starts with a letter (UUIDs may begin
+/// with a digit), and lowercase the hex (already lowercase out of
+/// `gen_random_uuid()`, but normalize defensively for any other source).
+///
+/// The SDK's `moduleIDPattern` regex caps `Config.ID` at 36 chars; this
+/// produces 33 (`m` + 32 hex), which fits with margin.
+fn sanitize_module_id(uuid: &str) -> String {
+    let mut out = String::with_capacity(33);
+    out.push('m');
+    for c in uuid.chars() {
+        if c == '-' {
+            continue;
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const SAMPLE_UUID: &str = "bb8a3f8b-1234-5678-9abc-def012345678";
+    const SAMPLE_SANITIZED: &str = "mbb8a3f8b123456789abcdef012345678";
+
     fn ins<'a>(slug: &'a str, name: &'a str) -> Inputs<'a> {
-        Inputs { slug, name }
+        Inputs {
+            slug,
+            name,
+            module_id: SAMPLE_UUID,
+        }
     }
 
     #[test]
-    fn render_substitutes_slug_and_name() {
+    fn render_substitutes_module_id_into_config_id() {
         let out = render(MAIN_GO, &ins("my-mod", "My Mod"));
-        assert!(out.contains(r#"ID:   "my-mod""#));
+        assert!(
+            out.contains(&format!(r#"ID:   "{}""#, SAMPLE_SANITIZED)),
+            "rendered main.go missing UUID-derived Config.ID"
+        );
         assert!(out.contains(r#"Name: "My Mod""#));
         assert!(!out.contains("__MS_SLUG__"));
         assert!(!out.contains("__MS_NAME__"));
+        assert!(!out.contains("__MS_MODULE_ID__"));
     }
 
     #[test]
@@ -117,21 +146,45 @@ mod tests {
     }
 
     #[test]
-    fn table_prefix_replaces_hyphens() {
-        assert_eq!(table_prefix("media"), "media");
-        assert_eq!(table_prefix("my-mod"), "my_mod");
-        assert_eq!(table_prefix("a-b-c"), "a_b_c");
+    fn sanitize_module_id_strips_hyphens_and_prepends_letter() {
+        assert_eq!(sanitize_module_id(SAMPLE_UUID), SAMPLE_SANITIZED);
+        // UUIDs that start with a digit still produce an identifier-safe ID.
+        assert_eq!(
+            sanitize_module_id("01234567-89ab-cdef-0123-456789abcdef"),
+            "m0123456789abcdef0123456789abcdef"
+        );
     }
 
     #[test]
-    fn render_sql_uses_table_prefix() {
+    fn sanitize_module_id_normalizes_uppercase() {
+        assert_eq!(
+            sanitize_module_id("BB8A3F8B-1234-5678-9ABC-DEF012345678"),
+            SAMPLE_SANITIZED
+        );
+    }
+
+    #[test]
+    fn sanitize_module_id_fits_under_sdk_regex_ceiling() {
+        // SDK's moduleIDPattern allows up to 36 chars. We emit "m" + 32 hex = 33.
+        let out = sanitize_module_id(SAMPLE_UUID);
+        assert!(
+            out.len() <= 36,
+            "sanitized ID {out} exceeds SDK regex limit"
+        );
+        assert!(out.starts_with('m'));
+    }
+
+    #[test]
+    fn render_sql_uses_module_id_table_prefix() {
         let out = render(SQL_INIT, &ins("my-mod", "My Mod"));
-        assert!(out.contains("CREATE TABLE IF NOT EXISTS my_mod_items"));
-        assert!(!out.contains("__MS_TABLE_PREFIX__"));
+        let expected = format!("CREATE TABLE IF NOT EXISTS {}_items", SAMPLE_SANITIZED);
+        assert!(out.contains(&expected), "missing {expected:?}");
+        assert!(!out.contains("__MS_MODULE_ID__"));
     }
 
     #[test]
     fn render_routes_substitutes_slug_in_response_body() {
+        // Slug stays the user-facing label even though Config.ID is UUID-derived.
         let out = render(ROUTES_GO, &ins("media", "Media"));
         assert!(out.contains(r#""hello from media""#));
     }
@@ -173,7 +226,7 @@ mod tests {
             assert!(p.exists(), "missing {}", p.display());
         }
         let main = fs::read_to_string(target.join("main.go")).unwrap();
-        assert!(main.contains(r#"ID:   "media""#));
+        assert!(main.contains(&format!(r#"ID:   "{}""#, SAMPLE_SANITIZED)));
     }
 
     #[test]
