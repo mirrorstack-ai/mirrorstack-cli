@@ -22,6 +22,11 @@ use super::{ok_mark, warn_prefix};
 
 mod compose;
 mod process;
+// Used in a follow-up PR that integrates WSS into the dev lifecycle.
+// Compiled + tested now so the wire format and protocol stay correct
+// while the AWS Sender impl + IaC for the WS API GW catch up.
+#[allow(dead_code)]
+mod tunnel;
 
 #[derive(Args)]
 pub struct DevArgs {
