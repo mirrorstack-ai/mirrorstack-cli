@@ -139,10 +139,65 @@ mod tests {
     }
 
     #[test]
+    fn render_substitutes_slug_into_config_slug() {
+        // Slug field is the SDK v0.2.0 catalog handle. The scaffolded
+        // module needs it set so the manifest carries it from day one;
+        // missing-slug behavior (dev-only mode) is for hand-written
+        // pre-publish modules, not the CLI scaffold.
+        let out = render(MAIN_GO, &ins("oauth", "OAuth"));
+        assert!(
+            out.contains(r#"Slug: "oauth""#),
+            "rendered main.go missing Config.Slug substitution"
+        );
+    }
+
+    #[test]
+    fn render_versions_default_is_dev_prerelease() {
+        // Pre-1.0 dev builds use `v0.1.0-dev` so `mirrorstack publish` can
+        // refuse `-dev` versions in prod by convention. Promotion
+        // happens at publish time. See docs/module-identity-and-storage-prefix.md.
+        let out = render(MAIN_GO, &ins("media", "Media"));
+        assert!(
+            out.contains(r#""v0.1.0-dev": {App: "0001"}"#),
+            "expected v0.1.0-dev as scaffold default version"
+        );
+        assert!(!out.contains(r#""v0.1.0": {App: "0001"}"#));
+    }
+
+    #[test]
+    fn render_dependson_example_matches_v0_2_shape() {
+        // The doc-comment example must reflect the v0.2.0 contract:
+        // owner-prefixed id with version constraint, plus the Need
+        // callback declaring tables/events. The pre-v0.2.0 bare-id
+        // example (`ms.DependsOn("oauth-core")`) misled scaffolded
+        // modules into a shape the catalog won't accept anymore.
+        let out = render(MAIN_GO, &ins("media", "Media"));
+        assert!(
+            out.contains(r#"ms.DependsOn("@anna/oauth@^1.0.0", func(n *ms.Need)"#),
+            "DependsOn example must use @<owner>/<id>@<version> + Need callback"
+        );
+        assert!(
+            !out.contains(r#"ms.DependsOn("oauth-core")"#),
+            "stale bare-id DependsOn example still present"
+        );
+    }
+
+    #[test]
     fn render_substitutes_in_go_mod() {
         let out = render(GO_MOD, &ins("media", "Media"));
         assert!(out.starts_with("module media\n"));
         assert!(!out.contains("__MS_SLUG__"));
+    }
+
+    #[test]
+    fn render_go_mod_pins_sdk_v0_2() {
+        // Scaffolded modules must link against SDK v0.2.0+ to get Need /
+        // OptionalDependOn — the template's main.go uses both.
+        let out = render(GO_MOD, &ins("media", "Media"));
+        assert!(
+            out.contains("github.com/mirrorstack-ai/app-module-sdk v0.2.0"),
+            "go.mod must pin SDK v0.2.0 to match scaffolded API surface"
+        );
     }
 
     #[test]

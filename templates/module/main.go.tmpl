@@ -29,11 +29,18 @@ func main() {
 		// changing this. Renaming this WOULD require migrating every schema
 		// and table whose name is derived from it.
 		ID:   "__MS_MODULE_ID__",
+		// Slug is the catalog handle (e.g. "oauth"). Mutable via catalog UI;
+		// the storage prefix at install time is <username>_<slug>_. Renames
+		// force a new published version with auto-generated rename migrations.
+		Slug: "__MS_SLUG__",
 		Name: "__MS_NAME__",
 		Icon: "extension",
 		SQL:  sqlFS,
 		Versions: map[string]system.MigrationVersions{
-			"v0.1.0": {App: "0001"},
+			// `-dev` prerelease tag distinguishes "iterating locally" from
+			// "real release". `mirrorstack publish` prompts to promote it
+			// before shipping; CI / prod refuses `-dev` versions.
+			"v0.1.0-dev": {App: "0001"},
 		},
 	}); err != nil {
 		log.Fatalf("mirrorstack: init failed: %v", err)
@@ -42,8 +49,15 @@ func main() {
 	ms.Describe("Replace this description with your module's purpose.")
 
 	// Required deps go here — these become install-time preconditions.
+	// Use @<owner>/<id>@<semver> for the spec; the optional callback
+	// declares which relations and events this module reads from the dep.
+	// The catalog validates names at install time and surfaces them for
+	// app-owner approval before issuing GRANT SELECT.
 	//
-	//	ms.DependsOn("oauth-core")
+	//	ms.DependsOn("@anna/oauth@^1.0.0", func(n *ms.Need) {
+	//	    n.Table("oauth_users")
+	//	    n.Event("user.signed_in")
+	//	})
 
 	for _, hook := range postInitHooks {
 		hook()
