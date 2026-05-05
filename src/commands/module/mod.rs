@@ -118,77 +118,104 @@ fn init(args: InitArgs) -> Result<()> {
     let pre_check = with_spinner("Checking availability…", || {
         api::get_module(&client, &apps_base, &creds.access_token, &slug)
     });
-    // Determine whether we still need to POST. `--used` + already-exists
-    // short-circuits without prompting for confirmation again.
-    let needs_create = match pre_check {
+    // Capture the platform-assigned module ID so scaffolding can substitute
+    // it into Config.ID and the table prefix. Sourced from whichever branch
+    // succeeds (`--used` + already-exists, fresh create, or a race-refetch).
+    let module_id: String = match pre_check {
         Ok(Some(existing)) if args.used => {
             print_already_exists(username, &existing.slug, Some(&existing.id));
-            false
+            existing.id
         }
         Ok(Some(_)) => {
             return Err(anyhow!(
                 "@{username}/{slug} already exists (pass --used to ignore when re-running)"
             ));
         }
-        Ok(None) => true,
+        Ok(None) => {
+            if !args.yes {
+                eprintln!();
+                eprintln!("  {} {}", style("Module:").dim(), style(&name).bold());
+                eprintln!(
+                    "  {}   {}",
+                    style("Slug:").dim(),
+                    style(format!("@{username}/{slug}")).cyan().bold()
+                );
+                let confirmed = Confirm::with_theme(&theme)
+                    .with_prompt("Create this module?")
+                    .default(true)
+                    .interact()?;
+                if !confirmed {
+                    eprintln!("{}", style("aborted.").yellow());
+                    return Ok(());
+                }
+            }
+
+            let create_result = with_spinner("Creating module…", || {
+                api::create_module(
+                    &client,
+                    &apps_base,
+                    &creds.access_token,
+                    &CreateModuleInput {
+                        name: &name,
+                        slug: &slug,
+                    },
+                )
+            });
+
+            match create_result {
+                Ok(m) => {
+                    print_created(username, &m.slug, &m.id);
+                    m.id
+                }
+                Err(ApiError::Server { code, .. }) if code == "slug_taken" && args.used => {
+                    // Race: the slug was free at pre-check but taken by the
+                    // time we POST'd. Re-fetch so scaffold still has a real
+                    // module ID to substitute.
+                    print_already_exists(username, &slug, None);
+                    refetch_module_id(&client, &apps_base, &creds.access_token, username, &slug)?
+                }
+                Err(ApiError::Server { code, message, .. }) => {
+                    return Err(anyhow!(
+                        "{code}: {message}{hint}",
+                        hint = slug_error_hint(&code)
+                    ));
+                }
+                Err(ApiError::Unauthenticated) => return Err(session_expired()),
+                Err(e) => return Err(e.into()),
+            }
+        }
         Err(ApiError::Unauthenticated) => return Err(session_expired()),
         Err(e) => return Err(e.into()),
     };
-
-    if needs_create {
-        if !args.yes {
-            eprintln!();
-            eprintln!("  {} {}", style("Module:").dim(), style(&name).bold());
-            eprintln!(
-                "  {}   {}",
-                style("Slug:").dim(),
-                style(format!("@{username}/{slug}")).cyan().bold()
-            );
-            let confirmed = Confirm::with_theme(&theme)
-                .with_prompt("Create this module?")
-                .default(true)
-                .interact()?;
-            if !confirmed {
-                eprintln!("{}", style("aborted.").yellow());
-                return Ok(());
-            }
-        }
-
-        let create_result = with_spinner("Creating module…", || {
-            api::create_module(
-                &client,
-                &apps_base,
-                &creds.access_token,
-                &CreateModuleInput {
-                    name: &name,
-                    slug: &slug,
-                },
-            )
-        });
-
-        match create_result {
-            Ok(m) => print_created(username, &m.slug, &m.id),
-            Err(ApiError::Server { code, .. }) if code == "slug_taken" && args.used => {
-                print_already_exists(username, &slug, None);
-            }
-            Err(ApiError::Server { code, message, .. }) => {
-                return Err(anyhow!(
-                    "{code}: {message}{hint}",
-                    hint = slug_error_hint(&code)
-                ));
-            }
-            Err(ApiError::Unauthenticated) => return Err(session_expired()),
-            Err(e) => return Err(e.into()),
-        }
-    }
 
     scaffold_if_requested(
         scaffold_target.as_deref(),
         &scaffold::Inputs {
             slug: &slug,
             name: &name,
+            module_id: &module_id,
         },
     )
+}
+
+fn refetch_module_id(
+    client: &reqwest::blocking::Client,
+    apps_base: &str,
+    access_token: &str,
+    username: &str,
+    slug: &str,
+) -> Result<String> {
+    let refetch = with_spinner("Resolving existing module…", || {
+        api::get_module(client, apps_base, access_token, slug)
+    });
+    match refetch {
+        Ok(Some(m)) => Ok(m.id),
+        Ok(None) => Err(anyhow!(
+            "module @{username}/{slug} disappeared between create and re-fetch"
+        )),
+        Err(ApiError::Unauthenticated) => Err(session_expired()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Resolve the target dir for scaffolding. `--dir <path>` wins; otherwise

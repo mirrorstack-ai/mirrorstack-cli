@@ -24,7 +24,11 @@ var postInitHooks []func()
 
 func main() {
 	if err := ms.Init(ms.Config{
-		ID:   "__MS_SLUG__",
+		// ID is derived from the platform-assigned UUID — stable across slug
+		// renames. Don't change it; renaming the URL slug doesn't require
+		// changing this. Renaming this WOULD require migrating every schema
+		// and table whose name is derived from it.
+		ID:   "__MS_MODULE_ID__",
 		Name: "__MS_NAME__",
 		Icon: "extension",
 		SQL:  sqlFS,
