@@ -1,8 +1,14 @@
 //! Spawn the user's module via `go run .` with `MS_LOCAL_DB_URL` injected,
-//! line-prefix its stdout/stderr, and graceful-exit on Ctrl-C.
+//! line-prefix its stdout/stderr, and kill it on Ctrl-C.
 //!
 //! No async runtime: we spawn a thread per output stream and rely on
 //! `ctrlc` for SIGINT delivery — the whole CLI is otherwise blocking.
+//!
+//! Ctrl-C calls `child.kill()`, which is SIGKILL on unix and
+//! TerminateProcess on windows. A Go server mid-DB-write loses any
+//! buffered work; for a dev shell where the user owns the database
+//! that's an acceptable trade-off in v1. SIGTERM-first-then-SIGKILL
+//! is queued as a follow-up.
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;

@@ -3,10 +3,10 @@
 //!
 //! The lifecycle is:
 //!   1. Bootstrap a `docker-compose.yml` in the cwd if missing
-//!   2. `docker compose up -d` and wait for Postgres health
+//!   2. `docker compose up -d --wait` (server-side healthcheck blocks until pg is ready)
 //!   3. Spawn `go run .` with `MS_LOCAL_DB_URL` injected
 //!   4. Stream the module's stdout/stderr through a labeled prefix
-//!   5. On Ctrl-C: graceful SIGTERM the module process, then `compose down`
+//!   5. On Ctrl-C: kill the module process (SIGKILL on unix; SIGTERM-then-SIGKILL is queued as a follow-up), then `docker compose down`
 //!
 //! No WSS tunnel yet — the module runs as a normal HTTP server on its own
 //! port. Future PR layers the tunnel registration on top.
