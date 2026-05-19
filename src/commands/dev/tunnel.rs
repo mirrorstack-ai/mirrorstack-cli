@@ -140,6 +140,52 @@ pub(super) struct RegisterAck {
     pub expires_at: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ErrorPayload {
+    code: String,
+    message: String,
+    #[serde(default)]
+    slug: Option<String>,
+}
+
+/// Typed register-time rejection. Distinguishes the cases the CLI knows
+/// how to coach the user through (`module_dev_mode_off`,
+/// `module_not_yours`) from "every other rpc.err on the register
+/// channel" so callers can match without string-sniffing.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RegisterError {
+    #[error("dev mode is disabled on this module")]
+    ModuleDevModeOff {
+        /// Module slug from the rpc.err payload — empty when the
+        /// platform predates the slug-in-error PR. Callers should
+        /// degrade to the /dev list URL when None.
+        slug: Option<String>,
+    },
+    #[error("module is not owned by you")]
+    ModuleNotYours,
+    #[error("register rejected ({code}): {message}")]
+    Rejected { code: String, message: String },
+    #[error(transparent)]
+    Transport(anyhow::Error),
+}
+
+impl From<anyhow::Error> for RegisterError {
+    fn from(e: anyhow::Error) -> Self {
+        RegisterError::Transport(e)
+    }
+}
+
+impl From<serde_json::Error> for RegisterError {
+    fn from(e: serde_json::Error) -> Self {
+        RegisterError::Transport(anyhow::Error::new(e))
+    }
+}
+
+/// Local Result alias — anyhow::Result is in scope at module level, so
+/// every typed handshake return path would otherwise need the
+/// fully-qualified std form. Keeps signatures readable.
+type RegisterResult<T> = std::result::Result<T, RegisterError>;
+
 /// Spawned-task handle. Drop or call [`shutdown`] to close the WSS.
 ///
 /// `service_token` is intentionally NOT held here — it lives on the
@@ -166,7 +212,7 @@ pub(super) async fn open(
     wss_url: &str,
     ttok: &str,
     register: RegisterPayload<'_>,
-) -> Result<TunnelHandle> {
+) -> RegisterResult<TunnelHandle> {
     let url = with_token_param(wss_url, ttok)?;
     let config = WebSocketConfig {
         max_message_size: Some(MAX_INBOUND_FRAME_BYTES),
@@ -193,8 +239,7 @@ pub(super) async fn open(
         await_register_ack(&mut sink, &mut stream, &register_id),
     )
     .await
-    .context("dev: register_ack timeout")?
-    .context("dev: register_ack")?;
+    .context("dev: register_ack timeout")??;
 
     let shutdown = Arc::new(Notify::new());
     tokio::spawn(run_tunnel_loop(sink, stream, shutdown.clone()));
@@ -219,11 +264,14 @@ fn with_token_param(wss_url: &str, ttok: &str) -> Result<String> {
 /// `register_id` arrives. Server-side ping/binary/text-without-ack are
 /// tolerated — the server may send heartbeat or status frames before
 /// the ack lands. Wrapped in `tokio::time::timeout` by the caller.
+// The server replies on the register's corr_id either with
+// register_ack (success) or rpc.err (rejection). Anything else during
+// handshake (server-initiated ping, future frame types) gets ignored.
 async fn await_register_ack(
     sink: &mut WsSink,
     stream: &mut WsReader,
     register_id: &str,
-) -> Result<RegisterAck> {
+) -> RegisterResult<RegisterAck> {
     loop {
         let next = stream
             .next()
@@ -237,20 +285,40 @@ async fn await_register_ack(
                 let _ = sink.send(Message::Pong(p)).await;
                 continue;
             }
-            Message::Close(_) => return Err(anyhow!("server closed before register_ack")),
+            Message::Close(_) => return Err(anyhow!("server closed before register_ack").into()),
             _ => continue,
         };
         let frame: Frame = serde_json::from_str(&text)
             .with_context(|| format!("dev: parse server frame: {text}"))?;
-        if frame.frame_type == FrameType::RegisterAck
-            && frame.corr_id.as_deref() == Some(register_id)
-        {
-            let payload = frame
-                .payload
-                .ok_or_else(|| anyhow!("register_ack missing payload"))?;
-            return serde_json::from_value(payload).context("dev: deserialize register_ack");
+        if frame.corr_id.as_deref() != Some(register_id) {
+            continue;
         }
-        // Other frames during handshake are ignored — see fn comment.
+        match frame.frame_type {
+            FrameType::RegisterAck => {
+                let payload = frame
+                    .payload
+                    .ok_or_else(|| anyhow!("register_ack missing payload"))?;
+                return Ok(
+                    serde_json::from_value(payload).context("dev: deserialize register_ack")?
+                );
+            }
+            FrameType::RpcErr => {
+                let payload = frame
+                    .payload
+                    .ok_or_else(|| anyhow!("rpc.err missing payload"))?;
+                let err: ErrorPayload =
+                    serde_json::from_value(payload).context("dev: deserialize rpc.err")?;
+                return Err(match err.code.as_str() {
+                    "module_dev_mode_off" => RegisterError::ModuleDevModeOff { slug: err.slug },
+                    "module_not_yours" => RegisterError::ModuleNotYours,
+                    _ => RegisterError::Rejected {
+                        code: err.code,
+                        message: err.message,
+                    },
+                });
+            }
+            _ => continue,
+        }
     }
 }
 
