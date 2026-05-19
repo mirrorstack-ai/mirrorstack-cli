@@ -175,6 +175,17 @@ impl From<anyhow::Error> for RegisterError {
     }
 }
 
+impl From<serde_json::Error> for RegisterError {
+    fn from(e: serde_json::Error) -> Self {
+        RegisterError::Transport(anyhow::Error::new(e))
+    }
+}
+
+/// Local Result alias — anyhow::Result is in scope at module level, so
+/// every typed handshake return path would otherwise need the
+/// fully-qualified std form. Keeps signatures readable.
+type RegisterResult<T> = std::result::Result<T, RegisterError>;
+
 /// Spawned-task handle. Drop or call [`shutdown`] to close the WSS.
 ///
 /// `service_token` is intentionally NOT held here — it lives on the
@@ -201,8 +212,8 @@ pub(super) async fn open(
     wss_url: &str,
     ttok: &str,
     register: RegisterPayload<'_>,
-) -> std::result::Result<TunnelHandle, RegisterError> {
-    let url = with_token_param(wss_url, ttok).map_err(RegisterError::from)?;
+) -> RegisterResult<TunnelHandle> {
+    let url = with_token_param(wss_url, ttok)?;
     let config = WebSocketConfig {
         max_message_size: Some(MAX_INBOUND_FRAME_BYTES),
         max_frame_size: Some(MAX_INBOUND_FRAME_BYTES),
@@ -211,33 +222,24 @@ pub(super) async fn open(
     let (ws_stream, _resp) =
         tokio_tungstenite::connect_async_with_config(&url, Some(config), false)
             .await
-            .with_context(|| format!("dev: connect WSS {wss_url}"))
-            .map_err(RegisterError::from)?;
+            .with_context(|| format!("dev: connect WSS {wss_url}"))?;
     let (mut sink, mut stream) = ws_stream.split();
 
     let register_frame = Frame::new(
         FrameType::Register,
-        Some(
-            serde_json::to_value(&register)
-                .context("dev: serialize register payload")
-                .map_err(RegisterError::from)?,
-        ),
+        Some(serde_json::to_value(&register).context("dev: serialize register payload")?),
     );
     let register_id = register_frame.id.clone();
-    sink.send(Message::Text(
-        serde_json::to_string(&register_frame).map_err(|e| RegisterError::from(anyhow!(e)))?,
-    ))
-    .await
-    .context("dev: send register frame")
-    .map_err(RegisterError::from)?;
+    sink.send(Message::Text(serde_json::to_string(&register_frame)?))
+        .await
+        .context("dev: send register frame")?;
 
     let ack = tokio::time::timeout(
         Duration::from_secs(10),
         await_register_ack(&mut sink, &mut stream, &register_id),
     )
     .await
-    .context("dev: register_ack timeout")
-    .map_err(RegisterError::from)??;
+    .context("dev: register_ack timeout")??;
 
     let shutdown = Arc::new(Notify::new());
     tokio::spawn(run_tunnel_loop(sink, stream, shutdown.clone()));
@@ -262,11 +264,14 @@ fn with_token_param(wss_url: &str, ttok: &str) -> Result<String> {
 /// `register_id` arrives. Server-side ping/binary/text-without-ack are
 /// tolerated — the server may send heartbeat or status frames before
 /// the ack lands. Wrapped in `tokio::time::timeout` by the caller.
+// The server replies on the register's corr_id either with
+// register_ack (success) or rpc.err (rejection). Anything else during
+// handshake (server-initiated ping, future frame types) gets ignored.
 async fn await_register_ack(
     sink: &mut WsSink,
     stream: &mut WsReader,
     register_id: &str,
-) -> std::result::Result<RegisterAck, RegisterError> {
+) -> RegisterResult<RegisterAck> {
     loop {
         let next = stream
             .next()
@@ -285,10 +290,6 @@ async fn await_register_ack(
         };
         let frame: Frame = serde_json::from_str(&text)
             .with_context(|| format!("dev: parse server frame: {text}"))?;
-        // The server replies on the register's corr_id either with
-        // register_ack (success) or rpc.err (rejection). Anything else
-        // during handshake (server-initiated ping, future frame types)
-        // gets ignored.
         if frame.corr_id.as_deref() != Some(register_id) {
             continue;
         }
@@ -297,16 +298,14 @@ async fn await_register_ack(
                 let payload = frame
                     .payload
                     .ok_or_else(|| anyhow!("register_ack missing payload"))?;
-                return serde_json::from_value(payload)
-                    .context("dev: deserialize register_ack")
-                    .map_err(RegisterError::from);
+                return Ok(serde_json::from_value(payload).context("dev: deserialize register_ack")?);
             }
             FrameType::RpcErr => {
                 let payload = frame
                     .payload
                     .ok_or_else(|| anyhow!("rpc.err missing payload"))?;
-                let err: ErrorPayload = serde_json::from_value(payload)
-                    .context("dev: deserialize rpc.err")?;
+                let err: ErrorPayload =
+                    serde_json::from_value(payload).context("dev: deserialize rpc.err")?;
                 return Err(match err.code.as_str() {
                     "module_dev_mode_off" => RegisterError::ModuleDevModeOff { slug: err.slug },
                     "module_not_yours" => RegisterError::ModuleNotYours,
