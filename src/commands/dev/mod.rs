@@ -15,14 +15,16 @@
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
 use console::style;
+use reqwest::blocking::Client;
 
 use super::{
-    DEFAULT_DISPATCH_BASE, ENV_DISPATCH_URL, ok_mark, resolve_base, session_expired, warn_prefix,
+    DEFAULT_API_BASE, DEFAULT_DISPATCH_BASE, ENV_API_URL, ENV_DISPATCH_URL, ok_mark, resolve_base,
+    session_expired, warn_prefix,
 };
 use crate::{api, credentials, http};
 
@@ -125,8 +127,9 @@ fn open_tunnel(
     module_dir: &Path,
     local_url: Option<&str>,
 ) -> Result<(tunnel::TunnelHandle, tokio::runtime::Runtime)> {
-    let creds = credentials::load_or_login_hint()?;
+    let mut creds = credentials::load_or_login_hint()?;
     let dispatch_base = resolve_base(ENV_DISPATCH_URL, DEFAULT_DISPATCH_BASE);
+    let api_base = resolve_base(ENV_API_URL, DEFAULT_API_BASE);
     let client = http::client(Duration::from_secs(15))?;
     let module_id = module_meta::read_module_id(module_dir)?;
     let local_url = local_url.unwrap_or(DEFAULT_LOCAL_URL);
@@ -136,7 +139,7 @@ fn open_tunnel(
         ok_mark(),
         style(&dispatch_base).cyan().dim()
     );
-    let token = match api::tunnel_token(&client, &dispatch_base, &creds.access_token) {
+    let token = match mint_tunnel_token(&client, &dispatch_base, &api_base, &mut creds) {
         Ok(t) => t,
         Err(api::ApiError::Unauthenticated) => return Err(session_expired()),
         Err(e) => {
@@ -159,7 +162,7 @@ fn open_tunnel(
         .build()
         .context("dev: build tokio runtime")?;
 
-    let handle = runtime.block_on(async {
+    let handle = match runtime.block_on(async {
         tunnel::open(
             &token.wss_url,
             &token.token,
@@ -170,7 +173,21 @@ fn open_tunnel(
             },
         )
         .await
-    })?;
+    }) {
+        Ok(h) => h,
+        Err(tunnel::RegisterError::ModuleDevModeOff { slug }) => {
+            return Err(dev_mode_off_hint(&dispatch_base, slug.as_deref()));
+        }
+        Err(tunnel::RegisterError::ModuleNotYours) => {
+            return Err(anyhow!(
+                "dev: this module isn't owned by you — only the module owner can open a dev tunnel.\nIf you scaffolded with `mirrorstack module init`, your `Config.ID` should match the platform's record; re-check it under `mirrorstack module list`."
+            ));
+        }
+        Err(tunnel::RegisterError::Rejected { code, message }) => {
+            return Err(anyhow!("dev: register rejected ({code}): {message}"));
+        }
+        Err(tunnel::RegisterError::Transport(e)) => return Err(e),
+    };
 
     eprintln!(
         "{} tunnel registered (session {})",
@@ -178,6 +195,92 @@ fn open_tunnel(
         style(&handle.session_id).cyan().dim()
     );
     Ok((handle, runtime))
+}
+
+/// Access tokens are short (15 min per the platform's TokenConfig).
+/// `mirrorstack dev` is a long-running command, so we silently refresh
+/// the access token via the stored refresh token (30-day TTL) on a 401
+/// and retry the mint once. The refresh endpoint rotates the refresh
+/// token too, so the rotated pair is persisted back to credentials.
+/// If the refresh ALSO 401s (revoked / expired session), the original
+/// Unauthenticated bubbles up and the caller surfaces session_expired.
+fn mint_tunnel_token(
+    client: &Client,
+    dispatch_base: &str,
+    api_base: &str,
+    creds: &mut credentials::Credentials,
+) -> Result<api::TunnelToken, api::ApiError> {
+    match api::tunnel_token(client, dispatch_base, &creds.access_token) {
+        Ok(t) => Ok(t),
+        Err(api::ApiError::Unauthenticated) => {
+            let refreshed = api::refresh_session(client, api_base, &creds.refresh_token)?;
+            creds.access_token = refreshed.access_token;
+            creds.refresh_token = refreshed.refresh_token;
+            // expires_at is informational only on the credentials struct;
+            // match the platform's 15-minute access TTL.
+            creds.expires_at = SystemTime::now() + Duration::from_secs(15 * 60);
+            if let Err(e) = credentials::save(creds) {
+                // Save failure isn't fatal for the in-process retry (we
+                // hold the new access token in `creds`), but log so the
+                // user sees the warning if the next run re-prompts login.
+                eprintln!(
+                    "{} refreshed session but failed to save credentials: {e:#}",
+                    warn_prefix()
+                );
+            }
+            api::tunnel_token(client, dispatch_base, &creds.access_token)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Build a user-facing error for the `module_dev_mode_off` rpc.err. The
+/// platform refused the tunnel because the module's `dev_mode_enabled`
+/// flag is false; coach the user toward the right toggle and offer to
+/// open it. When the platform carries the module slug in the error
+/// payload, deep-link straight to the Dev tab; otherwise degrade to
+/// the modules list (older platforms predate the slug field).
+fn dev_mode_off_hint(dispatch_base: &str, slug: Option<&str>) -> anyhow::Error {
+    let console = dev_console_url(dispatch_base, slug);
+    eprintln!();
+    eprintln!(
+        "{} dev mode is disabled for this module on the platform.",
+        warn_prefix()
+    );
+    eprintln!("  Open the dev console and toggle Dev mode on:");
+    eprintln!("  {}", style(&console).cyan().underlined());
+    eprintln!();
+    eprint!("  Press Enter to open in your browser, or Ctrl-C to cancel...");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let mut buf = String::new();
+    if std::io::stdin().read_line(&mut buf).is_ok() {
+        let _ = open::that(&console);
+    }
+    anyhow!("dev: module dev_mode disabled — re-run after enabling it")
+}
+
+/// Derive the dev-console web URL from the dispatch HTTP URL.
+/// localhost/127.0.0.1 → http://localhost:3001; production
+/// (`api.<host>`) → `https://apps.<host>`; anything else falls back to
+/// the canonical prod console so the message stays useful. When `slug`
+/// is provided, deep-link to /dev/module/<slug>/dev; otherwise the
+/// modules-list landing page.
+fn dev_console_url(dispatch_base: &str, slug: Option<&str>) -> String {
+    let parsed = url::Url::parse(dispatch_base).ok();
+    let host = parsed.as_ref().and_then(|u| u.host_str());
+    let base = match host {
+        Some("localhost") | Some("127.0.0.1") | Some("::1") => {
+            "http://localhost:3001".to_string()
+        }
+        Some(h) if h.starts_with("api.") => {
+            format!("https://apps.{}", &h["api.".len()..])
+        }
+        _ => "https://apps.mirrorstack.ai".to_string(),
+    };
+    match slug {
+        Some(s) if !s.is_empty() => format!("{base}/dev/module/{s}/dev"),
+        _ => format!("{base}/dev"),
+    }
 }
 
 fn resolve_db_url(args: &DevArgs) -> Result<String> {

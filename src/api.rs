@@ -214,6 +214,53 @@ pub fn create_module(
     })
 }
 
+/// Body of a successful `POST /v1/auth/sessions/refresh`. The platform
+/// rotates the refresh token on every refresh (replay defense), so we
+/// must persist the new one back to credentials. expires_at is RFC3339
+/// from the server but informational only — the CLI re-derives the
+/// 15-minute access TTL locally when saving.
+#[derive(Debug, Deserialize)]
+pub struct RefreshResponse {
+    pub access_token: String,
+    pub refresh_token: String,
+    #[allow(dead_code)]
+    pub expires_at: String,
+}
+
+/// POST /v1/auth/sessions/refresh — exchange a refresh token for a new
+/// access + refresh pair. The CLI calls this on a 401 from any
+/// access-token-bearing endpoint to recover without a fresh
+/// `mirrorstack login`. A 401 from this endpoint means the refresh
+/// token itself is gone (revoked, expired, or never existed) — surface
+/// as Unauthenticated so callers can fall back to the login hint.
+pub fn refresh_session(
+    http: &Client,
+    api_base: &str,
+    refresh_token: &str,
+) -> Result<RefreshResponse, ApiError> {
+    #[derive(Serialize)]
+    struct Body<'a> {
+        refresh_token: &'a str,
+    }
+    let endpoint = format!(
+        "{}/v1/auth/sessions/refresh",
+        api_base.trim_end_matches('/')
+    );
+    let resp = http
+        .post(&endpoint)
+        .header("Accept", "application/json")
+        .json(&Body { refresh_token })
+        .send()?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<RefreshResponse>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(unexpected_body_error(resp))
+}
+
 /// DELETE /v1/auth/sessions/current — revoke the supplied refresh token
 /// (CLI flow: token in body, not cookie). The platform treats a missing
 /// or already-revoked session as success, so callers can call this

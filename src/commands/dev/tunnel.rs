@@ -140,6 +140,41 @@ pub(super) struct RegisterAck {
     pub expires_at: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ErrorPayload {
+    code: String,
+    message: String,
+    #[serde(default)]
+    slug: Option<String>,
+}
+
+/// Typed register-time rejection. Distinguishes the cases the CLI knows
+/// how to coach the user through (`module_dev_mode_off`,
+/// `module_not_yours`) from "every other rpc.err on the register
+/// channel" so callers can match without string-sniffing.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RegisterError {
+    #[error("dev mode is disabled on this module")]
+    ModuleDevModeOff {
+        /// Module slug from the rpc.err payload — empty when the
+        /// platform predates the slug-in-error PR. Callers should
+        /// degrade to the /dev list URL when None.
+        slug: Option<String>,
+    },
+    #[error("module is not owned by you")]
+    ModuleNotYours,
+    #[error("register rejected ({code}): {message}")]
+    Rejected { code: String, message: String },
+    #[error(transparent)]
+    Transport(anyhow::Error),
+}
+
+impl From<anyhow::Error> for RegisterError {
+    fn from(e: anyhow::Error) -> Self {
+        RegisterError::Transport(e)
+    }
+}
+
 /// Spawned-task handle. Drop or call [`shutdown`] to close the WSS.
 ///
 /// `service_token` is intentionally NOT held here — it lives on the
@@ -166,8 +201,8 @@ pub(super) async fn open(
     wss_url: &str,
     ttok: &str,
     register: RegisterPayload<'_>,
-) -> Result<TunnelHandle> {
-    let url = with_token_param(wss_url, ttok)?;
+) -> std::result::Result<TunnelHandle, RegisterError> {
+    let url = with_token_param(wss_url, ttok).map_err(RegisterError::from)?;
     let config = WebSocketConfig {
         max_message_size: Some(MAX_INBOUND_FRAME_BYTES),
         max_frame_size: Some(MAX_INBOUND_FRAME_BYTES),
@@ -176,25 +211,33 @@ pub(super) async fn open(
     let (ws_stream, _resp) =
         tokio_tungstenite::connect_async_with_config(&url, Some(config), false)
             .await
-            .with_context(|| format!("dev: connect WSS {wss_url}"))?;
+            .with_context(|| format!("dev: connect WSS {wss_url}"))
+            .map_err(RegisterError::from)?;
     let (mut sink, mut stream) = ws_stream.split();
 
     let register_frame = Frame::new(
         FrameType::Register,
-        Some(serde_json::to_value(&register).context("dev: serialize register payload")?),
+        Some(
+            serde_json::to_value(&register)
+                .context("dev: serialize register payload")
+                .map_err(RegisterError::from)?,
+        ),
     );
     let register_id = register_frame.id.clone();
-    sink.send(Message::Text(serde_json::to_string(&register_frame)?))
-        .await
-        .context("dev: send register frame")?;
+    sink.send(Message::Text(
+        serde_json::to_string(&register_frame).map_err(|e| RegisterError::from(anyhow!(e)))?,
+    ))
+    .await
+    .context("dev: send register frame")
+    .map_err(RegisterError::from)?;
 
     let ack = tokio::time::timeout(
         Duration::from_secs(10),
         await_register_ack(&mut sink, &mut stream, &register_id),
     )
     .await
-    .context("dev: register_ack timeout")?
-    .context("dev: register_ack")?;
+    .context("dev: register_ack timeout")
+    .map_err(RegisterError::from)??;
 
     let shutdown = Arc::new(Notify::new());
     tokio::spawn(run_tunnel_loop(sink, stream, shutdown.clone()));
@@ -223,7 +266,7 @@ async fn await_register_ack(
     sink: &mut WsSink,
     stream: &mut WsReader,
     register_id: &str,
-) -> Result<RegisterAck> {
+) -> std::result::Result<RegisterAck, RegisterError> {
     loop {
         let next = stream
             .next()
@@ -237,20 +280,44 @@ async fn await_register_ack(
                 let _ = sink.send(Message::Pong(p)).await;
                 continue;
             }
-            Message::Close(_) => return Err(anyhow!("server closed before register_ack")),
+            Message::Close(_) => return Err(anyhow!("server closed before register_ack").into()),
             _ => continue,
         };
         let frame: Frame = serde_json::from_str(&text)
             .with_context(|| format!("dev: parse server frame: {text}"))?;
-        if frame.frame_type == FrameType::RegisterAck
-            && frame.corr_id.as_deref() == Some(register_id)
-        {
-            let payload = frame
-                .payload
-                .ok_or_else(|| anyhow!("register_ack missing payload"))?;
-            return serde_json::from_value(payload).context("dev: deserialize register_ack");
+        // The server replies on the register's corr_id either with
+        // register_ack (success) or rpc.err (rejection). Anything else
+        // during handshake (server-initiated ping, future frame types)
+        // gets ignored.
+        if frame.corr_id.as_deref() != Some(register_id) {
+            continue;
         }
-        // Other frames during handshake are ignored — see fn comment.
+        match frame.frame_type {
+            FrameType::RegisterAck => {
+                let payload = frame
+                    .payload
+                    .ok_or_else(|| anyhow!("register_ack missing payload"))?;
+                return serde_json::from_value(payload)
+                    .context("dev: deserialize register_ack")
+                    .map_err(RegisterError::from);
+            }
+            FrameType::RpcErr => {
+                let payload = frame
+                    .payload
+                    .ok_or_else(|| anyhow!("rpc.err missing payload"))?;
+                let err: ErrorPayload = serde_json::from_value(payload)
+                    .context("dev: deserialize rpc.err")?;
+                return Err(match err.code.as_str() {
+                    "module_dev_mode_off" => RegisterError::ModuleDevModeOff { slug: err.slug },
+                    "module_not_yours" => RegisterError::ModuleNotYours,
+                    _ => RegisterError::Rejected {
+                        code: err.code,
+                        message: err.message,
+                    },
+                });
+            }
+            _ => continue,
+        }
     }
 }
 
