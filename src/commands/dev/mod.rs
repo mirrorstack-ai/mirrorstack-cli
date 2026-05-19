@@ -269,9 +269,7 @@ fn dev_console_url(dispatch_base: &str, slug: Option<&str>) -> String {
     let parsed = url::Url::parse(dispatch_base).ok();
     let host = parsed.as_ref().and_then(|u| u.host_str());
     let base = match host {
-        Some("localhost") | Some("127.0.0.1") | Some("::1") => {
-            "http://localhost:3001".to_string()
-        }
+        Some("localhost") | Some("127.0.0.1") | Some("::1") => "http://localhost:3001".to_string(),
         Some(h) if h.starts_with("api.") => {
             format!("https://apps.{}", &h["api.".len()..])
         }

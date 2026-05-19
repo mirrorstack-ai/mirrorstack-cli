@@ -298,7 +298,9 @@ async fn await_register_ack(
                 let payload = frame
                     .payload
                     .ok_or_else(|| anyhow!("register_ack missing payload"))?;
-                return Ok(serde_json::from_value(payload).context("dev: deserialize register_ack")?);
+                return Ok(
+                    serde_json::from_value(payload).context("dev: deserialize register_ack")?
+                );
             }
             FrameType::RpcErr => {
                 let payload = frame
