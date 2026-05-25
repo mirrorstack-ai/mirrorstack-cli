@@ -21,24 +21,28 @@ use anyhow::{Context, Result, anyhow};
 
 use super::line_prefix;
 
-/// Run `go run .` in `dir` with `MS_LOCAL_DB_URL=<db_url>`. Blocks until
-/// the child exits, or until Ctrl-C is received and the child has been
-/// asked to terminate. Returns Ok on a clean child exit, Err on non-zero
-/// status or signal-driven termination.
-pub(super) fn run_module(dir: &Path, db_url: &str) -> Result<()> {
-    let mut child = Command::new("go")
-        .args(["run", "."])
+/// Run `go run .` in `dir` with `MS_LOCAL_DB_URL=<db_url>`. When
+/// `internal_secret` is `Some`, also sets `MS_INTERNAL_SECRET` — used
+/// by tunnel mode so the SDK's InternalAuth flips from bypass to
+/// enforce. Blocks until the child exits, or until Ctrl-C is received
+/// and the child has been asked to terminate. Returns Ok on a clean
+/// child exit, Err on non-zero status or signal-driven termination.
+pub(super) fn run_module(dir: &Path, db_url: &str, internal_secret: Option<&str>) -> Result<()> {
+    let mut cmd = Command::new("go");
+    cmd.args(["run", "."])
         .current_dir(dir)
         .env("MS_LOCAL_DB_URL", db_url)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                anyhow!("`go` not found on PATH. Install Go 1.26+ before running dev.")
-            }
-            _ => anyhow!("dev: spawn `go run .`: {e}"),
-        })?;
+        .stderr(Stdio::piped());
+    if let Some(secret) = internal_secret {
+        cmd.env("MS_INTERNAL_SECRET", secret);
+    }
+    let mut child = cmd.spawn().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            anyhow!("`go` not found on PATH. Install Go 1.26+ before running dev.")
+        }
+        _ => anyhow!("dev: spawn `go run .`: {e}"),
+    })?;
 
     let stdout = child.stdout.take().context("dev: child stdout")?;
     let stderr = child.stderr.take().context("dev: child stderr")?;

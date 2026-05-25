@@ -18,8 +18,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Args;
 use console::style;
+use rand::TryRngCore;
+use rand::rngs::OsRng;
 use reqwest::blocking::Client;
 
 use super::{
@@ -85,8 +89,22 @@ pub fn run(args: DevArgs) -> Result<()> {
     // Bring the tunnel up BEFORE compose so that a tunnel registration
     // failure (auth expired, dispatch unreachable) doesn't waste the user's
     // time bringing containers up first.
-    let tunnel_handle = if args.tunnel {
-        Some(open_tunnel(&cwd, args.local_url.as_deref())?)
+    //
+    // Tunnel mode exposes the module to remote callers (via dispatch's
+    // Leaf-1 307), so the module MUST enforce Internal-scope auth. Mint a
+    // per-session secret, set MS_INTERNAL_SECRET on the spawned module
+    // process (which flips the bypass-vs-enforce matrix in
+    // auth/middleware.go to enforce), and ship the same value to dispatch
+    // in the register frame so dispatch can attach X-MS-Internal-Secret on
+    // forwarded requests.
+    let tunnel = if args.tunnel {
+        let secret = mint_internal_secret()?;
+        let (handle, runtime) = open_tunnel(&cwd, args.local_url.as_deref(), &secret)?;
+        Some(Tunnel {
+            handle,
+            runtime,
+            internal_secret: secret,
+        })
     } else {
         None
     };
@@ -97,12 +115,13 @@ pub fn run(args: DevArgs) -> Result<()> {
     }
 
     eprintln!("{} module running — Ctrl-C to stop", ok_mark());
-    let module_status = process::run_module(&cwd, &db_url);
+    let internal_secret = tunnel.as_ref().map(|t| t.internal_secret.as_str());
+    let module_status = process::run_module(&cwd, &db_url, internal_secret);
 
-    if let Some((handle, runtime)) = tunnel_handle {
-        handle.shutdown();
+    if let Some(t) = tunnel {
+        t.handle.shutdown();
         // Block on the runtime briefly to let the close frame land.
-        runtime.block_on(async {
+        t.runtime.block_on(async {
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
     }
@@ -126,6 +145,7 @@ pub fn run(args: DevArgs) -> Result<()> {
 fn open_tunnel(
     module_dir: &Path,
     local_url: Option<&str>,
+    internal_secret: &str,
 ) -> Result<(tunnel::TunnelHandle, tokio::runtime::Runtime)> {
     let mut creds = credentials::load_or_login_hint()?;
     let dispatch_base = resolve_base(ENV_DISPATCH_URL, DEFAULT_DISPATCH_BASE);
@@ -170,6 +190,7 @@ fn open_tunnel(
                 module_id: &module_id,
                 local_url,
                 version: env!("CARGO_PKG_VERSION"),
+                internal_secret: Some(internal_secret),
             },
         )
         .await
@@ -279,6 +300,26 @@ fn dev_console_url(dispatch_base: &str, slug: Option<&str>) -> String {
         Some(s) if !s.is_empty() => format!("{base}/dev/module/{s}/dev"),
         _ => format!("{base}/dev"),
     }
+}
+
+/// Held for the lifetime of `mirrorstack dev --tunnel`. The runtime
+/// keeps the WSS background task alive; the secret is the
+/// `MS_INTERNAL_SECRET` value the spawned module enforces against.
+struct Tunnel {
+    handle: tunnel::TunnelHandle,
+    runtime: tokio::runtime::Runtime,
+    internal_secret: String,
+}
+
+/// Mint a 32-byte URL-safe base64 random token used as the module's
+/// MS_INTERNAL_SECRET. Same shape as auth::random_state (OsRng → b64url),
+/// inlined here to avoid a cross-module dependency for a one-off helper.
+fn mint_internal_secret() -> Result<String> {
+    let mut buf = [0u8; 32];
+    OsRng
+        .try_fill_bytes(&mut buf)
+        .context("dev: mint tunnel secret")?;
+    Ok(URL_SAFE_NO_PAD.encode(buf))
 }
 
 fn resolve_db_url(args: &DevArgs) -> Result<String> {
