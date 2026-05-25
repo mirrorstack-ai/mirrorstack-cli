@@ -124,6 +124,15 @@ pub(super) struct RegisterPayload<'a> {
     pub module_id: &'a str,
     pub local_url: &'a str,
     pub version: &'a str,
+    /// Per-session shared secret the module enforces on its Internal
+    /// scope routes (X-MS-Internal-Secret header). The CLI mints this,
+    /// sets `MS_INTERNAL_SECRET` on the spawned module process, and
+    /// sends the same value here so dispatch can attach the header to
+    /// every forwarded request. None until --tunnel is set; serialized
+    /// only when present so older dispatch builds keep round-tripping
+    /// the register frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub internal_secret: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -426,10 +435,25 @@ mod tests {
             module_id: "m_abc",
             local_url: "http://localhost:8080",
             version: "0.1.0",
+            internal_secret: None,
         };
         let s = serde_json::to_string(&p).unwrap();
         assert!(s.contains("\"module_id\":\"m_abc\""));
         assert!(s.contains("\"local_url\":\"http://localhost:8080\""));
+        // Skip-if-none keeps the field absent for older dispatch builds.
+        assert!(!s.contains("internal_secret"));
+    }
+
+    #[test]
+    fn register_payload_emits_internal_secret_when_set() {
+        let p = RegisterPayload {
+            module_id: "m_abc",
+            local_url: "http://localhost:8080",
+            version: "0.1.0",
+            internal_secret: Some("s3cret"),
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains("\"internal_secret\":\"s3cret\""));
     }
 
     #[test]
