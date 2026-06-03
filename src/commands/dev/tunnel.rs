@@ -141,12 +141,9 @@ pub(super) struct RegisterAck {
 }
 
 /// Spawned-task handle. Drop or call [`shutdown`] to close the WSS.
-///
-/// `service_token` is intentionally NOT held here — it lives on the
-/// returned [`RegisterAck`] until a real consumer (the future RPC plane)
-/// needs it on the handle itself. Re-thread when wired.
 pub(super) struct TunnelHandle {
     pub session_id: String,
+    pub service_token: String,
     shutdown: Arc<Notify>,
 }
 
@@ -201,6 +198,7 @@ pub(super) async fn open(
 
     Ok(TunnelHandle {
         session_id: ack.session_id,
+        service_token: ack.service_token,
         shutdown,
     })
 }
@@ -242,15 +240,22 @@ async fn await_register_ack(
         };
         let frame: Frame = serde_json::from_str(&text)
             .with_context(|| format!("dev: parse server frame: {text}"))?;
-        if frame.frame_type == FrameType::RegisterAck
-            && frame.corr_id.as_deref() == Some(register_id)
-        {
-            let payload = frame
-                .payload
-                .ok_or_else(|| anyhow!("register_ack missing payload"))?;
-            return serde_json::from_value(payload).context("dev: deserialize register_ack");
+        if frame.corr_id.as_deref() == Some(register_id) {
+            if frame.frame_type == FrameType::RegisterAck {
+                let payload = frame
+                    .payload
+                    .ok_or_else(|| anyhow!("register_ack missing payload"))?;
+                return serde_json::from_value(payload).context("dev: deserialize register_ack");
+            }
+            if frame.frame_type == FrameType::RpcErr {
+                if let Some(payload) = &frame.payload {
+                    let code = payload.get("code").and_then(|v| v.as_str()).unwrap_or("unknown");
+                    let msg = payload.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
+                    return Err(anyhow!("register rejected: {code}: {msg}"));
+                }
+                return Err(anyhow!("register rejected (no details)"));
+            }
         }
-        // Other frames during handshake are ignored — see fn comment.
     }
 }
 

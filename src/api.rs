@@ -214,6 +214,108 @@ pub fn create_module(
     })
 }
 
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct App {
+    pub id: String,
+    pub name: String,
+    pub slug: String,
+    #[serde(default)]
+    pub owner_id: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateAppInput<'a> {
+    pub name: &'a str,
+    pub slug: &'a str,
+}
+
+/// POST /v1/apps — create an application on the platform.
+pub fn create_app(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    input: &CreateAppInput,
+) -> Result<App, ApiError> {
+    let endpoint = format!("{}/v1/apps", apps_base.trim_end_matches('/'));
+
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .json(input)
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<App>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+
+    let status_u16 = status.as_u16();
+    let body = match http::read_capped(resp) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(ApiError::Unexpected {
+                status: status_u16,
+                body: format!("(read body failed: {e})"),
+            });
+        }
+    };
+    if let Ok(env) = serde_json::from_slice::<ErrorEnvelope>(&body) {
+        return Err(ApiError::Server {
+            status: status_u16,
+            code: env.error.code,
+            message: env.error.message,
+        });
+    }
+    Err(ApiError::Unexpected {
+        status: status_u16,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
+}
+
+/// POST /v1/auth/sessions/refresh — exchange a refresh token for new tokens.
+pub fn refresh_session(
+    http: &Client,
+    api_base: &str,
+    refresh_token: &str,
+) -> Result<TokenPair, ApiError> {
+    #[derive(serde::Serialize)]
+    struct Body<'a> {
+        refresh_token: &'a str,
+    }
+    let endpoint = format!(
+        "{}/v1/auth/sessions/refresh",
+        api_base.trim_end_matches('/')
+    );
+    let resp = http
+        .post(&endpoint)
+        .header("Accept", "application/json")
+        .json(&Body { refresh_token })
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<TokenPair>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(unexpected_body_error(resp))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TokenPair {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_in: u64,
+}
+
 /// DELETE /v1/auth/sessions/current — revoke the supplied refresh token
 /// (CLI flow: token in body, not cookie). The platform treats a missing
 /// or already-revoked session as success, so callers can call this
@@ -496,6 +598,66 @@ mod tests {
                 assert!(body.contains("upstream timeout"), "got body {body:?}");
             }
             other => panic!("expected Unexpected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_app_success() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps")
+            .match_header("authorization", "Bearer AT")
+            .with_status(201)
+            .with_body(
+                json!({
+                    "id": "a-1",
+                    "name": "My App",
+                    "slug": "my-app",
+                    "owner_id": "u-1",
+                    "created_at": "2026-05-28T00:00:00Z"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let a = create_app(
+            &test_client(),
+            &server.url(),
+            "AT",
+            &CreateAppInput {
+                name: "My App",
+                slug: "my-app",
+            },
+        )
+        .expect("ok");
+        assert_eq!(a.slug, "my-app");
+        assert_eq!(a.id, "a-1");
+    }
+
+    #[test]
+    fn create_app_409_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps")
+            .with_status(409)
+            .with_body(
+                r#"{"error":{"code":"slug_taken","message":"app slug already taken"}}"#,
+            )
+            .create();
+
+        let err = create_app(
+            &test_client(),
+            &server.url(),
+            "AT",
+            &CreateAppInput {
+                name: "My App",
+                slug: "my-app",
+            },
+        )
+        .unwrap_err();
+        match err {
+            ApiError::Server { code, .. } => assert_eq!(code, "slug_taken"),
+            other => panic!("expected Server, got {other:?}"),
         }
     }
 

@@ -76,16 +76,47 @@ pub fn load() -> Result<Credentials, LoadError> {
     }
 }
 
-/// Wrap [`load`] with the auth-required command idiom: a missing file
-/// becomes a "run `mirrorstack login`" hint instead of the raw error.
-/// Used by every command that needs an authenticated session.
+/// Load credentials, auto-refreshing if the access token is expired.
+/// Falls back to "run `mirrorstack login`" if refresh also fails.
 pub fn load_or_login_hint() -> Result<Credentials> {
-    match load() {
-        Ok(c) => Ok(c),
-        Err(LoadError::NotFound) => Err(anyhow::anyhow!(
-            "not signed in. Run `mirrorstack login` to sign in."
+    let creds = match load() {
+        Ok(c) => c,
+        Err(LoadError::NotFound) => {
+            return Err(anyhow::anyhow!(
+                "not signed in. Run `mirrorstack login` to sign in."
+            ))
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    if creds.expires_at > SystemTime::now() {
+        return Ok(creds);
+    }
+
+    // Token expired — try refresh
+    let api_base = std::env::var("MIRRORSTACK_API_URL")
+        .unwrap_or_else(|_| "https://api.mirrorstack.ai".into());
+    let client = match crate::http::client(std::time::Duration::from_secs(15)) {
+        Ok(c) => c,
+        Err(_) => return Err(anyhow::anyhow!("session expired. Run `mirrorstack login` to sign in again.")),
+    };
+
+    match crate::api::refresh_session(&client, &api_base, &creds.refresh_token) {
+        Ok(tokens) => {
+            let new_creds = Credentials {
+                access_token: tokens.access_token,
+                refresh_token: tokens.refresh_token,
+                expires_at: SystemTime::now()
+                    + std::time::Duration::from_secs(tokens.expires_in),
+            };
+            if let Err(e) = save(&new_creds) {
+                eprintln!("warning: couldn't save refreshed credentials: {e}");
+            }
+            Ok(new_creds)
+        }
+        Err(_) => Err(anyhow::anyhow!(
+            "session expired. Run `mirrorstack login` to sign in again."
         )),
-        Err(e) => Err(e.into()),
     }
 }
 
