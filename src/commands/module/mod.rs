@@ -73,7 +73,7 @@ pub fn run(args: ModuleArgs) -> Result<()> {
 fn init(args: InitArgs) -> Result<()> {
     let theme = ColorfulTheme::default();
 
-    let creds = credentials::load_or_login_hint()?;
+    let mut creds = credentials::load_or_login_hint()?;
     let api_base = resolve_base(ENV_API_URL, DEFAULT_API_BASE);
     let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
     let web_base = resolve_base(ENV_WEB_URL, DEFAULT_WEB_BASE);
@@ -82,11 +82,12 @@ fn init(args: InitArgs) -> Result<()> {
     // The platform stores ownership by user id, but the CLI surfaces the
     // full namespaced `@<username>/<slug>` — so we refuse to POST until the
     // caller has claimed a username, and point them at the web flow.
-    let identity = match api::me(&client, &api_base, &creds.access_token) {
-        Ok(id) => id,
-        Err(ApiError::Unauthenticated) => return Err(session_expired()),
-        Err(e) => return Err(e.into()),
-    };
+    let identity =
+        match credentials::with_refresh_retry(&mut creds, |tok| api::me(&client, &api_base, tok)) {
+            Ok(id) => id,
+            Err(ApiError::Unauthenticated) => return Err(session_expired()),
+            Err(e) => return Err(e.into()),
+        };
     let Some(username) = identity.slug.as_deref().filter(|s| !s.is_empty()) else {
         return Err(anyhow!(
             "no username set on this account. Visit {web_base}/me to claim one before creating modules."
@@ -116,7 +117,9 @@ fn init(args: InitArgs) -> Result<()> {
     // the common "I forgot I made this last week" case before we POST.
     // Reserved/invalid still surface server-side from the POST below.
     let pre_check = with_spinner("Checking availability…", || {
-        api::get_module(&client, &apps_base, &creds.access_token, &slug)
+        credentials::with_refresh_retry(&mut creds, |tok| {
+            api::get_module(&client, &apps_base, tok, &slug)
+        })
     });
     // Capture the platform-assigned module ID so scaffolding can substitute
     // it into Config.ID and the table prefix. Sourced from whichever branch
@@ -151,15 +154,17 @@ fn init(args: InitArgs) -> Result<()> {
             }
 
             let create_result = with_spinner("Creating module…", || {
-                api::create_module(
-                    &client,
-                    &apps_base,
-                    &creds.access_token,
-                    &CreateModuleInput {
-                        name: &name,
-                        slug: &slug,
-                    },
-                )
+                credentials::with_refresh_retry(&mut creds, |tok| {
+                    api::create_module(
+                        &client,
+                        &apps_base,
+                        tok,
+                        &CreateModuleInput {
+                            name: &name,
+                            slug: &slug,
+                        },
+                    )
+                })
             });
 
             match create_result {
@@ -172,7 +177,7 @@ fn init(args: InitArgs) -> Result<()> {
                     // time we POST'd. Re-fetch so scaffold still has a real
                     // module ID to substitute.
                     print_already_exists(username, &slug, None);
-                    refetch_module_id(&client, &apps_base, &creds.access_token, username, &slug)?
+                    refetch_module_id(&client, &apps_base, &mut creds, username, &slug)?
                 }
                 Err(ApiError::Server { code, message, .. }) => {
                     return Err(anyhow!(
@@ -201,12 +206,12 @@ fn init(args: InitArgs) -> Result<()> {
 fn refetch_module_id(
     client: &reqwest::blocking::Client,
     apps_base: &str,
-    access_token: &str,
+    creds: &mut credentials::Credentials,
     username: &str,
     slug: &str,
 ) -> Result<String> {
     let refetch = with_spinner("Resolving existing module…", || {
-        api::get_module(client, apps_base, access_token, slug)
+        credentials::with_refresh_retry(creds, |tok| api::get_module(client, apps_base, tok, slug))
     });
     match refetch {
         Ok(Some(m)) => Ok(m.id),

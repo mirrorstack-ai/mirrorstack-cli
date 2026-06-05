@@ -15,7 +15,7 @@
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -27,8 +27,7 @@ use rand::rngs::OsRng;
 use reqwest::blocking::Client;
 
 use super::{
-    DEFAULT_API_BASE, DEFAULT_DISPATCH_BASE, ENV_API_URL, ENV_DISPATCH_URL, ok_mark, resolve_base,
-    session_expired, warn_prefix,
+    DEFAULT_DISPATCH_BASE, ENV_DISPATCH_URL, ok_mark, resolve_base, session_expired, warn_prefix,
 };
 use crate::{api, credentials, http};
 
@@ -149,7 +148,6 @@ fn open_tunnel(
 ) -> Result<(tunnel::TunnelHandle, tokio::runtime::Runtime)> {
     let mut creds = credentials::load_or_login_hint()?;
     let dispatch_base = resolve_base(ENV_DISPATCH_URL, DEFAULT_DISPATCH_BASE);
-    let api_base = resolve_base(ENV_API_URL, DEFAULT_API_BASE);
     let client = http::client(Duration::from_secs(15))?;
     let module_id = module_meta::read_module_id(module_dir)?;
     let local_url = local_url.unwrap_or(DEFAULT_LOCAL_URL);
@@ -159,7 +157,7 @@ fn open_tunnel(
         ok_mark(),
         style(&dispatch_base).cyan().dim()
     );
-    let token = match mint_tunnel_token(&client, &dispatch_base, &api_base, &mut creds) {
+    let token = match mint_tunnel_token(&client, &dispatch_base, &mut creds) {
         Ok(t) => t,
         Err(api::ApiError::Unauthenticated) => return Err(session_expired()),
         Err(e) => {
@@ -221,38 +219,17 @@ fn open_tunnel(
 /// Access tokens are short (15 min per the platform's TokenConfig).
 /// `mirrorstack dev` is a long-running command, so we silently refresh
 /// the access token via the stored refresh token (30-day TTL) on a 401
-/// and retry the mint once. The refresh endpoint rotates the refresh
-/// token too, so the rotated pair is persisted back to credentials.
-/// If the refresh ALSO 401s (revoked / expired session), the original
-/// Unauthenticated bubbles up and the caller surfaces session_expired.
+/// and retry the mint once via [`credentials::with_refresh_retry`]. The
+/// refresh endpoint rotates the refresh token too, so the rotated pair is
+/// persisted back to credentials. If the refresh ALSO 401s (revoked /
+/// expired session), Unauthenticated bubbles up and the caller surfaces
+/// session_expired.
 fn mint_tunnel_token(
     client: &Client,
     dispatch_base: &str,
-    api_base: &str,
     creds: &mut credentials::Credentials,
 ) -> Result<api::TunnelToken, api::ApiError> {
-    match api::tunnel_token(client, dispatch_base, &creds.access_token) {
-        Ok(t) => Ok(t),
-        Err(api::ApiError::Unauthenticated) => {
-            let refreshed = api::refresh_session(client, api_base, &creds.refresh_token)?;
-            creds.access_token = refreshed.access_token;
-            creds.refresh_token = refreshed.refresh_token;
-            // expires_at is informational only on the credentials struct;
-            // match the platform's 15-minute access TTL.
-            creds.expires_at = SystemTime::now() + Duration::from_secs(15 * 60);
-            if let Err(e) = credentials::save(creds) {
-                // Save failure isn't fatal for the in-process retry (we
-                // hold the new access token in `creds`), but log so the
-                // user sees the warning if the next run re-prompts login.
-                eprintln!(
-                    "{} refreshed session but failed to save credentials: {e:#}",
-                    warn_prefix()
-                );
-            }
-            api::tunnel_token(client, dispatch_base, &creds.access_token)
-        }
-        Err(e) => Err(e),
-    }
+    credentials::with_refresh_retry(creds, |tok| api::tunnel_token(client, dispatch_base, tok))
 }
 
 /// Build a user-facing error for the `module_dev_mode_off` rpc.err. The
