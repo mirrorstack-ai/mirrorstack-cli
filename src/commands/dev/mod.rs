@@ -1,20 +1,31 @@
-//! `mirrorstack dev` — run a module locally with the supporting services
-//! it needs.
+//! `mirrorstack dev` — run modules locally.
 //!
-//! The lifecycle is:
-//!   1. Bootstrap a `docker-compose.yml` in the cwd if missing
-//!   2. `docker compose up -d --wait` (server-side healthcheck blocks until pg is ready)
-//!   3. (optional, --tunnel) Mint a connect token and open the WSS so
-//!      remote callers can reach this module via the platform's Leaf 1
-//!      302 path
-//!   4. Spawn `go run .` with `MS_LOCAL_DB_URL` injected
-//!   5. Stream the module's stdout/stderr through a labeled prefix
-//!   6. On Ctrl-C: kill the module (SIGKILL on unix; SIGTERM-then-SIGKILL
-//!      is queued as a follow-up — see issue #25), close the tunnel if
-//!      open, then `docker compose down`
+//! Two modes:
+//!   - **Outer** (host, default): `docker compose up` — all services
+//!     including Go modules run inside Docker.
+//!   - **Inner** (`--all`, inside runner container): spawn `go run`
+//!     per module directly. This is what the compose runner calls.
+//!
+//! Tunnel registration always happens on the host side (outer mode).
+//!
+//! Tunnel mode exposes modules to remote callers (via dispatch's Leaf-1
+//! 307), so each module MUST enforce Internal-scope auth rather than
+//! bypass it. Two cooperating mechanisms make that happen:
+//!   - Per-module `.ms-platform-token-<slug>` files carry the
+//!     dispatch-minted `stk_*` service token from each tunnel's register
+//!     ack. The runner points each module's MS_PLATFORM_TOKEN_FILE at its
+//!     own file (see docs/platform-module-auth.md). This is the primary
+//!     platform→module auth path.
+//!   - A per-session MS_INTERNAL_SECRET, minted here and both sent on the
+//!     register frame and injected into the compose env, keeps the SDK's
+//!     legacy InternalAuth fallback enforcing (not bypassing) while
+//!     dispatch round-trips the value. Backward-compat with older SDKs.
 
-use std::io::IsTerminal;
+use std::io::{BufRead, BufReader, IsTerminal, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -31,189 +42,448 @@ use super::{
 };
 use crate::{api, credentials, http};
 
-mod compose;
-mod module_meta;
-mod process;
+pub(crate) mod module_meta;
 mod tunnel;
+mod workspace;
 
 #[derive(Args)]
 pub struct DevArgs {
-    /// Working directory containing the module's main.go. Defaults to cwd.
+    /// Working directory containing go.work.
     #[arg(long)]
     dir: Option<PathBuf>,
-    /// Skip bringing up `docker-compose` services. Use when you already have
-    /// Postgres running yourself.
-    #[arg(long)]
-    no_compose: bool,
-    /// `MS_LOCAL_DB_URL` override. Defaults to the bundled compose Postgres
-    /// when --no-compose is unset, otherwise must be supplied via env.
-    #[arg(long)]
-    db_url: Option<String>,
-    /// Open a WSS tunnel to the platform so deployed callers can reach this
-    /// module via Leaf 1 (302 → localhost). Requires the developer to be
-    /// signed in (via `mirrorstack login`) and the platform's dispatch
-    /// service + WS API GW to be reachable. Module identity is parsed from
-    /// `Config.ID` in main.go; --local-url defaults to http://localhost:8080.
+    /// Open WSS tunnels so deployed callers can reach local modules.
     #[arg(long)]
     tunnel: bool,
-    /// URL the platform should 302 to when routing inbound calls for this
-    /// module. Only used when --tunnel is set. Default: http://localhost:8080.
+    /// Base URL for tunnel routing. Default: http://localhost.
     #[arg(long)]
     local_url: Option<String>,
+    /// Run all registered modules directly (used inside Docker runner).
+    #[arg(long)]
+    all: bool,
+    /// Enable file watching with hot reload (used with --all).
+    #[arg(long)]
+    watch: bool,
 }
 
-// Matches templates/dev/docker-compose.yml.tmpl: host port 5433 (chosen so
-// the bundled compose can coexist with api-platform's own postgres on 5432).
-const DEFAULT_DB_URL: &str =
-    "postgres://mirrorstack:mirrorstack@localhost:5433/mirrorstack?sslmode=disable";
-
-/// Default local URL the platform should 302 to for Leaf 1 routing. Matches
-/// the SDK's default HTTP listener port. Override with `--local-url`.
-const DEFAULT_LOCAL_URL: &str = "http://localhost:8080";
+const DEFAULT_LOCAL_URL: &str = "http://localhost";
+const DEFAULT_MODULE_PORT: u16 = 9080;
 
 pub fn run(args: DevArgs) -> Result<()> {
     let cwd = args
         .dir
         .clone()
         .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
-    if !cwd.join("main.go").exists() {
+
+    if !cwd.join("go.work").exists() {
         return Err(anyhow!(
-            "{} doesn't look like a module — no main.go found. Run `mirrorstack module init` first, or pass --dir <module-path>.",
+            "{} has no go.work. Run from a module workspace or pass --dir.",
             cwd.display()
         ));
     }
 
-    let db_url = resolve_db_url(&args)?;
+    if args.all {
+        run_inner(&cwd, &args)
+    } else {
+        run_outer(&cwd, &args)
+    }
+}
 
-    // Bring the tunnel up BEFORE compose so that a tunnel registration
-    // failure (auth expired, dispatch unreachable) doesn't waste the user's
-    // time bringing containers up first.
-    //
-    // Tunnel mode exposes the module to remote callers (via dispatch's
-    // Leaf-1 307), so the module MUST enforce Internal-scope auth. Mint a
-    // per-session secret, set MS_INTERNAL_SECRET on the spawned module
-    // process (which flips the bypass-vs-enforce matrix in
-    // auth/middleware.go to enforce), and ship the same value to dispatch
-    // in the register frame so dispatch can attach X-MS-Internal-Secret on
-    // forwarded requests.
-    let tunnel = if args.tunnel {
-        let secret = mint_internal_secret()?;
-        let (handle, runtime) = open_tunnel(&cwd, args.local_url.as_deref(), &secret)?;
-        Some(Tunnel {
-            handle,
-            runtime,
-            internal_secret: secret,
-        })
+// ── Outer mode: host runs `docker compose up` ───────────────────────
+
+fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
+    let all_modules = workspace::discover_modules(root)?;
+
+    let mut ready = Vec::new();
+    let mut skipped = Vec::new();
+    for m in &all_modules {
+        match module_meta::read_module_meta(&m.abs_dir) {
+            Ok(meta) if !meta.id.is_empty() => ready.push(m.clone()),
+            Ok(meta) => skipped.push((m.dir.display().to_string(), meta.slug)),
+            Err(_) => skipped.push((m.dir.display().to_string(), String::new())),
+        }
+    }
+
+    eprintln!(
+        "{} found {} modules in go.work ({} ready, {} skipped)",
+        ok_mark(),
+        style(all_modules.len()).cyan().bold(),
+        ready.len(),
+        skipped.len()
+    );
+    for m in &ready {
+        eprintln!("  {} {}", style("✓").green(), m.dir.display());
+    }
+    for (dir, slug) in &skipped {
+        let reason = if slug.is_empty() {
+            "no main.go"
+        } else {
+            "no ID — run `mirrorstack module register`"
+        };
+        eprintln!("  {} {} ({})", style("–").yellow(), dir, style(reason).dim());
+    }
+
+    if ready.is_empty() {
+        return Err(anyhow!(
+            "no registered modules to run. Run `mirrorstack module register` first."
+        ));
+    }
+
+    // Per-module platform-token files. Each tunnel session gets its OWN
+    // dispatch-minted service token, so each module process must read the
+    // token for ITS session. The old behavior wrote a single shared file
+    // (only the first module's token), which authenticated whichever module
+    // registered first and 401'd every other module on every
+    // platform-initiated call (lifecycle install, manifest read, dev-tunnel
+    // API). The files land in `root` and reach the runner through the
+    // `.:/modules` bind mount; dev-runner.sh points each module's
+    // MS_PLATFORM_TOKEN_FILE at `.ms-platform-token-<slug>`.
+    let mut token_files: Vec<PathBuf> = Vec::new();
+
+    // Per-session MS_INTERNAL_SECRET. Sent on each register frame (so
+    // dispatch can attach X-MS-Internal-Secret on forwarded requests) and
+    // injected into the compose env (so the runner forwards it to each
+    // module and the SDK's legacy InternalAuth fallback enforces rather
+    // than bypasses). Only minted in tunnel mode — without a tunnel the
+    // module isn't reachable by remote callers.
+    let internal_secret = if args.tunnel {
+        Some(mint_internal_secret()?)
     } else {
         None
     };
 
-    if !args.no_compose {
-        compose::ensure_compose_file(&cwd)?;
-        compose::up(&cwd)?;
+    // Register tunnels before compose so auth failures surface early.
+    let tunnel_state = if args.tunnel {
+        let secret = internal_secret.as_deref().expect("tunnel mode mints a secret");
+        let state = open_tunnels(&ready, args.local_url.as_deref(), secret)?;
+        // `open_tunnels` pushes handles in `ready` order, so zip is aligned.
+        for (m, handle) in ready.iter().zip(state.0.iter()) {
+            let slug = m.dir.file_name().unwrap().to_string_lossy();
+            let f = root.join(format!(".ms-platform-token-{slug}"));
+            std::fs::write(&f, &handle.service_token)
+                .with_context(|| format!("dev: write platform token file for {slug}"))?;
+            eprintln!(
+                "{} wrote platform token for {} → {}",
+                ok_mark(),
+                style(&*slug).cyan(),
+                style(f.display()).dim()
+            );
+            token_files.push(f);
+        }
+        Some(state)
+    } else {
+        None
+    };
+
+    eprintln!("{} starting docker compose…", ok_mark());
+    let mut compose = Command::new("docker");
+    compose
+        .args(["compose", "up", "--build"])
+        .current_dir(root)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    // MS_PLATFORM_TOKEN_FILE is set per-module by dev-runner.sh (each module
+    // reads its own `.ms-platform-token-<slug>`). MS_INTERNAL_SECRET is
+    // injected once on the compose env; the runner forwards it to every
+    // module process as the SDK's legacy InternalAuth fallback.
+    if let Some(secret) = &internal_secret {
+        compose.env("MS_INTERNAL_SECRET", secret);
     }
 
-    eprintln!("{} module running — Ctrl-C to stop", ok_mark());
-    let internal_secret = tunnel.as_ref().map(|t| t.internal_secret.as_str());
-    let module_status = process::run_module(&cwd, &db_url, internal_secret);
+    let compose_status = compose.status().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            anyhow!("`docker` not found on PATH. Install Docker Desktop before running dev.")
+        }
+        _ => anyhow!("dev: docker compose up: {e}"),
+    })?;
 
-    if let Some(t) = tunnel {
-        t.handle.shutdown();
-        // Block on the runtime briefly to let the close frame land.
-        t.runtime.block_on(async {
+    // Cleanup per-module token files.
+    for f in &token_files {
+        let _ = std::fs::remove_file(f);
+    }
+
+    if let Some((handles, runtime)) = tunnel_state {
+        for h in &handles {
+            h.shutdown();
+        }
+        runtime.block_on(async {
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
     }
 
-    if !args.no_compose {
-        if let Err(e) = compose::down(&cwd) {
-            eprintln!(
-                "{} compose down failed: {e:#}. Run `docker compose down` to clean up.",
-                warn_prefix()
-            );
+    if !compose_status.success() {
+        return Err(anyhow!(
+            "docker compose exited with status {}",
+            compose_status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into())
+        ));
+    }
+
+    Ok(())
+}
+
+// ── Inner mode: inside Docker, run modules directly ─────────────────
+
+fn run_inner(root: &Path, _args: &DevArgs) -> Result<()> {
+    let all_modules = workspace::discover_modules(root)?;
+
+    let mut ready = Vec::new();
+    for m in &all_modules {
+        match module_meta::read_module_meta(&m.abs_dir) {
+            Ok(meta) if !meta.id.is_empty() => ready.push(m.clone()),
+            _ => {
+                eprintln!("{} skipping {} (no ID)", warn_prefix(), m.dir.display());
+            }
         }
     }
 
-    module_status
+    if ready.is_empty() {
+        return Err(anyhow!("no registered modules to run"));
+    }
+
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://mirrorstack:mirrorstack@postgres:5432/ms_app_modules?sslmode=disable".into()
+    });
+
+    eprintln!(
+        "{} starting {} {}",
+        ok_mark(),
+        ready.len(),
+        if ready.len() == 1 { "module" } else { "modules" }
+    );
+
+    let mut children: Vec<(String, Child)> = Vec::new();
+
+    for m in &ready {
+        let slug = m.dir.file_name().unwrap().to_string_lossy().to_string();
+
+        let mut cmd = Command::new("go");
+        cmd.args(["run", &format!("./{}", m.dir.display())])
+            .current_dir(root)
+            .env("MS_LOCAL_DB_URL", &db_url)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // Pass through env vars from compose (MS_INTERNAL_SECRET is the
+        // per-session secret minted by the outer run; the rest are infra).
+        for var in [
+            "MS_INTERNAL_SECRET",
+            "REDIS_URL",
+            "AWS_ENDPOINT_URL",
+            "AWS_REGION",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("dev: spawn module {slug}"))?;
+
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let label: &'static str = Box::leak(slug.clone().into_boxed_str());
+        spawn_forwarder(stdout, label, false);
+        spawn_forwarder(stderr, label, true);
+
+        eprintln!("  {} {}", style("✓").green(), slug);
+        children.push((slug, child));
+    }
+
+    // Wait for Ctrl-C
+    let (tx, rx) = mpsc::channel::<()>();
+    ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    })
+    .context("dev: install ctrl-c handler")?;
+
+    let mut exited = vec![false; children.len()];
+    loop {
+        for (i, (label, child)) in children.iter_mut().enumerate() {
+            if exited[i] {
+                continue;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                exited[i] = true;
+                eprintln!(
+                    "{} module {} exited ({})",
+                    warn_prefix(),
+                    label,
+                    status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "signal".into())
+                );
+            }
+        }
+
+        if exited.iter().all(|e| *e) {
+            break;
+        }
+
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(()) => {
+                for (_, child) in &mut children {
+                    let _ = child.kill();
+                }
+                for (_, child) in &mut children {
+                    let _ = child.wait();
+                }
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                for (_, child) in &mut children {
+                    let _ = child.wait();
+                }
+                break;
+            }
+        }
+    }
+
+    Ok(())
 }
 
-/// Build a single-threaded tokio runtime, mint a connect token via
-/// dispatch, open the WSS, send `register`, and return the handle so the
-/// caller can shut it down on Ctrl-C. Runs blocking under the hood —
-/// the tunnel itself stays alive on the runtime's worker thread.
-fn open_tunnel(
-    module_dir: &Path,
-    local_url: Option<&str>,
+fn spawn_forwarder<R: Read + Send + 'static>(reader: R, label: &'static str, is_stderr: bool) {
+    thread::spawn(move || {
+        let prefix = line_prefix(label);
+        let mut buf = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match buf.read_line(&mut line) {
+                Ok(0) => return,
+                Ok(_) => {
+                    let trimmed = line.trim_end_matches(['\n', '\r']);
+                    if is_stderr {
+                        eprintln!("{prefix} {trimmed}");
+                    } else {
+                        println!("{prefix} {trimmed}");
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+}
+
+fn line_prefix(label: &str) -> String {
+    if std::io::stderr().is_terminal() {
+        format!("{} {}", style(label).cyan().dim(), style("│").dim())
+    } else {
+        format!("[{label}]")
+    }
+}
+
+// ── Tunnel registration ─────────────────────────────────────────────
+
+/// Open one WSS tunnel per ready module. Returns the handles (in `modules`
+/// order) plus the tokio runtime keeping their background tasks alive.
+///
+/// Each module's tunnel-token mint is wrapped in
+/// [`credentials::with_refresh_retry`] so a 401 on a long-running
+/// `mirrorstack dev` silently refreshes the 15-minute access token from the
+/// stored refresh token and retries once, rather than forcing a re-login.
+/// The rotated refresh pair is persisted back to credentials between
+/// modules. `internal_secret` is the per-session value sent on every
+/// register frame so dispatch can attach X-MS-Internal-Secret on forwarded
+/// requests.
+fn open_tunnels(
+    modules: &[workspace::WorkspaceModule],
+    local_url_base: Option<&str>,
     internal_secret: &str,
-) -> Result<(tunnel::TunnelHandle, tokio::runtime::Runtime)> {
+) -> Result<(Vec<tunnel::TunnelHandle>, tokio::runtime::Runtime)> {
     let mut creds = credentials::load_or_login_hint()?;
     let dispatch_base = resolve_base(ENV_DISPATCH_URL, DEFAULT_DISPATCH_BASE);
     let client = http::client(Duration::from_secs(15))?;
-    let module_id = module_meta::read_module_id(module_dir)?;
-    let local_url = local_url.unwrap_or(DEFAULT_LOCAL_URL);
 
-    eprintln!(
-        "{} fetching tunnel token from {}",
-        ok_mark(),
-        style(&dispatch_base).cyan().dim()
-    );
-    let token = match mint_tunnel_token(&client, &dispatch_base, &mut creds) {
-        Ok(t) => t,
-        Err(api::ApiError::Unauthenticated) => return Err(session_expired()),
-        Err(e) => {
-            // Dispatch unreachable is a routine "platform isn't running yet"
-            // error — point the user at the right env var.
-            return Err(anyhow!(
-                "dev: tunnel-token mint failed: {e}. Check {} (or {} env var) and that the dispatch service is running.",
-                dispatch_base,
-                ENV_DISPATCH_URL
-            ));
-        }
-    };
-    // Multi-thread (one worker) so the WSS background task — pinger,
-    // server-frame reader — keeps ticking while the rest of the CLI runs
-    // its blocking module-process loop. A current-thread runtime would
-    // freeze every spawned future the moment block_on returns.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
         .build()
         .context("dev: build tokio runtime")?;
 
-    let handle = match runtime.block_on(async {
-        tunnel::open(
-            &token.wss_url,
-            &token.token,
-            tunnel::RegisterPayload {
-                module_id: &module_id,
-                local_url,
-                version: env!("CARGO_PKG_VERSION"),
-                internal_secret: Some(internal_secret),
-            },
-        )
-        .await
-    }) {
-        Ok(h) => h,
-        Err(tunnel::RegisterError::ModuleDevModeOff { slug }) => {
-            return Err(dev_mode_off_hint(&dispatch_base, slug.as_deref()));
-        }
-        Err(tunnel::RegisterError::ModuleNotYours) => {
-            return Err(anyhow!(
-                "dev: this module isn't owned by you — only the module owner can open a dev tunnel.\nIf you scaffolded with `mirrorstack module init`, your `Config.ID` should match the platform's record; re-check it under `mirrorstack module list`."
-            ));
-        }
-        Err(tunnel::RegisterError::Rejected { code, message }) => {
-            return Err(anyhow!("dev: register rejected ({code}): {message}"));
-        }
-        Err(tunnel::RegisterError::Transport(e)) => return Err(e),
+    let mut handles = Vec::with_capacity(modules.len());
+
+    let local_url = match local_url_base {
+        Some(url) => url.to_string(),
+        None => format!("{DEFAULT_LOCAL_URL}:{DEFAULT_MODULE_PORT}"),
     };
 
-    eprintln!(
-        "{} tunnel registered (session {})",
-        ok_mark(),
-        style(&handle.session_id).cyan().dim()
-    );
-    Ok((handle, runtime))
+    for m in modules {
+        let module_id = module_meta::read_module_id(&m.abs_dir)?;
+        let slug = m.dir.file_name().unwrap().to_string_lossy();
+        let module_local_url = format!("{local_url}/_m/{slug}");
+
+        eprintln!(
+            "{} fetching tunnel token for {} from {}",
+            ok_mark(),
+            style(m.dir.display()).cyan(),
+            style(&dispatch_base).dim()
+        );
+
+        let token = match mint_tunnel_token(&client, &dispatch_base, &mut creds) {
+            Ok(t) => t,
+            Err(api::ApiError::Unauthenticated) => return Err(session_expired()),
+            Err(e) => {
+                return Err(anyhow!(
+                    "dev: tunnel-token mint for {} failed: {e}. Check {} (or {} env var) and that the dispatch service is running.",
+                    m.dir.display(),
+                    dispatch_base,
+                    ENV_DISPATCH_URL
+                ));
+            }
+        };
+
+        let handle = match runtime.block_on(async {
+            tunnel::open(
+                &token.wss_url,
+                &token.token,
+                tunnel::RegisterPayload {
+                    module_id: &module_id,
+                    local_url: &module_local_url,
+                    version: env!("CARGO_PKG_VERSION"),
+                    internal_secret: Some(internal_secret),
+                },
+            )
+            .await
+        }) {
+            Ok(h) => h,
+            Err(tunnel::RegisterError::ModuleDevModeOff { slug }) => {
+                return Err(dev_mode_off_hint(&dispatch_base, slug.as_deref()));
+            }
+            Err(tunnel::RegisterError::ModuleNotYours) => {
+                return Err(anyhow!(
+                    "dev: module {} isn't owned by you — only the module owner can open a dev tunnel.\nIf you scaffolded with `mirrorstack module init`, your `Config.ID` should match the platform's record; re-check it under `mirrorstack module list`.",
+                    m.dir.display()
+                ));
+            }
+            Err(tunnel::RegisterError::Rejected { code, message }) => {
+                return Err(anyhow!(
+                    "dev: register rejected for {} ({code}): {message}",
+                    m.dir.display()
+                ));
+            }
+            Err(tunnel::RegisterError::Transport(e)) => return Err(e),
+        };
+
+        eprintln!(
+            "{} tunnel {} → {} (session {})",
+            ok_mark(),
+            style(m.dir.display()).cyan(),
+            style(&module_local_url).dim(),
+            style(&handle.session_id).dim()
+        );
+
+        handles.push(handle);
+    }
+
+    Ok((handles, runtime))
 }
 
 /// Access tokens are short (15 min per the platform's TokenConfig).
@@ -279,16 +549,7 @@ fn dev_console_url(dispatch_base: &str, slug: Option<&str>) -> String {
     }
 }
 
-/// Held for the lifetime of `mirrorstack dev --tunnel`. The runtime
-/// keeps the WSS background task alive; the secret is the
-/// `MS_INTERNAL_SECRET` value the spawned module enforces against.
-struct Tunnel {
-    handle: tunnel::TunnelHandle,
-    runtime: tokio::runtime::Runtime,
-    internal_secret: String,
-}
-
-/// Mint a 32-byte URL-safe base64 random token used as the module's
+/// Mint a 32-byte URL-safe base64 random token used as the per-session
 /// MS_INTERNAL_SECRET. Same shape as auth::random_state (OsRng → b64url),
 /// inlined here to avoid a cross-module dependency for a one-off helper.
 fn mint_internal_secret() -> Result<String> {
@@ -299,72 +560,5 @@ fn mint_internal_secret() -> Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(buf))
 }
 
-fn resolve_db_url(args: &DevArgs) -> Result<String> {
-    if let Some(url) = &args.db_url {
-        return Ok(url.clone());
-    }
-    if let Ok(url) = std::env::var("MS_LOCAL_DB_URL") {
-        return Ok(url);
-    }
-    if args.no_compose {
-        return Err(anyhow!(
-            "--no-compose requires MS_LOCAL_DB_URL (env or --db-url) — without compose there's no fallback"
-        ));
-    }
-    Ok(DEFAULT_DB_URL.into())
-}
-
-/// Color-aware prefix used by both stdout and stderr forwarders. Skipped on
-/// non-TTY targets so CI logs stay clean.
-pub(super) fn line_prefix(label: &str) -> String {
-    if std::io::stderr().is_terminal() {
-        format!("{} {}", style(label).cyan().dim(), style("│").dim())
-    } else {
-        format!("[{label}]")
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn args_with(no_compose: bool, db_url: Option<String>) -> DevArgs {
-        DevArgs {
-            dir: None,
-            no_compose,
-            db_url,
-            tunnel: false,
-            local_url: None,
-        }
-    }
-
-    #[test]
-    fn resolve_db_url_prefers_explicit_arg() {
-        let args = args_with(false, Some("postgres://x".into()));
-        assert_eq!(resolve_db_url(&args).unwrap(), "postgres://x");
-    }
-
-    #[test]
-    fn resolve_db_url_no_compose_requires_env() {
-        // Skip when the runner happens to have MS_LOCAL_DB_URL set — the
-        // no-env error path is what we're after, and toggling process-global
-        // env from a test is a recipe for cross-test interference.
-        if std::env::var("MS_LOCAL_DB_URL").is_ok() {
-            return;
-        }
-        let args = args_with(true, None);
-        let err = resolve_db_url(&args).unwrap_err().to_string();
-        assert!(err.contains("MS_LOCAL_DB_URL"));
-    }
-
-    #[test]
-    fn resolve_db_url_compose_default_when_unset() {
-        if std::env::var("MS_LOCAL_DB_URL").is_ok() {
-            return;
-        }
-        let args = args_with(false, None);
-        let url = resolve_db_url(&args).unwrap();
-        assert!(url.starts_with("postgres://mirrorstack"));
-        assert!(url.contains(":5433/"));
-    }
-}
+mod tests {}

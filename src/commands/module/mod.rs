@@ -15,6 +15,7 @@ use dialoguer::{Confirm, Input, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::api::{self, ApiError, CreateModuleInput};
+use crate::commands::dev::module_meta;
 use crate::credentials;
 use crate::http;
 
@@ -22,7 +23,7 @@ mod scaffold;
 
 use super::{
     DEFAULT_API_BASE, DEFAULT_APPS_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_APPS_API_URL,
-    ENV_WEB_URL, ok_mark, resolve_base, session_expired,
+    ENV_WEB_URL, ok_mark, resolve_base, session_expired, warn_prefix,
 };
 
 #[derive(Args)]
@@ -33,9 +34,13 @@ pub struct ModuleArgs {
 
 #[derive(Subcommand)]
 enum ModuleCommand {
-    /// Register a new module on the platform. Interactive by default;
-    /// pass --yes for non-interactive use.
+    /// Create a new module on the platform and scaffold locally.
+    /// Interactive by default; pass --yes for non-interactive use.
     Init(InitArgs),
+    /// Register all unregistered modules in the workspace with the
+    /// platform. Scans go.work, finds modules with empty IDs, creates
+    /// them via the API, and writes the assigned ID back into main.go.
+    Register(RegisterArgs),
 }
 
 #[derive(Args)]
@@ -64,9 +69,20 @@ pub struct InitArgs {
     dir: Option<PathBuf>,
 }
 
+#[derive(Args)]
+pub struct RegisterArgs {
+    /// Working directory containing go.work. Defaults to cwd.
+    #[arg(long)]
+    dir: Option<PathBuf>,
+    /// Skip confirmation prompts.
+    #[arg(long, short)]
+    yes: bool,
+}
+
 pub fn run(args: ModuleArgs) -> Result<()> {
     match args.command {
         ModuleCommand::Init(i) => init(i),
+        ModuleCommand::Register(r) => register(r),
     }
 }
 
@@ -201,6 +217,250 @@ fn init(args: InitArgs) -> Result<()> {
             module_id: &module_id,
         },
     )
+}
+
+fn register(args: RegisterArgs) -> Result<()> {
+    let cwd = args
+        .dir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+
+    let go_work = cwd.join("go.work");
+    if !go_work.exists() {
+        return Err(anyhow!(
+            "no go.work found in {}. Run from a module workspace.",
+            cwd.display()
+        ));
+    }
+
+    let mut creds = credentials::load_or_login_hint()?;
+    let api_base = resolve_base(ENV_API_URL, DEFAULT_API_BASE);
+    let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
+    let web_base = resolve_base(ENV_WEB_URL, DEFAULT_WEB_BASE);
+    let client = http::client(Duration::from_secs(15))?;
+
+    let identity =
+        match credentials::with_refresh_retry(&mut creds, |tok| api::me(&client, &api_base, tok)) {
+            Ok(id) => id,
+            Err(ApiError::Unauthenticated) => return Err(session_expired()),
+            Err(e) => return Err(e.into()),
+        };
+    let Some(username) = identity.slug.as_deref().filter(|s| !s.is_empty()) else {
+        return Err(anyhow!(
+            "no username set. Visit {web_base}/me to claim one first."
+        ));
+    };
+
+    // Parse go.work to find module directories
+    let body = std::fs::read_to_string(&go_work)
+        .with_context(|| format!("read {}", go_work.display()))?;
+    let module_dirs = parse_go_work_use_dirs(&body);
+    if module_dirs.is_empty() {
+        return Err(anyhow!("go.work has no `use` directives"));
+    }
+
+    let theme = ColorfulTheme::default();
+    let mut registered = 0u32;
+    let mut skipped = 0u32;
+
+    for rel_dir in &module_dirs {
+        let abs_dir = cwd.join(rel_dir);
+        let meta = match module_meta::read_module_meta(&abs_dir) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!(
+                    "{} skipping {}: {e}",
+                    warn_prefix(),
+                    rel_dir
+                );
+                continue;
+            }
+        };
+
+        if !meta.id.is_empty() {
+            eprintln!(
+                "{} {} already registered ({})",
+                ok_mark(),
+                style(format!("@{username}/{}", meta.slug)).cyan(),
+                style(&meta.id).dim()
+            );
+            skipped += 1;
+            continue;
+        }
+
+        if !slug_valid(&meta.slug) {
+            eprintln!(
+                "{} skipping {}: slug '{}' is invalid",
+                warn_prefix(),
+                rel_dir,
+                meta.slug
+            );
+            continue;
+        }
+
+        if !args.yes {
+            eprintln!();
+            eprintln!(
+                "  {} {}",
+                style("Module:").dim(),
+                style(&meta.name).bold()
+            );
+            eprintln!(
+                "  {}   {}",
+                style("Slug:").dim(),
+                style(format!("@{username}/{}", meta.slug)).cyan().bold()
+            );
+            let confirmed = Confirm::with_theme(&theme)
+                .with_prompt(format!("Register {}?", meta.slug))
+                .default(true)
+                .interact()?;
+            if !confirmed {
+                eprintln!("{}", style("skipped.").yellow());
+                continue;
+            }
+        }
+
+        let result = with_spinner(&format!("Registering {}…", meta.slug), || {
+            credentials::with_refresh_retry(&mut creds, |tok| {
+                api::create_module(
+                    &client,
+                    &apps_base,
+                    tok,
+                    &CreateModuleInput {
+                        name: &meta.name,
+                        slug: &meta.slug,
+                    },
+                )
+            })
+        });
+
+        let module_id = match result {
+            Ok(m) => {
+                eprintln!(
+                    "{} created {}",
+                    ok_mark(),
+                    style(format!("@{username}/{}", m.slug)).cyan().bold()
+                );
+                m.id
+            }
+            Err(ApiError::Server { code, .. }) if code == "slug_taken" => {
+                // Already exists on platform — fetch the ID
+                match credentials::with_refresh_retry(&mut creds, |tok| {
+                    api::get_module(&client, &apps_base, tok, &meta.slug)
+                })? {
+                    Some(existing) => {
+                        eprintln!(
+                            "{} {} already exists on platform, using existing ID",
+                            ok_mark(),
+                            style(format!("@{username}/{}", meta.slug)).cyan()
+                        );
+                        existing.id
+                    }
+                    None => {
+                        eprintln!(
+                            "{} slug '{}' is taken by another user",
+                            warn_prefix(),
+                            meta.slug
+                        );
+                        continue;
+                    }
+                }
+            }
+            Err(ApiError::Unauthenticated) => return Err(session_expired()),
+            Err(e) => {
+                eprintln!(
+                    "{} failed to register {}: {e}",
+                    warn_prefix(),
+                    meta.slug
+                );
+                continue;
+            }
+        };
+
+        // Write the ID back into main.go
+        let sanitized_id = sanitize_module_id(&module_id);
+        module_meta::write_module_id(&abs_dir, &sanitized_id)
+            .with_context(|| format!("write ID to {}/main.go", rel_dir))?;
+        eprintln!(
+            "  {} wrote ID {} → {}/main.go",
+            style("→").dim(),
+            style(&sanitized_id).dim(),
+            rel_dir
+        );
+        registered += 1;
+    }
+
+    eprintln!();
+    eprintln!(
+        "{} done: {} registered, {} already had IDs",
+        ok_mark(),
+        registered,
+        skipped
+    );
+    Ok(())
+}
+
+/// Parse `use` directives from go.work content (same logic as workspace.rs
+/// but returns raw strings since we don't need abs paths here).
+fn parse_go_work_use_dirs(body: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut in_block = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if in_block {
+            if trimmed == ")" {
+                in_block = false;
+                continue;
+            }
+            if let Some(dir) = clean_go_work_path(trimmed) {
+                result.push(dir);
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("use") {
+            let rest = rest.trim();
+            if rest == "(" {
+                in_block = true;
+            } else if let Some(dir) = clean_go_work_path(rest) {
+                result.push(dir);
+            }
+        }
+    }
+    result
+}
+
+fn clean_go_work_path(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() || s.starts_with("//") {
+        return None;
+    }
+    let s = match s.find("//") {
+        Some(pos) => s[..pos].trim(),
+        None => s,
+    };
+    let s = s.strip_prefix("./").unwrap_or(s);
+    if s.is_empty() {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// Convert platform UUID to SDK-compatible module ID (same as scaffold.rs).
+fn sanitize_module_id(uuid: &str) -> String {
+    // If it already looks sanitized (starts with 'm', no hyphens), return as-is
+    if uuid.starts_with('m') && !uuid.contains('-') {
+        return uuid.to_string();
+    }
+    let mut out = String::with_capacity(33);
+    out.push('m');
+    for c in uuid.chars() {
+        if c == '-' {
+            continue;
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
 }
 
 fn refetch_module_id(

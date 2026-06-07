@@ -214,6 +214,71 @@ pub fn create_module(
     })
 }
 
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // name / owner_id / created_at are part of the API surface
+pub struct App {
+    pub id: String,
+    pub name: String,
+    pub slug: String,
+    #[serde(default)]
+    pub owner_id: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateAppInput<'a> {
+    pub name: &'a str,
+    pub slug: &'a str,
+}
+
+/// POST /v1/apps — create an application on the platform.
+pub fn create_app(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    input: &CreateAppInput,
+) -> Result<App, ApiError> {
+    let endpoint = format!("{}/v1/apps", apps_base.trim_end_matches('/'));
+
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .json(input)
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<App>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+
+    let status_u16 = status.as_u16();
+    let body = match http::read_capped(resp) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(ApiError::Unexpected {
+                status: status_u16,
+                body: format!("(read body failed: {e})"),
+            });
+        }
+    };
+    if let Ok(env) = serde_json::from_slice::<ErrorEnvelope>(&body) {
+        return Err(ApiError::Server {
+            status: status_u16,
+            code: env.error.code,
+            message: env.error.message,
+        });
+    }
+    Err(ApiError::Unexpected {
+        status: status_u16,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
+}
+
 /// Body of a successful `POST /v1/auth/sessions/refresh`. The platform
 /// rotates the refresh token on every refresh (replay defense), so we
 /// must persist the new one back to credentials. expires_at is RFC3339
@@ -543,6 +608,64 @@ mod tests {
                 assert!(body.contains("upstream timeout"), "got body {body:?}");
             }
             other => panic!("expected Unexpected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_app_success() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps")
+            .match_header("authorization", "Bearer AT")
+            .with_status(201)
+            .with_body(
+                json!({
+                    "id": "a-1",
+                    "name": "My App",
+                    "slug": "my-app",
+                    "owner_id": "u-1",
+                    "created_at": "2026-05-28T00:00:00Z"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let a = create_app(
+            &test_client(),
+            &server.url(),
+            "AT",
+            &CreateAppInput {
+                name: "My App",
+                slug: "my-app",
+            },
+        )
+        .expect("ok");
+        assert_eq!(a.slug, "my-app");
+        assert_eq!(a.id, "a-1");
+    }
+
+    #[test]
+    fn create_app_409_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps")
+            .with_status(409)
+            .with_body(r#"{"error":{"code":"slug_taken","message":"app slug already taken"}}"#)
+            .create();
+
+        let err = create_app(
+            &test_client(),
+            &server.url(),
+            "AT",
+            &CreateAppInput {
+                name: "My App",
+                slug: "my-app",
+            },
+        )
+        .unwrap_err();
+        match err {
+            ApiError::Server { code, .. } => assert_eq!(code, "slug_taken"),
+            other => panic!("expected Server, got {other:?}"),
         }
     }
 
