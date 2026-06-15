@@ -19,8 +19,8 @@ pub(super) struct WorkspaceModule {
 /// directives.
 pub(super) fn discover_modules(root: &Path) -> Result<Vec<WorkspaceModule>> {
     let go_work = root.join("go.work");
-    let body = fs::read_to_string(&go_work)
-        .with_context(|| format!("dev: read {}", go_work.display()))?;
+    let body =
+        fs::read_to_string(&go_work).with_context(|| format!("dev: read {}", go_work.display()))?;
 
     let dirs = parse_use_directives(&body);
     if dirs.is_empty() {

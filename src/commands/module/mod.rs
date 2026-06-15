@@ -252,8 +252,8 @@ fn register(args: RegisterArgs) -> Result<()> {
     };
 
     // Parse go.work to find module directories
-    let body = std::fs::read_to_string(&go_work)
-        .with_context(|| format!("read {}", go_work.display()))?;
+    let body =
+        std::fs::read_to_string(&go_work).with_context(|| format!("read {}", go_work.display()))?;
     let module_dirs = parse_go_work_use_dirs(&body);
     if module_dirs.is_empty() {
         return Err(anyhow!("go.work has no `use` directives"));
@@ -268,11 +268,7 @@ fn register(args: RegisterArgs) -> Result<()> {
         let meta = match module_meta::read_module_meta(&abs_dir) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!(
-                    "{} skipping {}: {e}",
-                    warn_prefix(),
-                    rel_dir
-                );
+                eprintln!("{} skipping {}: {e}", warn_prefix(), rel_dir);
                 continue;
             }
         };
@@ -300,11 +296,7 @@ fn register(args: RegisterArgs) -> Result<()> {
 
         if !args.yes {
             eprintln!();
-            eprintln!(
-                "  {} {}",
-                style("Module:").dim(),
-                style(&meta.name).bold()
-            );
+            eprintln!("  {} {}", style("Module:").dim(), style(&meta.name).bold());
             eprintln!(
                 "  {}   {}",
                 style("Slug:").dim(),
@@ -368,11 +360,7 @@ fn register(args: RegisterArgs) -> Result<()> {
             }
             Err(ApiError::Unauthenticated) => return Err(session_expired()),
             Err(e) => {
-                eprintln!(
-                    "{} failed to register {}: {e}",
-                    warn_prefix(),
-                    meta.slug
-                );
+                eprintln!("{} failed to register {}: {e}", warn_prefix(), meta.slug);
                 continue;
             }
         };

@@ -150,9 +150,7 @@ fn create(args: CreateArgs) -> Result<()> {
             eprintln!("  {} {}", style("id:").dim(), app.id);
             Ok(())
         }
-        Err(ApiError::Server { code, message, .. }) => {
-            Err(anyhow!("{code}: {message}"))
-        }
+        Err(ApiError::Server { code, message, .. }) => Err(anyhow!("{code}: {message}")),
         Err(ApiError::Unauthenticated) => Err(session_expired()),
         Err(e) => Err(e.into()),
     }

@@ -119,7 +119,12 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         } else {
             "no ID — run `mirrorstack module register`"
         };
-        eprintln!("  {} {} ({})", style("–").yellow(), dir, style(reason).dim());
+        eprintln!(
+            "  {} {} ({})",
+            style("–").yellow(),
+            dir,
+            style(reason).dim()
+        );
     }
 
     if ready.is_empty() {
@@ -153,7 +158,9 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
 
     // Register tunnels before compose so auth failures surface early.
     let tunnel_state = if args.tunnel {
-        let secret = internal_secret.as_deref().expect("tunnel mode mints a secret");
+        let secret = internal_secret
+            .as_deref()
+            .expect("tunnel mode mints a secret");
         let state = open_tunnels(&ready, args.local_url.as_deref(), secret)?;
         // `open_tunnels` pushes handles in `ready` order, so zip is aligned.
         for (m, handle) in ready.iter().zip(state.0.iter()) {
@@ -251,7 +258,11 @@ fn run_inner(root: &Path, _args: &DevArgs) -> Result<()> {
         "{} starting {} {}",
         ok_mark(),
         ready.len(),
-        if ready.len() == 1 { "module" } else { "modules" }
+        if ready.len() == 1 {
+            "module"
+        } else {
+            "modules"
+        }
     );
 
     let mut children: Vec<(String, Child)> = Vec::new();

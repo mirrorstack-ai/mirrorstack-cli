@@ -99,15 +99,11 @@ pub(crate) fn write_module_id(module_dir: &Path, new_id: &str) -> Result<()> {
                 return Err(anyhow!("unexpected EOF after Slug in {}", path.display()));
             }
         } else {
-            return Err(anyhow!(
-                "no Slug or ID field found in {}",
-                path.display()
-            ));
+            return Err(anyhow!("no Slug or ID field found in {}", path.display()));
         }
     };
 
-    fs::write(&path, new_body)
-        .with_context(|| format!("dev: write {}", path.display()))?;
+    fs::write(&path, new_body).with_context(|| format!("dev: write {}", path.display()))?;
     Ok(())
 }
 
@@ -116,7 +112,10 @@ fn detect_indent(source: &str, field_pos: usize) -> String {
     if let Some(nl) = before.rfind('\n') {
         let line_start = &before[nl + 1..field_pos];
         // Extract leading whitespace
-        let ws: String = line_start.chars().take_while(|c| c.is_whitespace()).collect();
+        let ws: String = line_start
+            .chars()
+            .take_while(|c| c.is_whitespace())
+            .collect();
         ws
     } else {
         String::new()
