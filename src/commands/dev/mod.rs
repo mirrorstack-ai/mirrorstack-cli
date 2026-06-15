@@ -360,6 +360,13 @@ fn open_tunnels(
         None => format!("{DEFAULT_LOCAL_URL}:{DEFAULT_MODULE_PORT}"),
     };
 
+    // The shared internal secret dispatch must attach (X-MS-Internal-Secret) to
+    // every platform-initiated forward so the module accepts manifest reads, cron
+    // fires, and event deliveries on its Internal scope. It is the SAME value the
+    // module process gets as MS_INTERNAL_SECRET (compose / env passthrough); we
+    // send it at register so the session can carry it. Empty → serde-skipped.
+    let internal_secret = std::env::var("MS_INTERNAL_SECRET").unwrap_or_default();
+
     for m in modules {
         let module_id = module_meta::read_module_id(&m.abs_dir)?;
         let slug = m.dir.file_name().unwrap().to_string_lossy();
@@ -391,6 +398,7 @@ fn open_tunnels(
                     module_id: &module_id,
                     local_url: &module_local_url,
                     version: env!("CARGO_PKG_VERSION"),
+                    internal_secret: &internal_secret,
                 },
             )
             .await

@@ -124,6 +124,13 @@ pub(super) struct RegisterPayload<'a> {
     pub module_id: &'a str,
     pub local_url: &'a str,
     pub version: &'a str,
+    // The per-session MS_INTERNAL_SECRET also set on the spawned module process.
+    // Dispatch stores it on the session and attaches it as X-MS-Internal-Secret
+    // on every platform-initiated forward (manifest read, cron, event delivery)
+    // so the module authenticates that traffic on its Internal scope. Omitted
+    // (serde skip) when empty so older dispatch round-trips the frame unchanged.
+    #[serde(skip_serializing_if = "str::is_empty")]
+    pub internal_secret: &'a str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -363,6 +370,7 @@ mod tests {
             module_id: "m_abc",
             local_url: "http://localhost:8080",
             version: "0.1.0",
+            internal_secret: "sec_test",
         };
         let s = serde_json::to_string(&p).unwrap();
         assert!(s.contains("\"module_id\":\"m_abc\""));
