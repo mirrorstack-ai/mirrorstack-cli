@@ -138,10 +138,9 @@ pub(super) struct RegisterPayload<'a> {
 #[derive(Debug, Deserialize)]
 pub(super) struct RegisterAck {
     pub session_id: String,
-    /// Carried by future RPC/SQL frames as the per-tunnel service token.
-    /// Phase 1 doesn't emit those frames yet; the field is held so the
-    /// returned handle stays a single source of truth for the ack.
-    #[allow(dead_code)]
+    /// The per-tunnel service token. The dev runner writes it to a
+    /// per-module `.ms-platform-token-<slug>` file so each spawned module
+    /// authenticates platform-initiated calls against ITS own session.
     pub service_token: String,
     /// RFC3339 — informational; the L1.5 reconnect contract makes the
     /// client retry on any failure rather than expiry-driven refresh.
@@ -197,11 +196,14 @@ type RegisterResult<T> = std::result::Result<T, RegisterError>;
 
 /// Spawned-task handle. Drop or call [`shutdown`] to close the WSS.
 ///
-/// `service_token` is intentionally NOT held here — it lives on the
-/// returned [`RegisterAck`] until a real consumer (the future RPC plane)
-/// needs it on the handle itself. Re-thread when wired.
+/// `service_token` is the per-tunnel dispatch-minted token from the
+/// register ack. The dev runner writes it to a per-module
+/// `.ms-platform-token-<slug>` file so each spawned module authenticates
+/// platform-initiated calls (lifecycle install, manifest read) against
+/// ITS own session.
 pub(super) struct TunnelHandle {
     pub session_id: String,
+    pub service_token: String,
     shutdown: Arc<Notify>,
 }
 
@@ -255,6 +257,7 @@ pub(super) async fn open(
 
     Ok(TunnelHandle {
         session_id: ack.session_id,
+        service_token: ack.service_token,
         shutdown,
     })
 }

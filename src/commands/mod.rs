@@ -5,6 +5,7 @@ use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use console::{StyledObject, style};
 
+mod app;
 mod dev;
 mod login;
 mod logout;
@@ -77,8 +78,10 @@ enum Command {
     /// Manage developer modules (the per-developer reusable units installed
     /// into apps).
     Module(module::ModuleArgs),
-    /// Run a module locally with its supporting services (Postgres in v1;
-    /// the WSS tunnel layer lands in a follow-up).
+    /// Manage applications on the platform.
+    Apps(app::AppArgs),
+    /// Run modules locally with supporting services. Scans go.work for
+    /// monorepo mode; falls back to single-module if only main.go exists.
     Dev(dev::DevArgs),
 }
 
@@ -89,6 +92,7 @@ impl Cli {
             Command::Logout(args) => logout::run(args),
             Command::Whoami(args) => whoami::run(args),
             Command::Module(args) => module::run(args),
+            Command::Apps(args) => app::run(args),
             Command::Dev(args) => dev::run(args),
         }
     }
