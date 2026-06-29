@@ -42,6 +42,7 @@ use super::{
 };
 use crate::{api, credentials, http};
 
+mod log_shipper;
 pub(crate) mod module_meta;
 mod tunnel;
 mod workspace;
@@ -254,6 +255,15 @@ fn run_inner(root: &Path, _args: &DevArgs) -> Result<()> {
         "postgres://mirrorstack:mirrorstack@postgres:5432/ms_app_modules?sslmode=disable".into()
     });
 
+    // Dev log shipping: tap each module's stdout/stderr and POST batches to
+    // dispatch's ingest, which the developer console reads. Reuses the runner's
+    // MS_DISPATCH_URL (container → dispatch) and MS_INTERNAL_SECRET (== the live
+    // tunnel session's secret, the ingest's auth). Either unset → shipping is
+    // disabled and logs just stay in the terminal.
+    let log_dispatch_url = std::env::var("MS_DISPATCH_URL").unwrap_or_default();
+    let log_secret = std::env::var("MS_INTERNAL_SECRET").unwrap_or_default();
+    let log_client = http::client(Duration::from_secs(5)).ok();
+
     eprintln!(
         "{} starting {} {}",
         ok_mark(),
@@ -299,8 +309,17 @@ fn run_inner(root: &Path, _args: &DevArgs) -> Result<()> {
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let label: &'static str = Box::leak(slug.clone().into_boxed_str());
-        spawn_forwarder(stdout, label, false);
-        spawn_forwarder(stderr, label, true);
+        let sink = match (&log_client, module_meta::read_module_id(&m.abs_dir)) {
+            (Some(client), Ok(module_id)) => log_shipper::spawn(
+                client.clone(),
+                log_dispatch_url.clone(),
+                module_id,
+                log_secret.clone(),
+            ),
+            _ => None,
+        };
+        spawn_forwarder(stdout, label, false, sink.clone());
+        spawn_forwarder(stderr, label, true, sink);
 
         eprintln!("  {} {}", style("✓").green(), slug);
         children.push((slug, child));
@@ -360,7 +379,12 @@ fn run_inner(root: &Path, _args: &DevArgs) -> Result<()> {
     Ok(())
 }
 
-fn spawn_forwarder<R: Read + Send + 'static>(reader: R, label: &'static str, is_stderr: bool) {
+fn spawn_forwarder<R: Read + Send + 'static>(
+    reader: R,
+    label: &'static str,
+    is_stderr: bool,
+    sink: Option<log_shipper::LogSink>,
+) {
     thread::spawn(move || {
         let prefix = line_prefix(label);
         let mut buf = BufReader::new(reader);
@@ -371,6 +395,11 @@ fn spawn_forwarder<R: Read + Send + 'static>(reader: R, label: &'static str, is_
                 Ok(0) => return,
                 Ok(_) => {
                     let trimmed = line.trim_end_matches(['\n', '\r']);
+                    // Ship to the developer console (best-effort), then mirror to
+                    // the terminal as before.
+                    if let Some(s) = &sink {
+                        let _ = s.send(log_shipper::parse_line(trimmed, is_stderr));
+                    }
                     if is_stderr {
                         eprintln!("{prefix} {trimmed}");
                     } else {
