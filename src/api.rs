@@ -214,6 +214,87 @@ pub fn create_module(
     })
 }
 
+#[derive(Debug, Serialize)]
+pub struct SetModuleDeployInput<'a> {
+    pub invoke_target: &'a str,
+    /// Omitted → server default `active`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // module_id / timestamps are part of the API surface
+pub struct ModuleDeploy {
+    pub version_id: String,
+    pub module_id: String,
+    pub invoke_target: String,
+    pub status: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+/// POST /v1/modules/{moduleId}/versions/{versionId}/deploy — point a module
+/// version at a Lambda invoke target (upsert: one deploy row per version).
+/// `module_id` is the raw platform UUID, not the sanitized `m<hex>` form
+/// written into main.go.
+pub fn set_module_deploy(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+    version_id: &str,
+    input: &SetModuleDeployInput,
+) -> Result<ModuleDeploy, ApiError> {
+    let endpoint = format!(
+        "{}/v1/modules/{}/versions/{}/deploy",
+        apps_base.trim_end_matches('/'),
+        module_id,
+        version_id
+    );
+
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .json(input)
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<ModuleDeploy>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+
+    // 4xx with platform error-envelope: surface code + message so callers
+    // can branch on `not_found` / `invoke_target_invalid` / `status_invalid`
+    // without re-parsing the body.
+    let status_u16 = status.as_u16();
+    let body = match http::read_capped(resp) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(ApiError::Unexpected {
+                status: status_u16,
+                body: format!("(read body failed: {e})"),
+            });
+        }
+    };
+    if let Ok(env) = serde_json::from_slice::<ErrorEnvelope>(&body) {
+        return Err(ApiError::Server {
+            status: status_u16,
+            code: env.error.code,
+            message: env.error.message,
+        });
+    }
+    Err(ApiError::Unexpected {
+        status: status_u16,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
+}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct App {
@@ -659,6 +740,169 @@ mod tests {
             ApiError::Server { code, .. } => assert_eq!(code, "slug_taken"),
             other => panic!("expected Server, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn set_module_deploy_success() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions/ver-uuid/deploy")
+            .match_header("authorization", "Bearer AT")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"invoke_target":"my-fn","status":"active"}"#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "version_id": "ver-uuid",
+                    "module_id": "mod-uuid",
+                    "invoke_target": "my-fn",
+                    "status": "active",
+                    "created_at": "2026-07-01T00:00:00Z",
+                    "updated_at": "2026-07-02T00:00:00Z"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let d = set_module_deploy(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            "ver-uuid",
+            &SetModuleDeployInput {
+                invoke_target: "my-fn",
+                status: Some("active"),
+            },
+        )
+        .expect("ok");
+        assert_eq!(d.version_id, "ver-uuid");
+        assert_eq!(d.invoke_target, "my-fn");
+        assert_eq!(d.status, "active");
+    }
+
+    #[test]
+    fn set_module_deploy_omits_status_when_none() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions/ver-uuid/deploy")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"invoke_target":"my-fn"}"#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "version_id": "ver-uuid",
+                    "module_id": "mod-uuid",
+                    "invoke_target": "my-fn",
+                    "status": "active"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let d = set_module_deploy(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            "ver-uuid",
+            &SetModuleDeployInput {
+                invoke_target: "my-fn",
+                status: None,
+            },
+        )
+        .expect("ok");
+        assert_eq!(d.status, "active");
+    }
+
+    #[test]
+    fn set_module_deploy_404_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions/ver-uuid/deploy")
+            .with_status(404)
+            .with_body(
+                r#"{"error":{"code":"not_found","message":"version not found for this module"}}"#,
+            )
+            .create();
+
+        let err = set_module_deploy(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            "ver-uuid",
+            &SetModuleDeployInput {
+                invoke_target: "my-fn",
+                status: None,
+            },
+        )
+        .unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 404);
+                assert_eq!(code, "not_found");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_module_deploy_422_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions/ver-uuid/deploy")
+            .with_status(422)
+            .with_body(
+                r#"{"error":{"code":"invoke_target_invalid","message":"invoke_target must be a Lambda function name or ARN"}}"#,
+            )
+            .create();
+
+        let err = set_module_deploy(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            "ver-uuid",
+            &SetModuleDeployInput {
+                invoke_target: "not a lambda!",
+                status: None,
+            },
+        )
+        .unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 422);
+                assert_eq!(code, "invoke_target_invalid");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_module_deploy_401_is_unauthenticated() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions/ver-uuid/deploy")
+            .with_status(401)
+            .with_body(r#"{"error":{"code":"token_expired","message":"token expired"}}"#)
+            .create();
+
+        let err = set_module_deploy(
+            &test_client(),
+            &server.url(),
+            "expired",
+            "mod-uuid",
+            "ver-uuid",
+            &SetModuleDeployInput {
+                invoke_target: "my-fn",
+                status: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
     }
 
     #[test]

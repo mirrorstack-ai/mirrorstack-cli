@@ -14,7 +14,7 @@ use console::style;
 use dialoguer::{Confirm, Input, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::api::{self, ApiError, CreateModuleInput};
+use crate::api::{self, ApiError, CreateModuleInput, SetModuleDeployInput};
 use crate::commands::dev::module_meta;
 use crate::credentials;
 use crate::http;
@@ -41,6 +41,10 @@ enum ModuleCommand {
     /// platform. Scans go.work, finds modules with empty IDs, creates
     /// them via the API, and writes the assigned ID back into main.go.
     Register(RegisterArgs),
+    /// Point a published module version at a live Lambda invoke target.
+    /// Run from the module directory (reads Config.Slug from ./main.go)
+    /// or pass --module.
+    Deploy(DeployArgs),
 }
 
 #[derive(Args)]
@@ -79,10 +83,48 @@ pub struct RegisterArgs {
     yes: bool,
 }
 
+#[derive(Args)]
+pub struct DeployArgs {
+    /// Version UUID to deploy, as returned by publish. (There is no
+    /// list-versions API yet, so version strings can't be resolved.)
+    #[arg(long)]
+    version_id: String,
+    /// Lambda function name or full ARN, with an optional :qualifier.
+    #[arg(long)]
+    target: String,
+    /// Deploy status.
+    #[arg(long, value_enum, default_value_t = DeployStatus::Active)]
+    status: DeployStatus,
+    /// Module slug. Defaults to Config.Slug parsed from ./main.go.
+    #[arg(long)]
+    module: Option<String>,
+    /// Module directory containing main.go. Defaults to cwd.
+    #[arg(long)]
+    dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum DeployStatus {
+    Active,
+    Draining,
+    Disabled,
+}
+
+impl DeployStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            DeployStatus::Active => "active",
+            DeployStatus::Draining => "draining",
+            DeployStatus::Disabled => "disabled",
+        }
+    }
+}
+
 pub fn run(args: ModuleArgs) -> Result<()> {
     match args.command {
         ModuleCommand::Init(i) => init(i),
         ModuleCommand::Register(r) => register(r),
+        ModuleCommand::Deploy(d) => deploy(d),
     }
 }
 
@@ -388,6 +430,87 @@ fn register(args: RegisterArgs) -> Result<()> {
         skipped
     );
     Ok(())
+}
+
+fn deploy(args: DeployArgs) -> Result<()> {
+    let dir = args
+        .dir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+
+    // Resolve the slug: --module wins, else parse Config.Slug from main.go
+    // the same way `dev` and `register` do.
+    let slug = match args.module {
+        Some(s) => s,
+        None => module_meta::read_module_meta(&dir)?.slug,
+    };
+    if !slug_valid(&slug) {
+        return Err(anyhow!(
+            "slug '{slug}' is invalid: must be 3-40 chars, start with a letter, end with a letter or digit, lowercase + hyphen only."
+        ));
+    }
+
+    let creds = credentials::load_or_login_hint()?;
+    let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
+    let client = http::client(Duration::from_secs(15))?;
+
+    // Resolve the platform UUID by slug. main.go's Config.ID is the
+    // sanitized `m<hex>` form, not the raw UUID the deploy endpoint takes.
+    // GET /v1/modules/{slug} is caller-scoped, so this doubles as an
+    // ownership check.
+    let module = match api::get_module(&client, &apps_base, &creds.access_token, &slug) {
+        Ok(Some(m)) => m,
+        Ok(None) => {
+            return Err(anyhow!(
+                "module '{slug}' not found on the platform (run `mirrorstack module register` first)"
+            ));
+        }
+        Err(ApiError::Unauthenticated) => return Err(session_expired()),
+        Err(e) => return Err(e.into()),
+    };
+
+    let result = with_spinner("Deploying…", || {
+        api::set_module_deploy(
+            &client,
+            &apps_base,
+            &creds.access_token,
+            &module.id,
+            &args.version_id,
+            &SetModuleDeployInput {
+                invoke_target: &args.target,
+                status: Some(args.status.as_str()),
+            },
+        )
+    });
+
+    let deploy = match result {
+        Ok(d) => d,
+        Err(ApiError::Server { code, message, .. }) => {
+            return Err(anyhow!(
+                "{code}: {message}{hint}",
+                hint = deploy_error_hint(&code)
+            ));
+        }
+        Err(ApiError::Unauthenticated) => return Err(session_expired()),
+        Err(e) => return Err(e.into()),
+    };
+
+    eprintln!("{} deployed {}", ok_mark(), style(&slug).cyan().bold());
+    eprintln!("  {} {}", style("version:").dim(), deploy.version_id);
+    eprintln!("  {}  {}", style("target:").dim(), deploy.invoke_target);
+    eprintln!("  {}  {}", style("status:").dim(), deploy.status);
+    Ok(())
+}
+
+fn deploy_error_hint(code: &str) -> &'static str {
+    match code {
+        "not_found" => " (check the version UUID belongs to this module and you own it)",
+        "invoke_target_invalid" => {
+            " (expected a Lambda function name or full ARN, optional :qualifier, [A-Za-z0-9_-]{1,140})"
+        }
+        "status_invalid" => " (must be active, draining, or disabled)",
+        _ => "",
+    }
 }
 
 /// Parse `use` directives from go.work content (same logic as workspace.rs
@@ -697,6 +820,21 @@ mod tests {
     #[test]
     fn slug_error_hint_for_taken() {
         assert!(slug_error_hint("slug_taken").contains("--used"));
+    }
+
+    #[test]
+    fn deploy_error_hint_for_known_codes() {
+        assert!(deploy_error_hint("not_found").contains("version UUID"));
+        assert!(deploy_error_hint("invoke_target_invalid").contains("ARN"));
+        assert!(deploy_error_hint("status_invalid").contains("draining"));
+        assert_eq!(deploy_error_hint("something_else"), "");
+    }
+
+    #[test]
+    fn deploy_status_as_str_matches_api() {
+        assert_eq!(DeployStatus::Active.as_str(), "active");
+        assert_eq!(DeployStatus::Draining.as_str(), "draining");
+        assert_eq!(DeployStatus::Disabled.as_str(), "disabled");
     }
 
     #[test]
