@@ -14,11 +14,15 @@ use console::style;
 use dialoguer::{Confirm, Input, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::api::{self, ApiError, CreateModuleInput, SetModuleDeployInput};
-use crate::commands::dev::module_meta;
+use crate::api::{
+    self, ApiError, CreateModuleInput, PublishManifest, PublishModuleVersionInput,
+    SetModuleDeployInput,
+};
+use crate::commands::dev::module_meta::{self, ModuleMeta};
 use crate::credentials;
 use crate::http;
 
+mod changelog;
 mod scaffold;
 
 use super::{
@@ -41,9 +45,13 @@ enum ModuleCommand {
     /// platform. Scans go.work, finds modules with empty IDs, creates
     /// them via the API, and writes the assigned ID back into main.go.
     Register(RegisterArgs),
-    /// Point a published module version at a live Lambda invoke target.
-    /// Run from the module directory (reads Config.Slug from ./main.go)
-    /// or pass --module.
+    /// Publish the version your code declares (the newest Config.Versions
+    /// key in ./main.go) together with its CHANGELOG.md section. Versions
+    /// are immutable — bump the key to publish again.
+    Publish(PublishArgs),
+    /// Point the version your code declares (the newest Config.Versions
+    /// key in ./main.go) at a live Lambda invoke target. The version must
+    /// be published first.
     Deploy(DeployArgs),
 }
 
@@ -84,17 +92,24 @@ pub struct RegisterArgs {
 }
 
 #[derive(Args)]
-pub struct DeployArgs {
-    /// Version UUID to deploy, as returned by publish. (There is no
-    /// list-versions API yet, so version strings can't be resolved.)
+pub struct PublishArgs {
+    /// Module slug. Defaults to Config.Slug parsed from ./main.go.
     #[arg(long)]
-    version_id: String,
+    module: Option<String>,
+    /// Module directory containing main.go and CHANGELOG.md. Defaults to cwd.
+    #[arg(long)]
+    dir: Option<PathBuf>,
+    /// Skip the confirmation prompt. Refuses `-dev` versions instead of
+    /// offering to promote them.
+    #[arg(long, short)]
+    yes: bool,
+}
+
+#[derive(Args)]
+pub struct DeployArgs {
     /// Lambda function name or full ARN, with an optional :qualifier.
     #[arg(long)]
     target: String,
-    /// Deploy status.
-    #[arg(long, value_enum, default_value_t = DeployStatus::Active)]
-    status: DeployStatus,
     /// Module slug. Defaults to Config.Slug parsed from ./main.go.
     #[arg(long)]
     module: Option<String>,
@@ -103,27 +118,11 @@ pub struct DeployArgs {
     dir: Option<PathBuf>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-enum DeployStatus {
-    Active,
-    Draining,
-    Disabled,
-}
-
-impl DeployStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            DeployStatus::Active => "active",
-            DeployStatus::Draining => "draining",
-            DeployStatus::Disabled => "disabled",
-        }
-    }
-}
-
 pub fn run(args: ModuleArgs) -> Result<()> {
     match args.command {
         ModuleCommand::Init(i) => init(i),
         ModuleCommand::Register(r) => register(r),
+        ModuleCommand::Publish(p) => publish(p),
         ModuleCommand::Deploy(d) => deploy(d),
     }
 }
@@ -432,36 +431,161 @@ fn register(args: RegisterArgs) -> Result<()> {
     Ok(())
 }
 
+fn publish(args: PublishArgs) -> Result<()> {
+    let dir = args
+        .dir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+    let meta = read_meta(&dir)?;
+    let slug = args.module.clone().unwrap_or_else(|| meta.slug.clone());
+    if !slug_valid(&slug) {
+        return Err(anyhow!(
+            "slug '{slug}' is invalid: must be 3-40 chars, start with a letter, end with a letter or digit, lowercase + hyphen only."
+        ));
+    }
+
+    let raw = code_version(&meta, &dir)?;
+    // `-dev` marks local iteration (scaffold convention). Interactively we
+    // offer to promote (rename the Versions key, dropping the tag); with
+    // --yes the caller must rename it in code first.
+    let (target_raw, promote_from) = match raw.strip_suffix("-dev") {
+        Some(promoted) => {
+            if args.yes {
+                return Err(anyhow!(
+                    "Config version '{raw}' is a -dev prerelease. Rename the Versions key in main.go (e.g. \"{promoted}\") before publishing with --yes."
+                ));
+            }
+            (promoted.to_string(), Some(raw.clone()))
+        }
+        None => (raw.clone(), None),
+    };
+    let version = canonical_version(&target_raw)?;
+
+    // Lint runs against the (possibly promoted) version BEFORE anything is
+    // written or POSTed, so a missing changelog entry aborts cleanly.
+    let entry = changelog::lint(&dir, &version)?;
+    for w in &entry.warnings {
+        eprintln!("{} {w}", warn_prefix());
+    }
+
+    let creds = credentials::load_or_login_hint()?;
+    let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
+    let client = http::client(Duration::from_secs(15))?;
+    let module = get_owned_module(&client, &apps_base, &creds.access_token, &slug)?;
+
+    let theme = ColorfulTheme::default();
+    let prompt = match &promote_from {
+        Some(from) => {
+            format!("Promote {from} → {target_raw} in main.go and publish {slug}@{version}?")
+        }
+        None => format!("Publish {slug}@{version}?"),
+    };
+    if promote_from.is_some() || !args.yes {
+        eprintln!();
+        eprintln!("  {} {}", style("Module:").dim(), style(&slug).bold());
+        eprintln!(
+            "  {} {}",
+            style("Version:").dim(),
+            style(&version).cyan().bold()
+        );
+        let confirmed = Confirm::with_theme(&theme)
+            .with_prompt(prompt)
+            .default(true)
+            .interact()?;
+        if !confirmed {
+            eprintln!("{}", style("aborted.").yellow());
+            return Ok(());
+        }
+    }
+
+    // The publish endpoint requires a manifest with id + slug; migration
+    // counters and the dependency graph take server defaults (a full
+    // manifest freeze off the dev tunnel is a later enrichment).
+    let manifest_id = if meta.id.is_empty() {
+        sanitize_module_id(&module.id)
+    } else {
+        meta.id.clone()
+    };
+
+    let result = with_spinner("Publishing…", || {
+        api::publish_module_version(
+            &client,
+            &apps_base,
+            &creds.access_token,
+            &module.id,
+            &PublishModuleVersionInput {
+                version: &version,
+                changelog: Some(&entry.body),
+                manifest: PublishManifest {
+                    id: &manifest_id,
+                    slug: &slug,
+                },
+            },
+        )
+    });
+
+    let published = match result {
+        Ok(v) => v,
+        Err(ApiError::Server { code, message, .. }) => {
+            return Err(anyhow!(
+                "{code}: {message}{hint}",
+                hint = publish_error_hint(&code)
+            ));
+        }
+        Err(ApiError::Unauthenticated) => return Err(session_expired()),
+        Err(e) => return Err(e.into()),
+    };
+
+    // Write the promoted key back only after the server accepted the
+    // version — a failed publish must not leave main.go half-promoted.
+    if let Some(from) = &promote_from {
+        match module_meta::promote_version(&dir, from, &target_raw) {
+            Ok(()) => eprintln!(
+                "{} promoted {} → {} in main.go",
+                ok_mark(),
+                style(from).dim(),
+                style(&target_raw).bold()
+            ),
+            Err(e) => eprintln!(
+                "{} published, but couldn't update main.go: {e}. Rename the Versions key \"{from}\" → \"{target_raw}\" manually.",
+                warn_prefix()
+            ),
+        }
+    }
+
+    eprintln!(
+        "{} published {}",
+        ok_mark(),
+        style(format!("{slug}@{version}")).cyan().bold()
+    );
+    eprintln!("  {} {}", style("id:").dim(), published.id);
+    for line in changelog_preview(&entry.body, 3) {
+        eprintln!("  {} {line}", style("│").dim());
+    }
+    eprintln!(
+        "  {} mirrorstack module deploy --target <lambda-fn>",
+        style("next:").dim()
+    );
+    Ok(())
+}
+
 fn deploy(args: DeployArgs) -> Result<()> {
     let dir = args
         .dir
         .clone()
         .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
 
-    // Resolve the slug: --module wins, else parse Config.Slug from main.go
-    // the same way `dev` and `register` do.
-    let slug = match args.module {
-        Some(s) => s,
-        None => module_meta::read_module_meta(&dir)
-            .map_err(|e| {
-                anyhow!("couldn't resolve the module from {}: {e}. Run from the module directory, or pass --module <slug> / --dir <path>.", dir.display())
-            })?
-            .slug,
-    };
-    // The version id is a raw path segment; reject non-UUIDs before they
-    // reach the URL (a stray value would POST to a different route and
-    // surface an opaque 405).
-    if !args.version_id.len().eq(&36)
-        || !args
-            .version_id
-            .bytes()
-            .all(|b| b == b'-' || b.is_ascii_hexdigit())
-    {
+    // The version always comes from code, so main.go is read even when
+    // --module overrides the slug.
+    let meta = read_meta(&dir)?;
+    let slug = args.module.clone().unwrap_or_else(|| meta.slug.clone());
+    let raw = code_version(&meta, &dir)?;
+    if raw.ends_with("-dev") {
         return Err(anyhow!(
-            "--version-id must be the version UUID (36 chars), got '{}'",
-            args.version_id
+            "Config version '{raw}' is a -dev prerelease and can't be deployed. Run `mirrorstack module publish` to promote and publish it first."
         ));
     }
+    let version = canonical_version(&raw)?;
     if !slug_valid(&slug) {
         return Err(anyhow!(
             "slug '{slug}' is invalid: must be 3-40 chars, start with a letter, end with a letter or digit, lowercase + hyphen only."
@@ -471,21 +595,7 @@ fn deploy(args: DeployArgs) -> Result<()> {
     let creds = credentials::load_or_login_hint()?;
     let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
     let client = http::client(Duration::from_secs(15))?;
-
-    // Resolve the platform UUID by slug. main.go's Config.ID is the
-    // sanitized `m<hex>` form, not the raw UUID the deploy endpoint takes.
-    // GET /v1/modules/{slug} is caller-scoped, so this doubles as an
-    // ownership check.
-    let module = match api::get_module(&client, &apps_base, &creds.access_token, &slug) {
-        Ok(Some(m)) => m,
-        Ok(None) => {
-            return Err(anyhow!(
-                "module '{slug}' not found on the platform (run `mirrorstack module register` first)"
-            ));
-        }
-        Err(ApiError::Unauthenticated) => return Err(session_expired()),
-        Err(e) => return Err(e.into()),
-    };
+    let module = get_owned_module(&client, &apps_base, &creds.access_token, &slug)?;
 
     let result = with_spinner("Deploying…", || {
         api::set_module_deploy(
@@ -493,10 +603,10 @@ fn deploy(args: DeployArgs) -> Result<()> {
             &apps_base,
             &creds.access_token,
             &module.id,
-            &args.version_id,
+            &version,
             &SetModuleDeployInput {
                 invoke_target: &args.target,
-                status: Some(args.status.as_str()),
+                status: None,
             },
         )
     });
@@ -513,20 +623,98 @@ fn deploy(args: DeployArgs) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
 
-    eprintln!("{} deployed {}", ok_mark(), style(&slug).cyan().bold());
-    eprintln!("  {} {}", style("version:").dim(), deploy.version_id);
-    eprintln!("  {}  {}", style("target:").dim(), deploy.invoke_target);
-    eprintln!("  {}  {}", style("status:").dim(), deploy.status);
+    eprintln!(
+        "{} deployed {}",
+        ok_mark(),
+        style(format!("{slug}@{version}")).cyan().bold()
+    );
+    eprintln!("  {} {}", style("target:").dim(), deploy.invoke_target);
+    eprintln!("  {} {}", style("status:").dim(), deploy.status);
     Ok(())
+}
+
+/// Read main.go metadata with a deploy/publish-flavoured error.
+fn read_meta(dir: &Path) -> Result<ModuleMeta> {
+    module_meta::read_module_meta(dir).map_err(|e| {
+        anyhow!(
+            "couldn't read the module from {}: {e}. Run from the module directory, or pass --module <slug> / --dir <path>.",
+            dir.display()
+        )
+    })
+}
+
+/// The version the code declares — the newest Config.Versions key.
+fn code_version(meta: &ModuleMeta, dir: &Path) -> Result<String> {
+    meta.version.clone().ok_or_else(|| {
+        anyhow!(
+            "no Config.Versions entry found in {}/main.go — declare your release, e.g. Versions: map[string]system.MigrationVersions{{\"v0.1.0\": {{App: \"0001\"}}}}.",
+            dir.display()
+        )
+    })
+}
+
+/// Strip the SDK's `v` key prefix and validate canonical SemVer — the form
+/// the platform stores and both publish and deploy send on the wire.
+fn canonical_version(raw: &str) -> Result<String> {
+    let canonical = raw.strip_prefix('v').unwrap_or(raw);
+    if module_meta::parse_semver(canonical).is_none() {
+        return Err(anyhow!(
+            "version '{raw}' in main.go is not SemVer (expected e.g. v1.2.0 or v1.2.0-beta.1)"
+        ));
+    }
+    Ok(canonical.to_string())
+}
+
+/// Resolve the platform UUID by slug. main.go's Config.ID is the sanitized
+/// `m<hex>` form, not the raw UUID the version endpoints take.
+/// GET /v1/modules/{slug} is caller-scoped, so this doubles as an
+/// ownership check.
+fn get_owned_module(
+    client: &reqwest::blocking::Client,
+    apps_base: &str,
+    access_token: &str,
+    slug: &str,
+) -> Result<api::Module> {
+    match api::get_module(client, apps_base, access_token, slug) {
+        Ok(Some(m)) => Ok(m),
+        Ok(None) => Err(anyhow!(
+            "module '{slug}' not found on the platform (run `mirrorstack module register` first)"
+        )),
+        Err(ApiError::Unauthenticated) => Err(session_expired()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// First `max_lines` non-empty changelog lines for the publish summary,
+/// with a trailing ellipsis when the section continues.
+fn changelog_preview(body: &str, max_lines: usize) -> Vec<String> {
+    let mut nonempty = body.lines().filter(|l| !l.trim().is_empty());
+    let mut out: Vec<String> = nonempty
+        .by_ref()
+        .take(max_lines)
+        .map(|l| l.trim().to_string())
+        .collect();
+    if nonempty.next().is_some() {
+        out.push("…".to_string());
+    }
+    out
+}
+
+fn publish_error_hint(code: &str) -> &'static str {
+    match code {
+        "version_exists" => " (bump Config.Version in main.go — versions are immutable)",
+        "version_invalid" => " (versions must be canonical SemVer, e.g. 1.2.0 or 1.2.0-beta.1)",
+        "changelog_too_large" => " (trim this version's CHANGELOG.md section to 16KB)",
+        _ => "",
+    }
 }
 
 fn deploy_error_hint(code: &str) -> &'static str {
     match code {
-        "not_found" => " (check the version UUID belongs to this module and you own it)",
+        "not_found" => " (version not published yet? run `mirrorstack module publish` first)",
         "invoke_target_invalid" => {
             " (expected a Lambda function name or full ARN, optional :qualifier, [A-Za-z0-9_-]{1,140})"
         }
-        "status_invalid" => " (must be active, draining, or disabled)",
         _ => "",
     }
 }
@@ -842,17 +1030,37 @@ mod tests {
 
     #[test]
     fn deploy_error_hint_for_known_codes() {
-        assert!(deploy_error_hint("not_found").contains("version UUID"));
+        assert!(deploy_error_hint("not_found").contains("mirrorstack module publish"));
         assert!(deploy_error_hint("invoke_target_invalid").contains("ARN"));
-        assert!(deploy_error_hint("status_invalid").contains("draining"));
         assert_eq!(deploy_error_hint("something_else"), "");
     }
 
     #[test]
-    fn deploy_status_as_str_matches_api() {
-        assert_eq!(DeployStatus::Active.as_str(), "active");
-        assert_eq!(DeployStatus::Draining.as_str(), "draining");
-        assert_eq!(DeployStatus::Disabled.as_str(), "disabled");
+    fn publish_error_hint_for_known_codes() {
+        assert!(publish_error_hint("version_exists").contains("main.go"));
+        assert!(publish_error_hint("version_invalid").contains("SemVer"));
+        assert!(publish_error_hint("changelog_too_large").contains("CHANGELOG.md"));
+        assert_eq!(publish_error_hint("something_else"), "");
+    }
+
+    #[test]
+    fn canonical_version_strips_v_prefix() {
+        assert_eq!(canonical_version("v0.1.0").unwrap(), "0.1.0");
+        assert_eq!(canonical_version("1.2.3-beta.1").unwrap(), "1.2.3-beta.1");
+    }
+
+    #[test]
+    fn canonical_version_rejects_non_semver() {
+        for s in ["v1.0", "one.two.three", "v1.2.3.4", ""] {
+            assert!(canonical_version(s).is_err(), "expected {s:?} rejected");
+        }
+    }
+
+    #[test]
+    fn changelog_preview_truncates_with_ellipsis() {
+        let body = "- a\n\n- b\n- c\n- d\n";
+        assert_eq!(changelog_preview(body, 3), vec!["- a", "- b", "- c", "…"]);
+        assert_eq!(changelog_preview("- only\n", 3), vec!["- only"]);
     }
 
     #[test]

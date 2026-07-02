@@ -38,7 +38,7 @@ func main() {
 		SQL:  sqlFS,
 		Versions: map[string]system.MigrationVersions{
 			// `-dev` prerelease tag distinguishes "iterating locally" from
-			// "real release". `mirrorstack publish` prompts to promote it
+			// "real release". `mirrorstack module publish` prompts to promote
 			// before shipping; CI / prod refuses `-dev` versions.
 			"v0.1.0-dev": {App: "0001"},
 		},
