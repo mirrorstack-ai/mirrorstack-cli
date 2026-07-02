@@ -22,6 +22,7 @@ use crate::credentials;
 use crate::http;
 
 mod changelog;
+mod readme;
 mod scaffold;
 
 use super::{
@@ -96,7 +97,8 @@ pub struct DeployArgs {
     /// Module slug. Defaults to Config.Slug parsed from ./main.go.
     #[arg(long)]
     module: Option<String>,
-    /// Module directory containing main.go and CHANGELOG.md. Defaults to cwd.
+    /// Module directory containing main.go, CHANGELOG.md, and optional
+    /// README.md. Defaults to cwd.
     #[arg(long)]
     dir: Option<PathBuf>,
     /// Non-interactive mode. Refuses `-dev` versions instead of offering
@@ -595,6 +597,13 @@ fn ensure_version_recorded(
         }
     };
 
+    // README.md is the module's long-form description — optional and
+    // free-form (no lint). It's frozen on the version row alongside the
+    // changelog, so it's read here on the fresh-record path only; an empty
+    // body (no README.md) is omitted from the request.
+    let readme = readme::read(dir)?;
+    let readme_field = (!readme.body.is_empty()).then_some(readme.body.as_str());
+
     let result = with_spinner("Recording version…", || {
         api::record_module_version(
             client,
@@ -604,6 +613,7 @@ fn ensure_version_recorded(
             &RecordModuleVersionInput {
                 version,
                 changelog: Some(&entry.body),
+                readme: readme_field,
                 manifest: &manifest,
             },
         )
@@ -611,11 +621,18 @@ fn ensure_version_recorded(
 
     match result {
         Ok(recorded) => {
-            // Warnings describe the changelog that was just frozen; on the
-            // already-recorded path they'd be noise about a file the
-            // platform no longer reads.
+            // Warnings describe the changelog/readme just frozen; on the
+            // already-recorded path they'd be noise about files the platform
+            // no longer reads.
             for w in &entry.warnings {
                 eprintln!("{} {w}", warn_prefix());
+            }
+            if readme.truncated {
+                eprintln!(
+                    "{} README.md exceeded {} bytes and was truncated for the version record",
+                    warn_prefix(),
+                    readme::MAX_README_BYTES
+                );
             }
             eprintln!(
                 "{} recorded {}",
@@ -743,6 +760,7 @@ fn record_error_hint(code: &str) -> &'static str {
     match code {
         "version_invalid" => " (versions must be canonical SemVer, e.g. 1.2.0 or 1.2.0-beta.1)",
         "changelog_too_large" => " (trim this version's CHANGELOG.md section to 16KB)",
+        "readme_too_large" => " (trim README.md to 64KB)",
         _ => "",
     }
 }
@@ -1077,6 +1095,7 @@ mod tests {
     fn record_error_hint_for_known_codes() {
         assert!(record_error_hint("version_invalid").contains("SemVer"));
         assert!(record_error_hint("changelog_too_large").contains("CHANGELOG.md"));
+        assert!(record_error_hint("readme_too_large").contains("README.md"));
         // `version_exists` is intercepted by deploy (already-recorded path),
         // so the hint table deliberately has no entry for it.
         assert_eq!(record_error_hint("version_exists"), "");
