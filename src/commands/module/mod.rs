@@ -442,8 +442,26 @@ fn deploy(args: DeployArgs) -> Result<()> {
     // the same way `dev` and `register` do.
     let slug = match args.module {
         Some(s) => s,
-        None => module_meta::read_module_meta(&dir)?.slug,
+        None => module_meta::read_module_meta(&dir)
+            .map_err(|e| {
+                anyhow!("couldn't resolve the module from {}: {e}. Run from the module directory, or pass --module <slug> / --dir <path>.", dir.display())
+            })?
+            .slug,
     };
+    // The version id is a raw path segment; reject non-UUIDs before they
+    // reach the URL (a stray value would POST to a different route and
+    // surface an opaque 405).
+    if !args.version_id.len().eq(&36)
+        || !args
+            .version_id
+            .bytes()
+            .all(|b| b == b'-' || b.is_ascii_hexdigit())
+    {
+        return Err(anyhow!(
+            "--version-id must be the version UUID (36 chars), got '{}'",
+            args.version_id
+        ));
+    }
     if !slug_valid(&slug) {
         return Err(anyhow!(
             "slug '{slug}' is invalid: must be 3-40 chars, start with a letter, end with a letter or digit, lowercase + hyphen only."
