@@ -2,7 +2,7 @@
 //!
 //! Parses `Config.ID`, `Config.Slug`, `Config.Name`, and the newest
 //! `Config.Versions` key out of `main.go`. These fields drive tunnel
-//! registration, platform registration, publish, and deploy.
+//! registration, platform registration, and deploy.
 
 use std::fs;
 use std::path::Path;
@@ -131,7 +131,7 @@ fn extract_versions_keys(go_source: &str) -> Vec<String> {
 /// Pick the highest SemVer among the Versions map keys, returned verbatim
 /// (keys keep the SDK's `v` prefix). Keys that don't parse as SemVer are
 /// ignored — multi-entry maps keep historical tags around, and the newest
-/// release is the one publish/deploy act on.
+/// release is the one deploy acts on.
 pub(crate) fn latest_version(keys: &[String]) -> Option<String> {
     keys.iter()
         .filter_map(|k| parse_semver(k.strip_prefix('v').unwrap_or(k)).map(|v| (v, k)))
@@ -180,8 +180,8 @@ impl PartialOrd for SemVer {
 
 /// Parse canonical SemVer (no `v` prefix). Mirrors the platform's
 /// `module_versions_semver_check` constraint — numeric parts and numeric
-/// prerelease ids reject leading zeros — so anything the publish endpoint
-/// would 422 parses as None here.
+/// prerelease ids reject leading zeros — so anything the record-version
+/// endpoint would 422 parses as None here.
 pub(crate) fn parse_semver(s: &str) -> Option<SemVer> {
     let s = s.split_once('+').map_or(s, |(rest, _)| rest);
     let (core, pre) = match s.split_once('-') {
@@ -224,7 +224,7 @@ fn pre_id(s: &str) -> Option<PreId> {
     Some(PreId::Alpha(s.to_string()))
 }
 
-/// Rename a `Versions` map key in `main.go` — the publish promote flow
+/// Rename a `Versions` map key in `main.go` — the deploy promote flow
 /// ("v0.1.0-dev" → "v0.1.0"). Only the first occurrence after the
 /// `Versions:` label is touched, so identical strings elsewhere in the
 /// file are safe.
@@ -327,7 +327,7 @@ func main() {
         Name: "Media",
         Icon: "extension",
         Versions: map[string]system.MigrationVersions{
-            // `-dev` marks local iteration; `mirrorstack module publish`
+            // `-dev` marks local iteration; `mirrorstack module deploy`
             // promotes it before shipping.
             "v0.1.0-dev": {App: "0001"},
         },

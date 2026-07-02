@@ -1,7 +1,7 @@
-//! CHANGELOG.md lint for `module publish`.
+//! CHANGELOG.md lint for `module deploy`'s record step.
 //!
-//! CHANGELOG.md at the module root is the version log: publish extracts
-//! the `## <version>` section and stores it on the version row. Hard
+//! CHANGELOG.md at the module root is the version log: deploy extracts
+//! the `## <version>` section and records it on the version row. Hard
 //! errors: file missing, no (or multiple) headings for the version, empty
 //! body, section over the platform cap. Ordering/duplicate anomalies are
 //! returned as warnings for the caller to print.
@@ -19,7 +19,7 @@ const MAX_SECTION_BYTES: usize = 16_384;
 
 #[derive(Debug)]
 pub(super) struct ChangelogEntry {
-    /// Trimmed section body for the published version.
+    /// Trimmed section body for the recorded version.
     pub body: String,
     /// Non-fatal anomalies, one message per line.
     pub warnings: Vec<String>,
@@ -83,7 +83,7 @@ fn lint_body(changelog: &str, version: &str) -> Result<ChangelogEntry> {
     let body = lines[start + 1..end].join("\n").trim().to_string();
     if body.is_empty() {
         return Err(anyhow!(
-            "the `## {version}` section in CHANGELOG.md is empty — describe the release before publishing"
+            "the `## {version}` section in CHANGELOG.md is empty — describe the release before deploying"
         ));
     }
     if body.len() > MAX_SECTION_BYTES {

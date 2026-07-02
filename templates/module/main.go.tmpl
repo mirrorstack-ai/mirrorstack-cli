@@ -31,15 +31,15 @@ func main() {
 		ID:   "__MS_MODULE_ID__",
 		// Slug is the catalog handle (e.g. "oauth"). Mutable via catalog UI;
 		// the storage prefix at install time is <username>_<slug>_. Renames
-		// force a new published version with auto-generated rename migrations.
+		// force a new recorded version with auto-generated rename migrations.
 		Slug: "__MS_SLUG__",
 		Name: "__MS_NAME__",
 		Icon: "extension",
 		SQL:  sqlFS,
 		Versions: map[string]system.MigrationVersions{
 			// `-dev` prerelease tag distinguishes "iterating locally" from
-			// "real release". `mirrorstack module publish` prompts to promote
-			// before shipping; CI / prod refuses `-dev` versions.
+			// "real release". `mirrorstack module deploy` prompts to promote
+			// before shipping; CI (--yes) refuses `-dev` versions.
 			"v0.1.0-dev": {App: "0001"},
 		},
 	}); err != nil {

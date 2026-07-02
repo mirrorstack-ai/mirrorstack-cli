@@ -215,21 +215,21 @@ pub fn create_module(
 }
 
 #[derive(Debug, Serialize)]
-pub struct PublishModuleVersionInput<'a> {
+pub struct RecordModuleVersionInput<'a> {
     /// Canonical SemVer, no `v` prefix (the platform 422s anything else).
     pub version: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changelog: Option<&'a str>,
-    pub manifest: PublishManifest<'a>,
+    pub manifest: RecordManifest<'a>,
 }
 
-/// Minimal frozen manifest for publish. The endpoint requires a JSON object
-/// with `id` and `slug` (slug must match the module); everything else —
-/// migration counters, dependency graph, MCP catalog — takes the endpoint's
-/// documented defaults. A full manifest freeze (read off the dev tunnel)
-/// can replace this without changing the endpoint.
+/// Minimal frozen manifest for the version record. The endpoint requires a
+/// JSON object with `id` and `slug` (slug must match the module); everything
+/// else — migration counters, dependency graph, MCP catalog — takes the
+/// endpoint's documented defaults. A full manifest freeze (read off the dev
+/// tunnel) can replace this without changing the endpoint.
 #[derive(Debug, Serialize)]
-pub struct PublishManifest<'a> {
+pub struct RecordManifest<'a> {
     /// SDK `m<hex>` form from main.go — stored verbatim, never compared.
     pub id: &'a str,
     pub slug: &'a str,
@@ -248,16 +248,17 @@ pub struct ModuleVersion {
     pub published_at: Option<String>,
 }
 
-/// POST /v1/modules/{moduleId}/versions — publish an immutable module
-/// version with its changelog. Republishing an existing version is a 409
-/// `version_exists`; the changelog is capped server-side at 16KB
-/// (`changelog_too_large`).
-pub fn publish_module_version(
+/// POST /v1/modules/{moduleId}/versions — record an immutable module
+/// version (snapshot + changelog). Recording carries no visibility
+/// semantics; "publish" is reserved for the future marketplace listing
+/// act. Re-recording an existing version is a 409 `version_exists`; the
+/// changelog is capped server-side at 16KB (`changelog_too_large`).
+pub fn record_module_version(
     http: &Client,
     apps_base: &str,
     access_token: &str,
     module_id: &str,
-    input: &PublishModuleVersionInput,
+    input: &RecordModuleVersionInput,
 ) -> Result<ModuleVersion, ApiError> {
     let endpoint = format!(
         "{}/v1/modules/{}/versions",
@@ -304,6 +305,44 @@ pub fn publish_module_version(
         status: status_u16,
         body: String::from_utf8_lossy(&body).into_owned(),
     })
+}
+
+/// Envelope for GET /v1/modules/{moduleId}/versions.
+#[derive(Debug, Deserialize)]
+struct ModuleVersionList {
+    versions: Vec<ModuleVersion>,
+}
+
+/// GET /v1/modules/{moduleId}/versions — the module's recorded versions,
+/// newest first (changelogs included, manifests omitted). Owner-scoped;
+/// someone else's module is a 404, surfaced as `Unexpected` since deploy
+/// resolves ownership via `get_module` before calling this.
+pub fn list_module_versions(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+) -> Result<Vec<ModuleVersion>, ApiError> {
+    let endpoint = format!(
+        "{}/v1/modules/{}/versions",
+        apps_base.trim_end_matches('/'),
+        module_id
+    );
+
+    let resp = http
+        .get(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<ModuleVersionList>()?.versions);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(unexpected_body_error(resp))
 }
 
 #[derive(Debug, Serialize)]
@@ -1032,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_module_version_success() {
+    fn record_module_version_success() {
         let mut server = Server::new();
         let _m = server
             .mock("POST", "/v1/modules/mod-uuid/versions")
@@ -1053,15 +1092,15 @@ mod tests {
             )
             .create();
 
-        let v = publish_module_version(
+        let v = record_module_version(
             &test_client(),
             &server.url(),
             "AT",
             "mod-uuid",
-            &PublishModuleVersionInput {
+            &RecordModuleVersionInput {
                 version: "0.1.0",
                 changelog: Some("- initial release"),
-                manifest: PublishManifest {
+                manifest: RecordManifest {
                     id: "mabc123",
                     slug: "media",
                 },
@@ -1074,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_module_version_omits_changelog_when_none() {
+    fn record_module_version_omits_changelog_when_none() {
         let mut server = Server::new();
         let _m = server
             .mock("POST", "/v1/modules/mod-uuid/versions")
@@ -1092,15 +1131,15 @@ mod tests {
             )
             .create();
 
-        let v = publish_module_version(
+        let v = record_module_version(
             &test_client(),
             &server.url(),
             "AT",
             "mod-uuid",
-            &PublishModuleVersionInput {
+            &RecordModuleVersionInput {
                 version: "0.1.0",
                 changelog: None,
-                manifest: PublishManifest {
+                manifest: RecordManifest {
                     id: "mabc123",
                     slug: "media",
                 },
@@ -1111,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_module_version_409_surfaces_code() {
+    fn record_module_version_409_surfaces_code() {
         let mut server = Server::new();
         let _m = server
             .mock("POST", "/v1/modules/mod-uuid/versions")
@@ -1121,15 +1160,15 @@ mod tests {
             )
             .create();
 
-        let err = publish_module_version(
+        let err = record_module_version(
             &test_client(),
             &server.url(),
             "AT",
             "mod-uuid",
-            &PublishModuleVersionInput {
+            &RecordModuleVersionInput {
                 version: "0.1.0",
                 changelog: None,
-                manifest: PublishManifest {
+                manifest: RecordManifest {
                     id: "mabc123",
                     slug: "media",
                 },
@@ -1146,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_module_version_422_surfaces_code() {
+    fn record_module_version_422_surfaces_code() {
         let mut server = Server::new();
         let _m = server
             .mock("POST", "/v1/modules/mod-uuid/versions")
@@ -1156,15 +1195,15 @@ mod tests {
             )
             .create();
 
-        let err = publish_module_version(
+        let err = record_module_version(
             &test_client(),
             &server.url(),
             "AT",
             "mod-uuid",
-            &PublishModuleVersionInput {
+            &RecordModuleVersionInput {
                 version: "0.1.0",
                 changelog: Some("huge"),
-                manifest: PublishManifest {
+                manifest: RecordManifest {
                     id: "mabc123",
                     slug: "media",
                 },
@@ -1181,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    fn publish_module_version_401_is_unauthenticated() {
+    fn record_module_version_401_is_unauthenticated() {
         let mut server = Server::new();
         let _m = server
             .mock("POST", "/v1/modules/mod-uuid/versions")
@@ -1189,21 +1228,71 @@ mod tests {
             .with_body(r#"{"error":{"code":"token_expired","message":"token expired"}}"#)
             .create();
 
-        let err = publish_module_version(
+        let err = record_module_version(
             &test_client(),
             &server.url(),
             "expired",
             "mod-uuid",
-            &PublishModuleVersionInput {
+            &RecordModuleVersionInput {
                 version: "0.1.0",
                 changelog: None,
-                manifest: PublishManifest {
+                manifest: RecordManifest {
                     id: "mabc123",
                     slug: "media",
                 },
             },
         )
         .unwrap_err();
+        assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
+    }
+
+    #[test]
+    fn list_module_versions_success() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/modules/mod-uuid/versions")
+            .match_header("authorization", "Bearer AT")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "versions": [
+                        {"id": "ver-2", "module_id": "mod-uuid", "version": "0.2.0"},
+                        {"id": "ver-1", "module_id": "mod-uuid", "version": "0.1.0"}
+                    ]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let vs = list_module_versions(&test_client(), &server.url(), "AT", "mod-uuid").expect("ok");
+        assert_eq!(vs.len(), 2);
+        assert_eq!(vs[0].version, "0.2.0");
+        assert_eq!(vs[1].id, "ver-1");
+    }
+
+    #[test]
+    fn list_module_versions_empty() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/modules/mod-uuid/versions")
+            .with_status(200)
+            .with_body(json!({"versions": []}).to_string())
+            .create();
+
+        let vs = list_module_versions(&test_client(), &server.url(), "AT", "mod-uuid").expect("ok");
+        assert!(vs.is_empty());
+    }
+
+    #[test]
+    fn list_module_versions_401_is_unauthenticated() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/modules/mod-uuid/versions")
+            .with_status(401)
+            .create();
+
+        let err =
+            list_module_versions(&test_client(), &server.url(), "expired", "mod-uuid").unwrap_err();
         assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
     }
 
