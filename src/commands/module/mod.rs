@@ -15,8 +15,7 @@ use dialoguer::{Confirm, Input, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::api::{
-    self, ApiError, CreateModuleInput, RecordManifest, RecordModuleVersionInput,
-    SetModuleDeployInput,
+    self, ApiError, CreateModuleInput, RecordModuleVersionInput, SetModuleDeployInput,
 };
 use crate::commands::dev::module_meta::{self, ModuleMeta};
 use crate::credentials;
@@ -26,8 +25,9 @@ mod changelog;
 mod scaffold;
 
 use super::{
-    DEFAULT_API_BASE, DEFAULT_APPS_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_APPS_API_URL,
-    ENV_WEB_URL, ok_mark, resolve_base, session_expired, warn_prefix,
+    DEFAULT_API_BASE, DEFAULT_APPS_API_BASE, DEFAULT_DISPATCH_BASE, DEFAULT_WEB_BASE, ENV_API_URL,
+    ENV_APPS_API_URL, ENV_DISPATCH_URL, ENV_WEB_URL, ok_mark, resolve_base, session_expired,
+    warn_prefix,
 };
 
 #[derive(Args)]
@@ -452,6 +452,7 @@ fn deploy(args: DeployArgs) -> Result<()> {
 
     let creds = credentials::load_or_login_hint()?;
     let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
+    let dispatch_base = resolve_base(ENV_DISPATCH_URL, DEFAULT_DISPATCH_BASE);
     let client = http::client(Duration::from_secs(15))?;
     let module = get_owned_module(&client, &apps_base, &creds.access_token, &slug)?;
 
@@ -478,9 +479,9 @@ fn deploy(args: DeployArgs) -> Result<()> {
     ensure_version_recorded(
         &client,
         &apps_base,
+        &dispatch_base,
         &creds.access_token,
         &module,
-        &meta,
         &slug,
         &version,
         &dir,
@@ -548,16 +549,17 @@ fn deploy(args: DeployArgs) -> Result<()> {
 /// The record attempt is 409-tolerant so no pre-flight existence check is
 /// needed and concurrent deploys can't race: `version_exists` means someone
 /// (usually an earlier run) already recorded it, and the deploy proceeds.
-/// A changelog lint failure is only fatal when the version isn't recorded
-/// yet — an existing record's changelog is immutable, so the local file no
-/// longer matters (checked via the versions list in that branch).
+/// Local inputs to the record — the changelog and the manifest read off the
+/// dev tunnel — are only fatal when the version isn't recorded yet: an
+/// existing record froze both, so on failure each branch checks the versions
+/// list and proceeds when the record already exists.
 #[allow(clippy::too_many_arguments)]
 fn ensure_version_recorded(
     client: &reqwest::blocking::Client,
     apps_base: &str,
+    dispatch_base: &str,
     access_token: &str,
     module: &api::Module,
-    meta: &ModuleMeta,
     slug: &str,
     version: &str,
     dir: &Path,
@@ -565,15 +567,7 @@ fn ensure_version_recorded(
     let entry = match changelog::lint(dir, version) {
         Ok(entry) => entry,
         Err(lint_err) => {
-            let listed = with_spinner("Checking recorded versions…", || {
-                api::list_module_versions(client, apps_base, access_token, &module.id)
-            });
-            let versions = match listed {
-                Ok(v) => v,
-                Err(ApiError::Unauthenticated) => return Err(session_expired()),
-                Err(e) => return Err(e.into()),
-            };
-            if versions.iter().any(|v| v.version == version) {
+            if version_is_recorded(client, apps_base, access_token, &module.id, version)? {
                 print_already_recorded(slug, version);
                 return Ok(());
             }
@@ -581,13 +575,24 @@ fn ensure_version_recorded(
         }
     };
 
-    // The record endpoint requires a manifest with id + slug; migration
-    // counters and the dependency graph take server defaults (a full
-    // manifest freeze off the dev tunnel is a later enrichment).
-    let manifest_id = if meta.id.is_empty() {
-        sanitize_module_id(&module.id)
-    } else {
-        meta.id.clone()
+    // The record freezes the manifest the platform mounts this version with
+    // (pages, routes, permissions), so it must be the module's real declared
+    // surface — read off the live dev tunnel, not reconstructed locally.
+    let fetched = with_spinner("Reading module manifest…", || {
+        api::get_tunnel_manifest(client, dispatch_base, access_token, &module.id)
+    });
+    let manifest = match fetched {
+        Ok(m) => m,
+        Err(ApiError::Unauthenticated) => return Err(session_expired()),
+        Err(fetch_err) => {
+            if version_is_recorded(client, apps_base, access_token, &module.id, version)? {
+                print_already_recorded(slug, version);
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "recording a new version needs the module running under `mirrorstack dev` (its manifest is captured at record time) — start it or record later ({fetch_err})"
+            ));
+        }
     };
 
     let result = with_spinner("Recording version…", || {
@@ -599,10 +604,7 @@ fn ensure_version_recorded(
             &RecordModuleVersionInput {
                 version,
                 changelog: Some(&entry.body),
-                manifest: RecordManifest {
-                    id: &manifest_id,
-                    slug,
-                },
+                manifest: &manifest,
             },
         )
     });
@@ -634,6 +636,27 @@ fn ensure_version_recorded(
             "{code}: {message}{hint}",
             hint = record_error_hint(&code)
         )),
+        Err(ApiError::Unauthenticated) => Err(session_expired()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Whether `version` already exists as a recorded row. Used to downgrade
+/// failures of the record's local inputs (changelog lint, manifest fetch):
+/// when the record already happened those inputs are frozen server-side and
+/// the deploy proceeds without them.
+fn version_is_recorded(
+    client: &reqwest::blocking::Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+    version: &str,
+) -> Result<bool> {
+    let listed = with_spinner("Checking recorded versions…", || {
+        api::list_module_versions(client, apps_base, access_token, module_id)
+    });
+    match listed {
+        Ok(versions) => Ok(versions.iter().any(|v| v.version == version)),
         Err(ApiError::Unauthenticated) => Err(session_expired()),
         Err(e) => Err(e.into()),
     }

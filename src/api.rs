@@ -111,6 +111,64 @@ pub fn tunnel_token(
     Err(unexpected_body_error(resp))
 }
 
+/// GET /v1/tunnel/manifest/{moduleId} — the module's live manifest, proxied
+/// off its `mirrorstack dev` tunnel by the dispatch service. `module_id` is
+/// the raw platform UUID. The 200 body is the manifest object itself (no
+/// envelope), returned as opaque JSON. Owner-gated: someone else's (or an
+/// unknown) module is a 404 `not_found`, and a module without a live tunnel
+/// is a 503 `tunnel_offline` — callers branch on those codes to tell "start
+/// `mirrorstack dev`" apart from real failures.
+pub fn get_tunnel_manifest(
+    http: &Client,
+    dispatch_base: &str,
+    access_token: &str,
+    module_id: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let endpoint = format!(
+        "{}/v1/tunnel/manifest/{}",
+        dispatch_base.trim_end_matches('/'),
+        module_id
+    );
+
+    let resp = http
+        .get(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<serde_json::Value>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ApiError::Unauthenticated);
+    }
+
+    // Error envelope: surface code + message so callers can branch on
+    // `tunnel_offline` / `not_found` without re-parsing the body.
+    let status_u16 = status.as_u16();
+    let body = match http::read_capped(resp) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(ApiError::Unexpected {
+                status: status_u16,
+                body: format!("(read body failed: {e})"),
+            });
+        }
+    };
+    if let Ok(env) = serde_json::from_slice::<ErrorEnvelope>(&body) {
+        return Err(ApiError::Server {
+            status: status_u16,
+            code: env.error.code,
+            message: env.error.message,
+        });
+    }
+    Err(ApiError::Unexpected {
+        status: status_u16,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
+}
+
 pub fn me(http: &Client, api_base: &str, access_token: &str) -> Result<Identity, ApiError> {
     let endpoint = format!("{}/v1/auth/me", api_base.trim_end_matches('/'));
 
@@ -220,19 +278,11 @@ pub struct RecordModuleVersionInput<'a> {
     pub version: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changelog: Option<&'a str>,
-    pub manifest: RecordManifest<'a>,
-}
-
-/// Minimal frozen manifest for the version record. The endpoint requires a
-/// JSON object with `id` and `slug` (slug must match the module); everything
-/// else — migration counters, dependency graph, MCP catalog — takes the
-/// endpoint's documented defaults. A full manifest freeze (read off the dev
-/// tunnel) can replace this without changing the endpoint.
-#[derive(Debug, Serialize)]
-pub struct RecordManifest<'a> {
-    /// SDK `m<hex>` form from main.go — stored verbatim, never compared.
-    pub id: &'a str,
-    pub slug: &'a str,
+    /// The module's full live manifest as read off the dev tunnel
+    /// (`get_tunnel_manifest`), passed through as opaque JSON. The platform
+    /// stores it verbatim on the version row and the web console mounts the
+    /// installed version's UI from it — a stub here loses the module's pages.
+    pub manifest: &'a serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1070,14 +1120,21 @@ mod tests {
         assert_eq!(d.version_id, "ver-uuid");
     }
 
+    /// Small manifest Value for record tests that don't exercise the body.
+    fn stub_manifest() -> serde_json::Value {
+        json!({"id": "mabc123", "slug": "media"})
+    }
+
     #[test]
-    fn record_module_version_success() {
+    fn record_module_version_sends_manifest_verbatim() {
         let mut server = Server::new();
+        // A full manifest (pages, routes) must survive as-is — the platform
+        // stores it on the version row and mounts the module's UI from it.
         let _m = server
             .mock("POST", "/v1/modules/mod-uuid/versions")
             .match_header("authorization", "Bearer AT")
             .match_body(mockito::Matcher::JsonString(
-                r#"{"version":"0.1.0","changelog":"- initial release","manifest":{"id":"mabc123","slug":"media"}}"#.into(),
+                r#"{"version":"0.1.0","changelog":"- initial release","manifest":{"id":"mabc123","slug":"media","ui":{"defaultPages":[{"path":"/"}]},"routes":{"public":[{"method":"GET","path":"/public/me"}]}}}"#.into(),
             ))
             .with_status(201)
             .with_body(
@@ -1092,6 +1149,12 @@ mod tests {
             )
             .create();
 
+        let manifest = json!({
+            "id": "mabc123",
+            "slug": "media",
+            "ui": {"defaultPages": [{"path": "/"}]},
+            "routes": {"public": [{"method": "GET", "path": "/public/me"}]}
+        });
         let v = record_module_version(
             &test_client(),
             &server.url(),
@@ -1100,10 +1163,7 @@ mod tests {
             &RecordModuleVersionInput {
                 version: "0.1.0",
                 changelog: Some("- initial release"),
-                manifest: RecordManifest {
-                    id: "mabc123",
-                    slug: "media",
-                },
+                manifest: &manifest,
             },
         )
         .expect("ok");
@@ -1139,10 +1199,7 @@ mod tests {
             &RecordModuleVersionInput {
                 version: "0.1.0",
                 changelog: None,
-                manifest: RecordManifest {
-                    id: "mabc123",
-                    slug: "media",
-                },
+                manifest: &stub_manifest(),
             },
         )
         .expect("ok");
@@ -1168,10 +1225,7 @@ mod tests {
             &RecordModuleVersionInput {
                 version: "0.1.0",
                 changelog: None,
-                manifest: RecordManifest {
-                    id: "mabc123",
-                    slug: "media",
-                },
+                manifest: &stub_manifest(),
             },
         )
         .unwrap_err();
@@ -1203,10 +1257,7 @@ mod tests {
             &RecordModuleVersionInput {
                 version: "0.1.0",
                 changelog: Some("huge"),
-                manifest: RecordManifest {
-                    id: "mabc123",
-                    slug: "media",
-                },
+                manifest: &stub_manifest(),
             },
         )
         .unwrap_err();
@@ -1236,10 +1287,7 @@ mod tests {
             &RecordModuleVersionInput {
                 version: "0.1.0",
                 changelog: None,
-                manifest: RecordManifest {
-                    id: "mabc123",
-                    slug: "media",
-                },
+                manifest: &stub_manifest(),
             },
         )
         .unwrap_err();
@@ -1294,6 +1342,83 @@ mod tests {
         let err =
             list_module_versions(&test_client(), &server.url(), "expired", "mod-uuid").unwrap_err();
         assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
+    }
+
+    #[test]
+    fn get_tunnel_manifest_success() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/tunnel/manifest/mod-uuid")
+            .match_header("authorization", "Bearer AT")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "id": "mabc123",
+                    "slug": "media",
+                    "ui": {"defaultPages": [{"path": "/"}, {"path": "/settings"}]},
+                    "routes": {"public": []}
+                })
+                .to_string(),
+            )
+            .create();
+
+        let m = get_tunnel_manifest(&test_client(), &server.url(), "AT", "mod-uuid").expect("ok");
+        assert_eq!(m["slug"], "media");
+        assert_eq!(m["ui"]["defaultPages"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn get_tunnel_manifest_401_is_unauthenticated() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/tunnel/manifest/mod-uuid")
+            .with_status(401)
+            .with_body(r#"{"error":{"code":"token_expired","message":"token expired"}}"#)
+            .create();
+
+        let err =
+            get_tunnel_manifest(&test_client(), &server.url(), "expired", "mod-uuid").unwrap_err();
+        assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
+    }
+
+    #[test]
+    fn get_tunnel_manifest_404_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/tunnel/manifest/mod-uuid")
+            .with_status(404)
+            .with_body(r#"{"error":{"code":"not_found","message":"module not found"}}"#)
+            .create();
+
+        let err = get_tunnel_manifest(&test_client(), &server.url(), "AT", "mod-uuid").unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 404);
+                assert_eq!(code, "not_found");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_tunnel_manifest_503_tunnel_offline_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/tunnel/manifest/mod-uuid")
+            .with_status(503)
+            .with_body(
+                r#"{"error":{"code":"tunnel_offline","message":"no live dev tunnel for this module"}}"#,
+            )
+            .create();
+
+        let err = get_tunnel_manifest(&test_client(), &server.url(), "AT", "mod-uuid").unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 503);
+                assert_eq!(code, "tunnel_offline");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
     }
 
     #[test]
