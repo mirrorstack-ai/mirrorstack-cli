@@ -6,6 +6,8 @@
 //! and reuses its connection pool across multiple calls (e.g. `me` +
 //! `get_module` + `create_module` from `module init`).
 
+use std::collections::BTreeMap;
+
 use reqwest::blocking::{Client, Response};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -111,6 +113,64 @@ pub fn tunnel_token(
     Err(unexpected_body_error(resp))
 }
 
+/// GET /v1/tunnel/manifest/{moduleId} — the module's live manifest, proxied
+/// off its `mirrorstack dev` tunnel by the dispatch service. `module_id` is
+/// the raw platform UUID. The 200 body is the manifest object itself (no
+/// envelope), returned as opaque JSON. Owner-gated: someone else's (or an
+/// unknown) module is a 404 `not_found`, and a module without a live tunnel
+/// is a 503 `tunnel_offline` — callers branch on those codes to tell "start
+/// `mirrorstack dev`" apart from real failures.
+pub fn get_tunnel_manifest(
+    http: &Client,
+    dispatch_base: &str,
+    access_token: &str,
+    module_id: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let endpoint = format!(
+        "{}/v1/tunnel/manifest/{}",
+        dispatch_base.trim_end_matches('/'),
+        module_id
+    );
+
+    let resp = http
+        .get(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<serde_json::Value>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ApiError::Unauthenticated);
+    }
+
+    // Error envelope: surface code + message so callers can branch on
+    // `tunnel_offline` / `not_found` without re-parsing the body.
+    let status_u16 = status.as_u16();
+    let body = match http::read_capped(resp) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(ApiError::Unexpected {
+                status: status_u16,
+                body: format!("(read body failed: {e})"),
+            });
+        }
+    };
+    if let Ok(env) = serde_json::from_slice::<ErrorEnvelope>(&body) {
+        return Err(ApiError::Server {
+            status: status_u16,
+            code: env.error.code,
+            message: env.error.message,
+        });
+    }
+    Err(ApiError::Unexpected {
+        status: status_u16,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
+}
+
 pub fn me(http: &Client, api_base: &str, access_token: &str) -> Result<Identity, ApiError> {
     let endpoint = format!("{}/v1/auth/me", api_base.trim_end_matches('/'));
 
@@ -214,8 +274,231 @@ pub fn create_module(
     })
 }
 
+#[derive(Debug, Serialize)]
+pub struct RecordModuleVersionInput<'a> {
+    /// Canonical SemVer, no `v` prefix (the platform 422s anything else).
+    pub version: &'a str,
+    /// This version's changelog locale map — `{ "default": <CHANGELOG.md
+    /// section>, "<tag>": <CHANGELOG.<tag>.md section> }`, each the module's
+    /// `## <version>` section extracted off disk. `default` is required;
+    /// omitted only when empty. Capped server-side at 16KB per value
+    /// (`changelog_too_large`).
+    #[serde(skip_serializing_if = "map_is_empty")]
+    pub changelog: &'a BTreeMap<String, String>,
+    /// The module's README locale map — `{ "default": <README.md>, "<tag>":
+    /// <README.<tag>.md> }` read off disk at the module root. Optional and
+    /// free-form; omitted when empty. Each value is capped client-side at 64KB
+    /// to match the platform (`readme_too_large`).
+    #[serde(skip_serializing_if = "map_is_empty")]
+    pub readme: &'a BTreeMap<String, String>,
+    /// The module's full live manifest as read off the dev tunnel
+    /// (`get_tunnel_manifest`), passed through as opaque JSON. The platform
+    /// stores it verbatim on the version row and the web console mounts the
+    /// installed version's UI from it — a stub here loses the module's pages.
+    pub manifest: &'a serde_json::Value,
+}
+
+/// `skip_serializing_if` predicate for the borrowed changelog / readme maps.
+/// The field is a reference, so serde hands the predicate a double reference.
+fn map_is_empty(map: &&BTreeMap<String, String>) -> bool {
+    map.is_empty()
+}
+
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // name / owner_id / created_at are part of the API surface
+#[allow(dead_code)] // module_id / channel / published_at are part of the API surface
+pub struct ModuleVersion {
+    /// Version row UUID.
+    pub id: String,
+    pub module_id: String,
+    pub version: String,
+    #[serde(default)]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub published_at: Option<String>,
+}
+
+/// POST /v1/modules/{moduleId}/versions — record an immutable module
+/// version (snapshot + changelog). Recording carries no visibility
+/// semantics; "publish" is reserved for the future marketplace listing
+/// act. Re-recording an existing version is a 409 `version_exists`; the
+/// changelog is capped server-side at 16KB (`changelog_too_large`).
+pub fn record_module_version(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+    input: &RecordModuleVersionInput,
+) -> Result<ModuleVersion, ApiError> {
+    let endpoint = format!(
+        "{}/v1/modules/{}/versions",
+        apps_base.trim_end_matches('/'),
+        module_id
+    );
+
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .json(input)
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<ModuleVersion>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+
+    // 4xx with platform error-envelope: surface code + message so callers
+    // can branch on `version_exists` / `version_invalid` /
+    // `changelog_too_large` without re-parsing the body.
+    let status_u16 = status.as_u16();
+    let body = match http::read_capped(resp) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(ApiError::Unexpected {
+                status: status_u16,
+                body: format!("(read body failed: {e})"),
+            });
+        }
+    };
+    if let Ok(env) = serde_json::from_slice::<ErrorEnvelope>(&body) {
+        return Err(ApiError::Server {
+            status: status_u16,
+            code: env.error.code,
+            message: env.error.message,
+        });
+    }
+    Err(ApiError::Unexpected {
+        status: status_u16,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
+}
+
+/// Envelope for GET /v1/modules/{moduleId}/versions.
+#[derive(Debug, Deserialize)]
+struct ModuleVersionList {
+    versions: Vec<ModuleVersion>,
+}
+
+/// GET /v1/modules/{moduleId}/versions — the module's recorded versions,
+/// newest first (changelogs included, manifests omitted). Owner-scoped;
+/// someone else's module is a 404, surfaced as `Unexpected` since deploy
+/// resolves ownership via `get_module` before calling this.
+pub fn list_module_versions(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+) -> Result<Vec<ModuleVersion>, ApiError> {
+    let endpoint = format!(
+        "{}/v1/modules/{}/versions",
+        apps_base.trim_end_matches('/'),
+        module_id
+    );
+
+    let resp = http
+        .get(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<ModuleVersionList>()?.versions);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(unexpected_body_error(resp))
+}
+
+#[derive(Debug, Serialize)]
+pub struct SetModuleDeployInput<'a> {
+    pub invoke_target: &'a str,
+    /// Omitted → server default `active`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // module_id / timestamps are part of the API surface
+pub struct ModuleDeploy {
+    pub version_id: String,
+    pub module_id: String,
+    pub invoke_target: String,
+    pub status: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+/// POST /v1/modules/{moduleId}/versions/{versionRef}/deploy — point a module
+/// version at a Lambda invoke target (upsert: one deploy row per version).
+/// `version_ref` is the version UUID or the version string — the platform
+/// tries the UUID shape first, then resolves UNIQUE(module_id, version).
+/// SemVer strings are path-safe verbatim ([0-9A-Za-z.+-] only). `module_id`
+/// is the raw platform UUID, not the sanitized `m<hex>` form in main.go.
+pub fn set_module_deploy(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+    version_ref: &str,
+    input: &SetModuleDeployInput,
+) -> Result<ModuleDeploy, ApiError> {
+    let endpoint = format!(
+        "{}/v1/modules/{}/versions/{}/deploy",
+        apps_base.trim_end_matches('/'),
+        module_id,
+        version_ref
+    );
+
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .json(input)
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<ModuleDeploy>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+
+    // 4xx with platform error-envelope: surface code + message so callers
+    // can branch on `not_found` / `invoke_target_invalid` / `status_invalid`
+    // without re-parsing the body.
+    let status_u16 = status.as_u16();
+    let body = match http::read_capped(resp) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(ApiError::Unexpected {
+                status: status_u16,
+                body: format!("(read body failed: {e})"),
+            });
+        }
+    };
+    if let Ok(env) = serde_json::from_slice::<ErrorEnvelope>(&body) {
+        return Err(ApiError::Server {
+            status: status_u16,
+            code: env.error.code,
+            message: env.error.message,
+        });
+    }
+    Err(ApiError::Unexpected {
+        status: status_u16,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct App {
     pub id: String,
     pub name: String,
@@ -385,6 +668,7 @@ fn unexpected_body_error(resp: Response) -> ApiError {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     use mockito::Server;
@@ -665,6 +949,520 @@ mod tests {
         .unwrap_err();
         match err {
             ApiError::Server { code, .. } => assert_eq!(code, "slug_taken"),
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_module_deploy_success() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions/ver-uuid/deploy")
+            .match_header("authorization", "Bearer AT")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"invoke_target":"my-fn","status":"active"}"#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "version_id": "ver-uuid",
+                    "module_id": "mod-uuid",
+                    "invoke_target": "my-fn",
+                    "status": "active",
+                    "created_at": "2026-07-01T00:00:00Z",
+                    "updated_at": "2026-07-02T00:00:00Z"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let d = set_module_deploy(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            "ver-uuid",
+            &SetModuleDeployInput {
+                invoke_target: "my-fn",
+                status: Some("active"),
+            },
+        )
+        .expect("ok");
+        assert_eq!(d.version_id, "ver-uuid");
+        assert_eq!(d.invoke_target, "my-fn");
+        assert_eq!(d.status, "active");
+    }
+
+    #[test]
+    fn set_module_deploy_omits_status_when_none() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions/ver-uuid/deploy")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"invoke_target":"my-fn"}"#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "version_id": "ver-uuid",
+                    "module_id": "mod-uuid",
+                    "invoke_target": "my-fn",
+                    "status": "active"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let d = set_module_deploy(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            "ver-uuid",
+            &SetModuleDeployInput {
+                invoke_target: "my-fn",
+                status: None,
+            },
+        )
+        .expect("ok");
+        assert_eq!(d.status, "active");
+    }
+
+    #[test]
+    fn set_module_deploy_404_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions/ver-uuid/deploy")
+            .with_status(404)
+            .with_body(
+                r#"{"error":{"code":"not_found","message":"version not found for this module"}}"#,
+            )
+            .create();
+
+        let err = set_module_deploy(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            "ver-uuid",
+            &SetModuleDeployInput {
+                invoke_target: "my-fn",
+                status: None,
+            },
+        )
+        .unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 404);
+                assert_eq!(code, "not_found");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_module_deploy_422_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions/ver-uuid/deploy")
+            .with_status(422)
+            .with_body(
+                r#"{"error":{"code":"invoke_target_invalid","message":"invoke_target must be a Lambda function name or ARN"}}"#,
+            )
+            .create();
+
+        let err = set_module_deploy(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            "ver-uuid",
+            &SetModuleDeployInput {
+                invoke_target: "not a lambda!",
+                status: None,
+            },
+        )
+        .unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 422);
+                assert_eq!(code, "invoke_target_invalid");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_module_deploy_401_is_unauthenticated() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions/ver-uuid/deploy")
+            .with_status(401)
+            .with_body(r#"{"error":{"code":"token_expired","message":"token expired"}}"#)
+            .create();
+
+        let err = set_module_deploy(
+            &test_client(),
+            &server.url(),
+            "expired",
+            "mod-uuid",
+            "ver-uuid",
+            &SetModuleDeployInput {
+                invoke_target: "my-fn",
+                status: None,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
+    }
+
+    #[test]
+    fn set_module_deploy_accepts_version_string_ref() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions/1.2.0/deploy")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "version_id": "ver-uuid",
+                    "module_id": "mod-uuid",
+                    "invoke_target": "my-fn",
+                    "status": "active"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let d = set_module_deploy(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            "1.2.0",
+            &SetModuleDeployInput {
+                invoke_target: "my-fn",
+                status: None,
+            },
+        )
+        .expect("ok");
+        assert_eq!(d.version_id, "ver-uuid");
+    }
+
+    /// Small manifest Value for record tests that don't exercise the body.
+    fn stub_manifest() -> serde_json::Value {
+        json!({"id": "mabc123", "slug": "media"})
+    }
+
+    #[test]
+    fn record_module_version_sends_manifest_verbatim() {
+        let mut server = Server::new();
+        // A full manifest (pages, routes) must survive as-is — the platform
+        // stores it on the version row and mounts the module's UI from it.
+        // Changelog and README both ship as locale maps: `default` plus any
+        // `<tag>` translation, all frozen on the version row.
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions")
+            .match_header("authorization", "Bearer AT")
+            .match_body(mockito::Matcher::JsonString(
+                r##"{"version":"0.1.0","changelog":{"default":"- initial release","zh-TW":"- 初始版本"},"readme":{"default":"# Media\n\nLong-form module docs.","zh-TW":"# 媒體\n\n模組長篇說明。"},"manifest":{"id":"mabc123","slug":"media","ui":{"defaultPages":[{"path":"/"}]},"routes":{"public":[{"method":"GET","path":"/public/me"}]}}}"##.into(),
+            ))
+            .with_status(201)
+            .with_body(
+                json!({
+                    "id": "ver-uuid",
+                    "module_id": "mod-uuid",
+                    "version": "0.1.0",
+                    "channel": "stable",
+                    "published_at": "2026-07-02T00:00:00Z"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let manifest = json!({
+            "id": "mabc123",
+            "slug": "media",
+            "ui": {"defaultPages": [{"path": "/"}]},
+            "routes": {"public": [{"method": "GET", "path": "/public/me"}]}
+        });
+        let changelog = BTreeMap::from([
+            ("default".to_string(), "- initial release".to_string()),
+            ("zh-TW".to_string(), "- 初始版本".to_string()),
+        ]);
+        let readme = BTreeMap::from([
+            (
+                "default".to_string(),
+                "# Media\n\nLong-form module docs.".to_string(),
+            ),
+            ("zh-TW".to_string(), "# 媒體\n\n模組長篇說明。".to_string()),
+        ]);
+        let v = record_module_version(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            &RecordModuleVersionInput {
+                version: "0.1.0",
+                changelog: &changelog,
+                readme: &readme,
+                manifest: &manifest,
+            },
+        )
+        .expect("ok");
+        assert_eq!(v.id, "ver-uuid");
+        assert_eq!(v.version, "0.1.0");
+        assert_eq!(v.channel.as_deref(), Some("stable"));
+    }
+
+    #[test]
+    fn record_module_version_omits_changelog_when_empty() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"version":"0.1.0","manifest":{"id":"mabc123","slug":"media"}}"#.into(),
+            ))
+            .with_status(201)
+            .with_body(
+                json!({
+                    "id": "ver-uuid",
+                    "module_id": "mod-uuid",
+                    "version": "0.1.0"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let v = record_module_version(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            &RecordModuleVersionInput {
+                version: "0.1.0",
+                changelog: &BTreeMap::new(),
+                readme: &BTreeMap::new(),
+                manifest: &stub_manifest(),
+            },
+        )
+        .expect("ok");
+        assert_eq!(v.published_at, None);
+    }
+
+    #[test]
+    fn record_module_version_409_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions")
+            .with_status(409)
+            .with_body(
+                r#"{"error":{"code":"version_exists","message":"this version is already published"}}"#,
+            )
+            .create();
+
+        let err = record_module_version(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            &RecordModuleVersionInput {
+                version: "0.1.0",
+                changelog: &BTreeMap::new(),
+                readme: &BTreeMap::new(),
+                manifest: &stub_manifest(),
+            },
+        )
+        .unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 409);
+                assert_eq!(code, "version_exists");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_module_version_422_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions")
+            .with_status(422)
+            .with_body(
+                r#"{"error":{"code":"changelog_too_large","message":"changelog must be 16384 characters or fewer"}}"#,
+            )
+            .create();
+
+        let err = record_module_version(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            &RecordModuleVersionInput {
+                version: "0.1.0",
+                changelog: &BTreeMap::from([("default".to_string(), "huge".to_string())]),
+                readme: &BTreeMap::new(),
+                manifest: &stub_manifest(),
+            },
+        )
+        .unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 422);
+                assert_eq!(code, "changelog_too_large");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_module_version_401_is_unauthenticated() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions")
+            .with_status(401)
+            .with_body(r#"{"error":{"code":"token_expired","message":"token expired"}}"#)
+            .create();
+
+        let err = record_module_version(
+            &test_client(),
+            &server.url(),
+            "expired",
+            "mod-uuid",
+            &RecordModuleVersionInput {
+                version: "0.1.0",
+                changelog: &BTreeMap::new(),
+                readme: &BTreeMap::new(),
+                manifest: &stub_manifest(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
+    }
+
+    #[test]
+    fn list_module_versions_success() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/modules/mod-uuid/versions")
+            .match_header("authorization", "Bearer AT")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "versions": [
+                        {"id": "ver-2", "module_id": "mod-uuid", "version": "0.2.0"},
+                        {"id": "ver-1", "module_id": "mod-uuid", "version": "0.1.0"}
+                    ]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let vs = list_module_versions(&test_client(), &server.url(), "AT", "mod-uuid").expect("ok");
+        assert_eq!(vs.len(), 2);
+        assert_eq!(vs[0].version, "0.2.0");
+        assert_eq!(vs[1].id, "ver-1");
+    }
+
+    #[test]
+    fn list_module_versions_empty() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/modules/mod-uuid/versions")
+            .with_status(200)
+            .with_body(json!({"versions": []}).to_string())
+            .create();
+
+        let vs = list_module_versions(&test_client(), &server.url(), "AT", "mod-uuid").expect("ok");
+        assert!(vs.is_empty());
+    }
+
+    #[test]
+    fn list_module_versions_401_is_unauthenticated() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/modules/mod-uuid/versions")
+            .with_status(401)
+            .create();
+
+        let err =
+            list_module_versions(&test_client(), &server.url(), "expired", "mod-uuid").unwrap_err();
+        assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
+    }
+
+    #[test]
+    fn get_tunnel_manifest_success() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/tunnel/manifest/mod-uuid")
+            .match_header("authorization", "Bearer AT")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "id": "mabc123",
+                    "slug": "media",
+                    "ui": {"defaultPages": [{"path": "/"}, {"path": "/settings"}]},
+                    "routes": {"public": []}
+                })
+                .to_string(),
+            )
+            .create();
+
+        let m = get_tunnel_manifest(&test_client(), &server.url(), "AT", "mod-uuid").expect("ok");
+        assert_eq!(m["slug"], "media");
+        assert_eq!(m["ui"]["defaultPages"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn get_tunnel_manifest_401_is_unauthenticated() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/tunnel/manifest/mod-uuid")
+            .with_status(401)
+            .with_body(r#"{"error":{"code":"token_expired","message":"token expired"}}"#)
+            .create();
+
+        let err =
+            get_tunnel_manifest(&test_client(), &server.url(), "expired", "mod-uuid").unwrap_err();
+        assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
+    }
+
+    #[test]
+    fn get_tunnel_manifest_404_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/tunnel/manifest/mod-uuid")
+            .with_status(404)
+            .with_body(r#"{"error":{"code":"not_found","message":"module not found"}}"#)
+            .create();
+
+        let err = get_tunnel_manifest(&test_client(), &server.url(), "AT", "mod-uuid").unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 404);
+                assert_eq!(code, "not_found");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_tunnel_manifest_503_tunnel_offline_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/tunnel/manifest/mod-uuid")
+            .with_status(503)
+            .with_body(
+                r#"{"error":{"code":"tunnel_offline","message":"no live dev tunnel for this module"}}"#,
+            )
+            .create();
+
+        let err = get_tunnel_manifest(&test_client(), &server.url(), "AT", "mod-uuid").unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 503);
+                assert_eq!(code, "tunnel_offline");
+            }
             other => panic!("expected Server, got {other:?}"),
         }
     }

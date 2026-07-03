@@ -143,7 +143,7 @@ mod tests {
         // Slug field is the SDK v0.2.0 catalog handle. The scaffolded
         // module needs it set so the manifest carries it from day one;
         // missing-slug behavior (dev-only mode) is for hand-written
-        // pre-publish modules, not the CLI scaffold.
+        // never-deployed modules, not the CLI scaffold.
         let out = render(MAIN_GO, &ins("oauth", "OAuth"));
         assert!(
             out.contains(r#"Slug: "oauth""#),
@@ -153,9 +153,9 @@ mod tests {
 
     #[test]
     fn render_versions_default_is_dev_prerelease() {
-        // Pre-1.0 dev builds use `v0.1.0-dev` so `mirrorstack publish` can
-        // refuse `-dev` versions in prod by convention. Promotion
-        // happens at publish time. See docs/module-identity-and-storage-prefix.md.
+        // Pre-1.0 dev builds use `v0.1.0-dev` so `mirrorstack module deploy` can
+        // refuse `-dev` versions in CI (--yes) by convention. Promotion
+        // happens at deploy time. See docs/module-identity-and-storage-prefix.md.
         let out = render(MAIN_GO, &ins("media", "Media"));
         assert!(
             out.contains(r#""v0.1.0-dev": {App: "0001"}"#),
