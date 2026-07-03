@@ -6,6 +6,8 @@
 //! and reuses its connection pool across multiple calls (e.g. `me` +
 //! `get_module` + `create_module` from `module init`).
 
+use std::collections::BTreeMap;
+
 use reqwest::blocking::{Client, Response};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -278,16 +280,23 @@ pub struct RecordModuleVersionInput<'a> {
     pub version: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changelog: Option<&'a str>,
-    /// The module's README.md (long-form description), read off disk at the
-    /// module root. Optional and free-form — omitted when absent. Capped
-    /// client-side at 64KB to match the platform (`readme_too_large`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub readme: Option<&'a str>,
+    /// The module's README locale map — `{ "default": <README.md>, "<tag>":
+    /// <README.<tag>.md> }` read off disk at the module root. Optional and
+    /// free-form; omitted when empty. Each value is capped client-side at 64KB
+    /// to match the platform (`readme_too_large`).
+    #[serde(skip_serializing_if = "readme_map_is_empty")]
+    pub readme: &'a BTreeMap<String, String>,
     /// The module's full live manifest as read off the dev tunnel
     /// (`get_tunnel_manifest`), passed through as opaque JSON. The platform
     /// stores it verbatim on the version row and the web console mounts the
     /// installed version's UI from it — a stub here loses the module's pages.
     pub manifest: &'a serde_json::Value,
+}
+
+/// `skip_serializing_if` predicate for [`RecordModuleVersionInput::readme`].
+/// The field is a reference, so serde hands the predicate a double reference.
+fn readme_map_is_empty(map: &&BTreeMap<String, String>) -> bool {
+    map.is_empty()
 }
 
 #[derive(Debug, Deserialize)]
@@ -644,6 +653,7 @@ fn unexpected_body_error(resp: Response) -> ApiError {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     use mockito::Server;
@@ -1135,11 +1145,13 @@ mod tests {
         let mut server = Server::new();
         // A full manifest (pages, routes) must survive as-is — the platform
         // stores it on the version row and mounts the module's UI from it.
+        // README ships as a locale map: `default` (README.md) plus any
+        // `README.<tag>.md` translation, both frozen on the version row.
         let _m = server
             .mock("POST", "/v1/modules/mod-uuid/versions")
             .match_header("authorization", "Bearer AT")
             .match_body(mockito::Matcher::JsonString(
-                r##"{"version":"0.1.0","changelog":"- initial release","readme":"# Media\n\nLong-form module docs.","manifest":{"id":"mabc123","slug":"media","ui":{"defaultPages":[{"path":"/"}]},"routes":{"public":[{"method":"GET","path":"/public/me"}]}}}"##.into(),
+                r##"{"version":"0.1.0","changelog":"- initial release","readme":{"default":"# Media\n\nLong-form module docs.","zh-TW":"# 媒體\n\n模組長篇說明。"},"manifest":{"id":"mabc123","slug":"media","ui":{"defaultPages":[{"path":"/"}]},"routes":{"public":[{"method":"GET","path":"/public/me"}]}}}"##.into(),
             ))
             .with_status(201)
             .with_body(
@@ -1160,6 +1172,13 @@ mod tests {
             "ui": {"defaultPages": [{"path": "/"}]},
             "routes": {"public": [{"method": "GET", "path": "/public/me"}]}
         });
+        let readme = BTreeMap::from([
+            (
+                "default".to_string(),
+                "# Media\n\nLong-form module docs.".to_string(),
+            ),
+            ("zh-TW".to_string(), "# 媒體\n\n模組長篇說明。".to_string()),
+        ]);
         let v = record_module_version(
             &test_client(),
             &server.url(),
@@ -1168,7 +1187,7 @@ mod tests {
             &RecordModuleVersionInput {
                 version: "0.1.0",
                 changelog: Some("- initial release"),
-                readme: Some("# Media\n\nLong-form module docs."),
+                readme: &readme,
                 manifest: &manifest,
             },
         )
@@ -1205,7 +1224,7 @@ mod tests {
             &RecordModuleVersionInput {
                 version: "0.1.0",
                 changelog: None,
-                readme: None,
+                readme: &BTreeMap::new(),
                 manifest: &stub_manifest(),
             },
         )
@@ -1232,7 +1251,7 @@ mod tests {
             &RecordModuleVersionInput {
                 version: "0.1.0",
                 changelog: None,
-                readme: None,
+                readme: &BTreeMap::new(),
                 manifest: &stub_manifest(),
             },
         )
@@ -1265,7 +1284,7 @@ mod tests {
             &RecordModuleVersionInput {
                 version: "0.1.0",
                 changelog: Some("huge"),
-                readme: None,
+                readme: &BTreeMap::new(),
                 manifest: &stub_manifest(),
             },
         )
@@ -1296,7 +1315,7 @@ mod tests {
             &RecordModuleVersionInput {
                 version: "0.1.0",
                 changelog: None,
-                readme: None,
+                readme: &BTreeMap::new(),
                 manifest: &stub_manifest(),
             },
         )

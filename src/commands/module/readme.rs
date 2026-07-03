@@ -1,62 +1,106 @@
-//! README.md read for `module deploy`'s record step.
+//! README locale-map read for `module deploy`'s record step.
 //!
-//! README.md at the module root is the module's long-form description.
-//! Deploy reads it (when present) and records it on the version row so the
-//! marketplace catalog can render it. Unlike CHANGELOG.md it is optional and
-//! free-form — there is no lint. A missing file is not an error (nothing is
-//! sent). Trailing whitespace is trimmed and the text is capped at the
+//! README files at the module root are the module's long-form description.
+//! Deploy reads them (when present) and records them on the version row so the
+//! marketplace catalog can render the reader's locale. `README.md` is the
+//! default; `README.<tag>.md` (e.g. `README.zh-TW.md`) contributes a
+//! locale-specific translation. Unlike CHANGELOG.md they are optional and
+//! free-form — there is no lint. Missing files are not an error (nothing is
+//! sent). Each value has its trailing whitespace trimmed and is capped at the
 //! platform's byte limit, truncated on a UTF-8 char boundary.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
-/// Server-side cap on `module_versions.readme` (64KB). Enforced here so an
-/// oversized README is truncated client-side instead of round-tripping a
-/// `readme_too_large` rejection.
+/// Server-side cap on each `module_versions.readme` value (64KB). Enforced
+/// here so an oversized README is truncated client-side instead of
+/// round-tripping a `readme_too_large` rejection.
 pub(super) const MAX_README_BYTES: usize = 65_536;
 
-/// Result of reading README.md.
+/// Result of scanning the module dir for README files.
 pub(super) struct Readme {
-    /// Trimmed, capped README body. Empty when there is no README.md (or it
-    /// held only whitespace).
-    pub body: String,
-    /// Whether `body` was truncated to fit [`MAX_README_BYTES`].
+    /// Locale → trimmed, capped markdown. Key `default` is `README.md`; a
+    /// `<tag>` key is `README.<tag>.md`. Empty when the module ships no
+    /// README (or every file held only whitespace).
+    pub map: BTreeMap<String, String>,
+    /// Whether any value was truncated to fit [`MAX_README_BYTES`].
     pub truncated: bool,
 }
 
-/// Read `README.md` from `module_dir`. A missing file yields an empty body —
-/// READMEs are optional, unlike CHANGELOG.md.
+/// Scan `module_dir` for `README.md` (key `default`) and any
+/// `README.<tag>.md` (key `<tag>`), building a locale map. A dir with no
+/// README files yields an empty map — READMEs are optional, unlike
+/// CHANGELOG.md.
 pub(super) fn read(module_dir: &Path) -> Result<Readme> {
-    let path = module_dir.join("README.md");
-    if !path.exists() {
-        return Ok(Readme {
-            body: String::new(),
-            truncated: false,
-        });
+    let mut map = BTreeMap::new();
+    let mut truncated = false;
+
+    let entries = match std::fs::read_dir(module_dir) {
+        Ok(entries) => entries,
+        // A missing module dir is treated the same as one with no READMEs —
+        // the caller's own preflight already resolved the module.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Readme { map, truncated });
+        }
+        Err(e) => return Err(e).with_context(|| format!("read dir {}", module_dir.display())),
+    };
+
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read dir {}", module_dir.display()))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(key) = readme_key(name) else { continue };
+        let path = entry.path();
+        // `is_file` follows symlinks (matching the old single-file read) and
+        // skips a directory that happens to be named like a README.
+        if !path.is_file() {
+            continue;
+        }
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let (body, hit_cap) = cap(raw.trim_end());
+        truncated |= hit_cap;
+        if !body.is_empty() {
+            map.insert(key, body);
+        }
     }
-    let raw =
-        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    Ok(cap(raw.trim_end()))
+
+    Ok(Readme { map, truncated })
+}
+
+/// Locale key for a README file name, or None when it isn't a README:
+/// `README.md` → `default`; `README.<tag>.md` → `<tag>` when `<tag>` is a
+/// non-empty locale-ish token (`[A-Za-z0-9_-]`, matching the platform's key
+/// validation). Anything else (e.g. `README.release.notes`) is ignored.
+fn readme_key(file_name: &str) -> Option<String> {
+    if file_name == "README.md" {
+        return Some("default".to_string());
+    }
+    let tag = file_name.strip_prefix("README.")?.strip_suffix(".md")?;
+    if tag.is_empty()
+        || !tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    Some(tag.to_string())
 }
 
 /// Cap `text` at [`MAX_README_BYTES`], truncating on the nearest UTF-8 char
 /// boundary at or below the limit so a multi-byte character is never split.
-fn cap(text: &str) -> Readme {
+/// Returns the (possibly truncated) body and whether truncation happened.
+fn cap(text: &str) -> (String, bool) {
     if text.len() <= MAX_README_BYTES {
-        return Readme {
-            body: text.to_string(),
-            truncated: false,
-        };
+        return (text.to_string(), false);
     }
     let mut end = MAX_README_BYTES;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    Readme {
-        body: text[..end].to_string(),
-        truncated: true,
-    }
+    (text[..end].to_string(), true)
 }
 
 #[cfg(test)]
@@ -64,35 +108,105 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_missing_file_is_empty() {
+    fn read_no_readme_is_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let r = read(tmp.path()).expect("ok");
-        assert!(r.body.is_empty());
+        assert!(r.map.is_empty());
         assert!(!r.truncated);
     }
 
     #[test]
-    fn read_trims_trailing_whitespace() {
+    fn read_missing_dir_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let r = read(&tmp.path().join("nope")).expect("ok");
+        assert!(r.map.is_empty());
+        assert!(!r.truncated);
+    }
+
+    #[test]
+    fn read_default_trims_trailing_whitespace() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("README.md"), "# Media\n\nDocs.\n\n  \n").unwrap();
         let r = read(tmp.path()).expect("ok");
-        assert_eq!(r.body, "# Media\n\nDocs.");
+        assert_eq!(r.map.get("default").map(String::as_str), Some("# Media\n\nDocs."));
+        assert_eq!(r.map.len(), 1);
         assert!(!r.truncated);
+    }
+
+    #[test]
+    fn read_collects_locale_variants() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("README.md"), "# Media\n").unwrap();
+        std::fs::write(tmp.path().join("README.zh-TW.md"), "# 媒體\n").unwrap();
+        std::fs::write(tmp.path().join("README.en_US.md"), "# Media US\n").unwrap();
+        let r = read(tmp.path()).expect("ok");
+        assert_eq!(r.map.get("default").map(String::as_str), Some("# Media"));
+        assert_eq!(r.map.get("zh-TW").map(String::as_str), Some("# 媒體"));
+        assert_eq!(r.map.get("en_US").map(String::as_str), Some("# Media US"));
+        assert_eq!(r.map.len(), 3);
+    }
+
+    #[test]
+    fn read_omits_empty_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("README.md"), "\n\n   \n").unwrap();
+        std::fs::write(tmp.path().join("README.fr.md"), "# Bonjour\n").unwrap();
+        let r = read(tmp.path()).expect("ok");
+        assert!(!r.map.contains_key("default"));
+        assert_eq!(r.map.get("fr").map(String::as_str), Some("# Bonjour"));
+        assert_eq!(r.map.len(), 1);
+    }
+
+    #[test]
+    fn read_ignores_non_readme_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("README.md"), "# Media\n").unwrap();
+        std::fs::write(tmp.path().join("CHANGELOG.md"), "# Changelog\n").unwrap();
+        std::fs::write(tmp.path().join("README.notes.txt"), "not markdown\n").unwrap();
+        std::fs::write(tmp.path().join("READMEER.md"), "nope\n").unwrap();
+        let r = read(tmp.path()).expect("ok");
+        assert_eq!(r.map.len(), 1);
+        assert!(r.map.contains_key("default"));
+    }
+
+    #[test]
+    fn read_flags_truncation() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("README.md"),
+            "x".repeat(MAX_README_BYTES + 10),
+        )
+        .unwrap();
+        let r = read(tmp.path()).expect("ok");
+        assert!(r.truncated);
+        assert_eq!(r.map.get("default").map(String::len), Some(MAX_README_BYTES));
+    }
+
+    #[test]
+    fn readme_key_maps_default_and_tags() {
+        assert_eq!(readme_key("README.md").as_deref(), Some("default"));
+        assert_eq!(readme_key("README.zh-TW.md").as_deref(), Some("zh-TW"));
+        assert_eq!(readme_key("README.en_US.md").as_deref(), Some("en_US"));
+        assert_eq!(readme_key("README.notes.txt"), None);
+        assert_eq!(readme_key("READMEER.md"), None);
+        assert_eq!(readme_key("README..md"), None);
+        // A multi-dot middle isn't a single locale-ish token.
+        assert_eq!(readme_key("README.zh.TW.md"), None);
     }
 
     #[test]
     fn cap_leaves_small_text_untouched() {
-        let r = cap("short");
-        assert_eq!(r.body, "short");
-        assert!(!r.truncated);
+        let (body, truncated) = cap("short");
+        assert_eq!(body, "short");
+        assert!(!truncated);
     }
 
     #[test]
     fn cap_truncates_oversized_text() {
         let big = "x".repeat(MAX_README_BYTES + 10);
-        let r = cap(&big);
-        assert_eq!(r.body.len(), MAX_README_BYTES);
-        assert!(r.truncated);
+        let (body, truncated) = cap(&big);
+        assert_eq!(body.len(), MAX_README_BYTES);
+        assert!(truncated);
     }
 
     #[test]
@@ -102,9 +216,9 @@ mod tests {
         let mut s = "a".repeat(MAX_README_BYTES - 1);
         s.push('é'); // occupies bytes MAX-1 and MAX
         s.push('é'); // pushes total length over the cap
-        let r = cap(&s);
-        assert!(r.truncated);
-        assert!(r.body.len() <= MAX_README_BYTES);
-        assert!(s.is_char_boundary(r.body.len()));
+        let (body, truncated) = cap(&s);
+        assert!(truncated);
+        assert!(body.len() <= MAX_README_BYTES);
+        assert!(s.is_char_boundary(body.len()));
     }
 }

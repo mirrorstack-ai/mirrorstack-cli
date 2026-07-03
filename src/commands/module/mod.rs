@@ -597,12 +597,12 @@ fn ensure_version_recorded(
         }
     };
 
-    // README.md is the module's long-form description — optional and
-    // free-form (no lint). It's frozen on the version row alongside the
-    // changelog, so it's read here on the fresh-record path only; an empty
-    // body (no README.md) is omitted from the request.
+    // README files are the module's long-form description — optional and
+    // free-form (no lint). `README.md` is the `default`; `README.<tag>.md`
+    // adds a locale translation. They're frozen on the version row alongside
+    // the changelog, so they're read here on the fresh-record path only; an
+    // empty map (no README files) is omitted from the request.
     let readme = readme::read(dir)?;
-    let readme_field = (!readme.body.is_empty()).then_some(readme.body.as_str());
 
     let result = with_spinner("Recording version…", || {
         api::record_module_version(
@@ -613,7 +613,7 @@ fn ensure_version_recorded(
             &RecordModuleVersionInput {
                 version,
                 changelog: Some(&entry.body),
-                readme: readme_field,
+                readme: &readme.map,
                 manifest: &manifest,
             },
         )
@@ -629,7 +629,7 @@ fn ensure_version_recorded(
             }
             if readme.truncated {
                 eprintln!(
-                    "{} README.md exceeded {} bytes and was truncated for the version record",
+                    "{} a README file exceeded {} bytes and was truncated for the version record",
                     warn_prefix(),
                     readme::MAX_README_BYTES
                 );
