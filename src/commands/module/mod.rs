@@ -612,7 +612,7 @@ fn ensure_version_recorded(
             &module.id,
             &RecordModuleVersionInput {
                 version,
-                changelog: Some(&entry.body),
+                changelog: &entry.map,
                 readme: &readme.map,
                 manifest: &manifest,
             },
@@ -640,7 +640,8 @@ fn ensure_version_recorded(
                 style(format!("{slug}@{version}")).cyan().bold()
             );
             eprintln!("  {} {}", style("id:").dim(), recorded.id);
-            for line in changelog_preview(&entry.body, 3) {
+            // `default` (CHANGELOG.md) is always present after a clean lint.
+            for line in changelog_preview(&entry.map["default"], 3) {
                 eprintln!("  {} {line}", style("│").dim());
             }
             Ok(())

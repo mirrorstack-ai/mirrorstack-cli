@@ -278,13 +278,18 @@ pub fn create_module(
 pub struct RecordModuleVersionInput<'a> {
     /// Canonical SemVer, no `v` prefix (the platform 422s anything else).
     pub version: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub changelog: Option<&'a str>,
+    /// This version's changelog locale map — `{ "default": <CHANGELOG.md
+    /// section>, "<tag>": <CHANGELOG.<tag>.md section> }`, each the module's
+    /// `## <version>` section extracted off disk. `default` is required;
+    /// omitted only when empty. Capped server-side at 16KB per value
+    /// (`changelog_too_large`).
+    #[serde(skip_serializing_if = "map_is_empty")]
+    pub changelog: &'a BTreeMap<String, String>,
     /// The module's README locale map — `{ "default": <README.md>, "<tag>":
     /// <README.<tag>.md> }` read off disk at the module root. Optional and
     /// free-form; omitted when empty. Each value is capped client-side at 64KB
     /// to match the platform (`readme_too_large`).
-    #[serde(skip_serializing_if = "readme_map_is_empty")]
+    #[serde(skip_serializing_if = "map_is_empty")]
     pub readme: &'a BTreeMap<String, String>,
     /// The module's full live manifest as read off the dev tunnel
     /// (`get_tunnel_manifest`), passed through as opaque JSON. The platform
@@ -293,9 +298,9 @@ pub struct RecordModuleVersionInput<'a> {
     pub manifest: &'a serde_json::Value,
 }
 
-/// `skip_serializing_if` predicate for [`RecordModuleVersionInput::readme`].
+/// `skip_serializing_if` predicate for the borrowed changelog / readme maps.
 /// The field is a reference, so serde hands the predicate a double reference.
-fn readme_map_is_empty(map: &&BTreeMap<String, String>) -> bool {
+fn map_is_empty(map: &&BTreeMap<String, String>) -> bool {
     map.is_empty()
 }
 
@@ -1145,13 +1150,13 @@ mod tests {
         let mut server = Server::new();
         // A full manifest (pages, routes) must survive as-is — the platform
         // stores it on the version row and mounts the module's UI from it.
-        // README ships as a locale map: `default` (README.md) plus any
-        // `README.<tag>.md` translation, both frozen on the version row.
+        // Changelog and README both ship as locale maps: `default` plus any
+        // `<tag>` translation, all frozen on the version row.
         let _m = server
             .mock("POST", "/v1/modules/mod-uuid/versions")
             .match_header("authorization", "Bearer AT")
             .match_body(mockito::Matcher::JsonString(
-                r##"{"version":"0.1.0","changelog":"- initial release","readme":{"default":"# Media\n\nLong-form module docs.","zh-TW":"# 媒體\n\n模組長篇說明。"},"manifest":{"id":"mabc123","slug":"media","ui":{"defaultPages":[{"path":"/"}]},"routes":{"public":[{"method":"GET","path":"/public/me"}]}}}"##.into(),
+                r##"{"version":"0.1.0","changelog":{"default":"- initial release","zh-TW":"- 初始版本"},"readme":{"default":"# Media\n\nLong-form module docs.","zh-TW":"# 媒體\n\n模組長篇說明。"},"manifest":{"id":"mabc123","slug":"media","ui":{"defaultPages":[{"path":"/"}]},"routes":{"public":[{"method":"GET","path":"/public/me"}]}}}"##.into(),
             ))
             .with_status(201)
             .with_body(
@@ -1172,6 +1177,10 @@ mod tests {
             "ui": {"defaultPages": [{"path": "/"}]},
             "routes": {"public": [{"method": "GET", "path": "/public/me"}]}
         });
+        let changelog = BTreeMap::from([
+            ("default".to_string(), "- initial release".to_string()),
+            ("zh-TW".to_string(), "- 初始版本".to_string()),
+        ]);
         let readme = BTreeMap::from([
             (
                 "default".to_string(),
@@ -1186,7 +1195,7 @@ mod tests {
             "mod-uuid",
             &RecordModuleVersionInput {
                 version: "0.1.0",
-                changelog: Some("- initial release"),
+                changelog: &changelog,
                 readme: &readme,
                 manifest: &manifest,
             },
@@ -1198,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn record_module_version_omits_changelog_when_none() {
+    fn record_module_version_omits_changelog_when_empty() {
         let mut server = Server::new();
         let _m = server
             .mock("POST", "/v1/modules/mod-uuid/versions")
@@ -1223,7 +1232,7 @@ mod tests {
             "mod-uuid",
             &RecordModuleVersionInput {
                 version: "0.1.0",
-                changelog: None,
+                changelog: &BTreeMap::new(),
                 readme: &BTreeMap::new(),
                 manifest: &stub_manifest(),
             },
@@ -1250,7 +1259,7 @@ mod tests {
             "mod-uuid",
             &RecordModuleVersionInput {
                 version: "0.1.0",
-                changelog: None,
+                changelog: &BTreeMap::new(),
                 readme: &BTreeMap::new(),
                 manifest: &stub_manifest(),
             },
@@ -1283,7 +1292,7 @@ mod tests {
             "mod-uuid",
             &RecordModuleVersionInput {
                 version: "0.1.0",
-                changelog: Some("huge"),
+                changelog: &BTreeMap::from([("default".to_string(), "huge".to_string())]),
                 readme: &BTreeMap::new(),
                 manifest: &stub_manifest(),
             },
@@ -1314,7 +1323,7 @@ mod tests {
             "mod-uuid",
             &RecordModuleVersionInput {
                 version: "0.1.0",
-                changelog: None,
+                changelog: &BTreeMap::new(),
                 readme: &BTreeMap::new(),
                 manifest: &stub_manifest(),
             },
