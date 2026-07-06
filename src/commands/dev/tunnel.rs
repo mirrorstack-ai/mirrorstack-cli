@@ -37,6 +37,25 @@ type WsReader = SplitStream<WsStream>;
 /// exposing a memory-bomb surface to a misbehaving server.
 const MAX_INBOUND_FRAME_BYTES: usize = 1 << 20;
 
+/// Local Internal-scope endpoint the SDK serves the module manifest on. The
+/// heartbeat GETs this (through the CLI's own dev proxy) purely to read the
+/// hash response header — it is NOT the platform's `/v1/tunnel/manifest` route.
+const MODULE_MANIFEST_PATH: &str = "/__mirrorstack/platform/manifest";
+
+/// Response header the SDK stamps with its own manifest hash. The CLI forwards
+/// this value verbatim on the heartbeat; it never computes a hash itself, so
+/// the ping stays byte-consistent with what the platform reads on its fetch.
+const MANIFEST_HASH_HEADER: &str = "X-MS-Manifest-Hash";
+
+/// Hard cap on the heartbeat's manifest fetch. A wedged module must never
+/// stall ping/pong, so the GET is abandoned well inside the 30s beat.
+// Kept deliberately short: the manifest fetch is awaited inside the heartbeat
+// select! arm, so this bounds how long inbound-frame handling (server ping/pong)
+// can be delayed each beat. The endpoint is loopback-local (~tens of ms healthy;
+// a mid-restart module refuses the connection and fails fast), so 500ms is a
+// generous ceiling that keeps the beat responsive.
+const MANIFEST_FETCH_TIMEOUT: Duration = Duration::from_millis(500);
+
 mod uuid_lite {
     //! Tiny v4 UUID generator. We don't pull `uuid` for one call site — the
     //! envelope just wants a unique ID to correlate frames, not anything
@@ -133,6 +152,13 @@ pub(super) struct RegisterPayload<'a> {
     /// the register frame.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub internal_secret: Option<&'a str>,
+    /// The module's current manifest hash — the SDK's `X-MS-Manifest-Hash`
+    /// value, read verbatim off a local manifest fetch. None at register time
+    /// (the module isn't up yet when `open_tunnels` runs); the platform seeds
+    /// its stored hash from its own fetch and the first heartbeat. Serialized
+    /// only when present so older dispatch builds keep round-tripping register.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,7 +279,21 @@ pub(super) async fn open(
     .context("dev: register_ack timeout")??;
 
     let shutdown = Arc::new(Notify::new());
-    tokio::spawn(run_tunnel_loop(sink, stream, shutdown.clone()));
+    // Async client for the heartbeat's local manifest fetch. Client-level
+    // timeout guards every GET so a wedged module can't stall the ping loop.
+    let http = reqwest::Client::builder()
+        .timeout(MANIFEST_FETCH_TIMEOUT)
+        .build()
+        .context("dev: build manifest-hash http client")?;
+    tokio::spawn(run_tunnel_loop(
+        sink,
+        stream,
+        shutdown.clone(),
+        http,
+        register.local_url.to_string(),
+        ack.service_token.clone(),
+        register.internal_secret.map(str::to_string),
+    ));
 
     Ok(TunnelHandle {
         session_id: ack.session_id,
@@ -339,7 +379,15 @@ async fn await_register_ack(
 /// so a silently-dying tunnel doesn't leave the user wondering why
 /// inbound calls stop arriving. (See issue #29 for upgrading this to a
 /// liveness signal callers can poll.)
-async fn run_tunnel_loop(mut sink: WsSink, mut stream: WsReader, shutdown: Arc<Notify>) {
+async fn run_tunnel_loop(
+    mut sink: WsSink,
+    mut stream: WsReader,
+    shutdown: Arc<Notify>,
+    http: reqwest::Client,
+    local_url: String,
+    service_token: String,
+    internal_secret: Option<String>,
+) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     // The first tick fires immediately — consume it so the first ping is at
     // t=30s, not t=0. Delay the missed-tick behavior so a paused runtime
@@ -357,7 +405,20 @@ async fn run_tunnel_loop(mut sink: WsSink, mut stream: WsReader, shutdown: Arc<N
                 return;
             }
             _ = interval.tick() => {
-                let ping = Frame::new(FrameType::Ping, None);
+                // Read the module's current manifest hash off its local
+                // endpoint, timeout-guarded so a wedged module can never stall
+                // the beat. A successful read sends the SDK's hash verbatim; any
+                // error/timeout sends a payload-less ping so the tunnel keeps
+                // beating. Re-sending an unchanged hash is a no-op on the
+                // platform, so fetching every beat is cheap and safe.
+                let hash = fetch_manifest_hash(
+                    &http,
+                    &local_url,
+                    &service_token,
+                    internal_secret.as_deref(),
+                )
+                .await;
+                let ping = Frame::new(FrameType::Ping, ping_payload(hash.as_deref()));
                 if let Ok(body) = serde_json::to_string(&ping) {
                     if let Err(e) = sink.send(Message::Text(body)).await {
                         eprintln!("{} tunnel: ping send failed ({e}); closing tunnel", warn_prefix());
@@ -392,6 +453,45 @@ async fn run_tunnel_loop(mut sink: WsSink, mut stream: WsReader, shutdown: Arc<N
             }
         }
     }
+}
+
+/// Build a ping frame payload for a (possibly absent) manifest hash.
+/// `Some(hash)` → `{"manifest_hash": hash}`; `None` → payload-less ping
+/// (the frame's `payload` field stays absent).
+fn ping_payload(hash: Option<&str>) -> Option<serde_json::Value> {
+    hash.map(|h| serde_json::json!({ "manifest_hash": h }))
+}
+
+/// GET the module's local manifest endpoint and return the SDK's
+/// `X-MS-Manifest-Hash` RESPONSE header verbatim. The CLI never computes a
+/// hash — reading the SDK's own header keeps it single-producer-consistent
+/// with the platform, which reads the same header on its fetch.
+///
+/// The GET carries the platform token + internal secret the module's Internal
+/// scope requires, and is capped by [`MANIFEST_FETCH_TIMEOUT`]. Any failure —
+/// connect refused, timeout, missing/empty header — yields `None` so the caller
+/// sends a payload-less ping instead of stalling or dropping the tunnel.
+async fn fetch_manifest_hash(
+    client: &reqwest::Client,
+    local_url: &str,
+    service_token: &str,
+    internal_secret: Option<&str>,
+) -> Option<String> {
+    let mut req = client.get(format!("{local_url}{MODULE_MANIFEST_PATH}"));
+    if !service_token.is_empty() {
+        req = req.header("X-MS-Platform-Token", service_token);
+    }
+    if let Some(secret) = internal_secret {
+        req = req.header("X-MS-Internal-Secret", secret);
+    }
+    let resp = req.send().await.ok()?;
+    let hash = resp
+        .headers()
+        .get(MANIFEST_HASH_HEADER)?
+        .to_str()
+        .ok()?
+        .trim();
+    (!hash.is_empty()).then(|| hash.to_string())
 }
 
 #[cfg(test)]
@@ -439,12 +539,15 @@ mod tests {
             local_url: "http://localhost:8080",
             version: "0.1.0",
             internal_secret: None,
+            manifest_hash: None,
         };
         let s = serde_json::to_string(&p).unwrap();
         assert!(s.contains("\"module_id\":\"m_abc\""));
         assert!(s.contains("\"local_url\":\"http://localhost:8080\""));
         // Skip-if-none keeps the field absent for older dispatch builds.
         assert!(!s.contains("internal_secret"));
+        // manifest_hash is None at register time — also skipped.
+        assert!(!s.contains("manifest_hash"));
     }
 
     #[test]
@@ -454,9 +557,66 @@ mod tests {
             local_url: "http://localhost:8080",
             version: "0.1.0",
             internal_secret: Some("s3cret"),
+            manifest_hash: None,
         };
         let s = serde_json::to_string(&p).unwrap();
         assert!(s.contains("\"internal_secret\":\"s3cret\""));
+    }
+
+    #[test]
+    fn ping_payload_wraps_hash_when_present() {
+        let p = ping_payload(Some("sha256:abc")).unwrap();
+        assert_eq!(p, serde_json::json!({ "manifest_hash": "sha256:abc" }));
+    }
+
+    #[test]
+    fn ping_payload_none_stays_payload_less() {
+        assert!(ping_payload(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_manifest_hash_reads_response_header() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("GET", "/__mirrorstack/platform/manifest")
+            .match_header("x-ms-platform-token", "ptok")
+            .match_header("x-ms-internal-secret", "sec")
+            .with_status(200)
+            .with_header(MANIFEST_HASH_HEADER, "sha256:abc")
+            .with_body("{}")
+            .create_async()
+            .await;
+        let client = reqwest::Client::new();
+        let got = fetch_manifest_hash(&client, &server.url(), "ptok", Some("sec")).await;
+        assert_eq!(got.as_deref(), Some("sha256:abc"));
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn fetch_manifest_hash_absent_header_is_none() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("GET", "/__mirrorstack/platform/manifest")
+            .with_status(200)
+            .with_body("{}")
+            .create_async()
+            .await;
+        let client = reqwest::Client::new();
+        assert_eq!(
+            fetch_manifest_hash(&client, &server.url(), "", None).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_manifest_hash_connect_error_is_none() {
+        // Nothing listening on this port → connect refused → None, never a stall.
+        let client = reqwest::Client::builder()
+            .timeout(MANIFEST_FETCH_TIMEOUT)
+            .build()
+            .unwrap();
+        let got = fetch_manifest_hash(&client, "http://127.0.0.1:1", "", None).await;
+        assert_eq!(got, None);
     }
 
     #[test]

@@ -781,6 +781,10 @@ fn open_tunnels(
                     local_url: &module_local_url,
                     version: env!("CARGO_PKG_VERSION"),
                     internal_secret: Some(internal_secret),
+                    // The module isn't up yet at register (open_tunnels precedes
+                    // `docker compose up`); the platform seeds the hash from its
+                    // own fetch and the first heartbeat carries it.
+                    manifest_hash: None,
                 },
             )
             .await
