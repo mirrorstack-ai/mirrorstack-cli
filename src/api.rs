@@ -562,6 +562,191 @@ pub fn create_app(
     })
 }
 
+/// GET /v1/apps/{ref} — the caller's app by ID or slug (the platform
+/// resolves either shape). Member-scoped: `Ok(None)` on 404, which covers
+/// both "does not exist" and "exists but the caller isn't a member".
+pub fn get_app(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    app_ref: &str,
+) -> Result<Option<App>, ApiError> {
+    let endpoint = format!("{}/v1/apps/{}", apps_base.trim_end_matches('/'), app_ref);
+
+    let resp = http
+        .get(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(Some(resp.json::<App>()?));
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(unexpected_body_error(resp))
+}
+
+/// One file of an app deploy's manifest, as POSTed to the platform.
+#[derive(Debug, Serialize)]
+pub struct DeployFile<'a> {
+    /// Relative forward-slash path under the deploy root (the S3 key tail).
+    pub path: &'a str,
+    pub size: u64,
+    /// Lowercase hex SHA-256 of the file contents.
+    pub sha256: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateAppDeployInput<'a> {
+    pub env: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<&'a str>,
+    pub files: &'a [DeployFile<'a>],
+}
+
+/// One presigned S3 PUT the CLI must perform to ship a deploy file.
+#[derive(Debug, Deserialize)]
+pub struct UploadTarget {
+    /// The manifest path this URL uploads (maps back to the local file).
+    pub path: String,
+    pub url: String,
+    /// Headers the presigned URL was signed with — sent verbatim on the PUT.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreatedDeploy {
+    pub deploy_id: String,
+    pub uploads: Vec<UploadTarget>,
+}
+
+/// POST /v1/apps/{appId}/deploys — register a pending deploy and mint one
+/// presigned S3 PUT per manifest file (15-minute expiry). Owner/admin
+/// gated; the platform re-validates the manifest (≤500 files, ≤25MB
+/// total, safe relative paths) and surfaces violations as error envelopes.
+pub fn create_app_deploy(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    app_id: &str,
+    input: &CreateAppDeployInput,
+) -> Result<CreatedDeploy, ApiError> {
+    let endpoint = format!(
+        "{}/v1/apps/{}/deploys",
+        apps_base.trim_end_matches('/'),
+        app_id
+    );
+
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .json(input)
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<CreatedDeploy>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
+/// Body of a successful finalize: the deploy's new status (`ready`).
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // status is part of the API surface; deploy treats 2xx as ready
+pub struct DeployStatus {
+    pub status: String,
+}
+
+/// POST /v1/apps/{appId}/deploys/{deployId}/finalize — the platform spot
+/// checks the uploaded objects (HeadObject on a sample) and flips the
+/// deploy to `ready`. A missing object is a 4xx envelope, not a 200 with
+/// a failed status.
+pub fn finalize_app_deploy(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    app_id: &str,
+    deploy_id: &str,
+) -> Result<DeployStatus, ApiError> {
+    let endpoint = format!(
+        "{}/v1/apps/{}/deploys/{}/finalize",
+        apps_base.trim_end_matches('/'),
+        app_id,
+        deploy_id
+    );
+
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<DeployStatus>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // active_deploy_id is part of the API surface; deploy echoes its own id
+pub struct ActivatedStage {
+    pub active_deploy_id: String,
+}
+
+/// POST /v1/apps/{appId}/stages/{env}/activate — point the stage at a
+/// `ready` deploy. The platform rewrites the edge manifest so the change
+/// is live within the worker's cache TTL (~30s).
+pub fn activate_app_stage(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    app_id: &str,
+    env: &str,
+    deploy_id: &str,
+) -> Result<ActivatedStage, ApiError> {
+    #[derive(Serialize)]
+    struct Body<'a> {
+        deploy_id: &'a str,
+    }
+    let endpoint = format!(
+        "{}/v1/apps/{}/stages/{}/activate",
+        apps_base.trim_end_matches('/'),
+        app_id,
+        env
+    );
+
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .json(&Body { deploy_id })
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<ActivatedStage>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
 /// Body of a successful `POST /v1/auth/sessions/refresh`. The platform
 /// rotates the refresh token on every refresh (replay defense), so we
 /// must persist the new one back to credentials. expires_at is RFC3339
@@ -645,6 +830,34 @@ pub fn revoke_session(
         return Err(ApiError::Unauthenticated);
     }
     Err(unexpected_body_error(resp))
+}
+
+/// Common tail for non-success responses that may carry the platform's
+/// structured error envelope: `{"error":{code,message}}` becomes
+/// [`ApiError::Server`] so callers can branch on the code, anything else
+/// falls through to [`ApiError::Unexpected`] with the raw body.
+fn envelope_error(resp: Response) -> ApiError {
+    let status = resp.status().as_u16();
+    let body = match http::read_capped(resp) {
+        Ok(b) => b,
+        Err(e) => {
+            return ApiError::Unexpected {
+                status,
+                body: format!("(read body failed: {e})"),
+            };
+        }
+    };
+    if let Ok(env) = serde_json::from_slice::<ErrorEnvelope>(&body) {
+        return ApiError::Server {
+            status,
+            code: env.error.code,
+            message: env.error.message,
+        };
+    }
+    ApiError::Unexpected {
+        status,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    }
 }
 
 /// Common tail for unexpected (non-success, non-typed) responses: read
@@ -1462,6 +1675,196 @@ mod tests {
             ApiError::Server { status, code, .. } => {
                 assert_eq!(status, 503);
                 assert_eq!(code, "tunnel_offline");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_app_200_returns_some() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/apps/my-app")
+            .match_header("authorization", "Bearer AT")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "id": "a-1",
+                    "name": "My App",
+                    "slug": "my-app",
+                    "owner_id": "u-1"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let a = get_app(&test_client(), &server.url(), "AT", "my-app").expect("ok");
+        assert!(a.is_some());
+        assert_eq!(a.unwrap().id, "a-1");
+    }
+
+    #[test]
+    fn get_app_404_returns_none() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/apps/nope")
+            .with_status(404)
+            .with_body(r#"{"error":{"code":"not_found","message":"app not found"}}"#)
+            .create();
+
+        let a = get_app(&test_client(), &server.url(), "AT", "nope").expect("ok");
+        assert!(a.is_none());
+    }
+
+    #[test]
+    fn create_app_deploy_success() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/a-1/deploys")
+            .match_header("authorization", "Bearer AT")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"env":"production","note":"first ship","files":[{"path":"index.html","size":5,"sha256":"aa"}]}"#.into(),
+            ))
+            .with_status(201)
+            .with_body(
+                json!({
+                    "deploy_id": "d-1",
+                    "uploads": [{
+                        "path": "index.html",
+                        "url": "https://s3.example/put",
+                        "headers": {"Content-Type": "text/html"}
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let d = create_app_deploy(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "a-1",
+            &CreateAppDeployInput {
+                env: "production",
+                note: Some("first ship"),
+                files: &[DeployFile {
+                    path: "index.html",
+                    size: 5,
+                    sha256: "aa",
+                }],
+            },
+        )
+        .expect("ok");
+        assert_eq!(d.deploy_id, "d-1");
+        assert_eq!(d.uploads.len(), 1);
+        assert_eq!(d.uploads[0].path, "index.html");
+        assert_eq!(
+            d.uploads[0].headers.get("Content-Type").map(String::as_str),
+            Some("text/html")
+        );
+    }
+
+    #[test]
+    fn create_app_deploy_omits_note_when_none_and_surfaces_422() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/a-1/deploys")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"env":"production","files":[{"path":"index.html","size":5,"sha256":"aa"}]}"#
+                    .into(),
+            ))
+            .with_status(422)
+            .with_body(
+                r#"{"error":{"code":"deploy_too_large","message":"total size exceeds 25MB"}}"#,
+            )
+            .create();
+
+        let err = create_app_deploy(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "a-1",
+            &CreateAppDeployInput {
+                env: "production",
+                note: None,
+                files: &[DeployFile {
+                    path: "index.html",
+                    size: 5,
+                    sha256: "aa",
+                }],
+            },
+        )
+        .unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 422);
+                assert_eq!(code, "deploy_too_large");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finalize_app_deploy_success() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/a-1/deploys/d-1/finalize")
+            .match_header("authorization", "Bearer AT")
+            .with_status(200)
+            .with_body(json!({"status": "ready"}).to_string())
+            .create();
+
+        let s = finalize_app_deploy(&test_client(), &server.url(), "AT", "a-1", "d-1").expect("ok");
+        assert_eq!(s.status, "ready");
+    }
+
+    #[test]
+    fn activate_app_stage_success() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/a-1/stages/production/activate")
+            .match_header("authorization", "Bearer AT")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"deploy_id":"d-1"}"#.into(),
+            ))
+            .with_status(200)
+            .with_body(json!({"active_deploy_id": "d-1"}).to_string())
+            .create();
+
+        let a = activate_app_stage(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "a-1",
+            "production",
+            "d-1",
+        )
+        .expect("ok");
+        assert_eq!(a.active_deploy_id, "d-1");
+    }
+
+    #[test]
+    fn activate_app_stage_409_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/a-1/stages/production/activate")
+            .with_status(409)
+            .with_body(r#"{"error":{"code":"deploy_not_ready","message":"deploy is not ready"}}"#)
+            .create();
+
+        let err = activate_app_stage(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "a-1",
+            "production",
+            "d-1",
+        )
+        .unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 409);
+                assert_eq!(code, "deploy_not_ready");
             }
             other => panic!("expected Server, got {other:?}"),
         }

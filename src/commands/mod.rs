@@ -79,6 +79,7 @@ enum Command {
     /// into apps).
     Module(module::ModuleArgs),
     /// Manage applications on the platform.
+    #[command(visible_alias = "app")]
     Apps(app::AppArgs),
     /// Run modules locally with supporting services. Scans go.work for
     /// monorepo mode; falls back to single-module if only main.go exists.

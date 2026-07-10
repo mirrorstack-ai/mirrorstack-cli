@@ -18,6 +18,8 @@ use super::{
     ENV_WEB_URL, ok_mark, resolve_base, session_expired,
 };
 
+mod deploy;
+
 #[derive(Args)]
 pub struct AppArgs {
     #[command(subcommand)]
@@ -28,6 +30,10 @@ pub struct AppArgs {
 enum AppCommand {
     /// Create a new application on the platform.
     Create(CreateArgs),
+    /// Deploy a static build directory to app hosting
+    /// (`https://<slug>.mirrorstack.app`). Uploads, finalizes, and
+    /// activates unless --no-activate.
+    Deploy(deploy::DeployArgs),
 }
 
 #[derive(Args)]
@@ -46,6 +52,7 @@ struct CreateArgs {
 pub fn run(args: AppArgs) -> Result<()> {
     match args.command {
         AppCommand::Create(c) => create(c),
+        AppCommand::Deploy(d) => deploy::run(d),
     }
 }
 
@@ -175,7 +182,7 @@ fn derive_slug(name: &str) -> String {
     out
 }
 
-fn with_spinner<T, F>(message: &str, f: F) -> T
+pub(super) fn with_spinner<T, F>(message: &str, f: F) -> T
 where
     F: FnOnce() -> T,
 {
