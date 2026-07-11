@@ -12,16 +12,18 @@ mod logout;
 mod module;
 mod whoami;
 
-/// Default api-platform account-service host. Override per-invocation with
+/// Default api-platform account-service base. Prod path-routes each service
+/// under an API-Gateway mapping key (`/account`, `/apps`, `/dispatch`) — a
+/// bare-host request 403s at the edge. Override per-invocation with
 /// `MIRRORSTACK_API_URL` (or via `.env`).
-pub(crate) const DEFAULT_API_BASE: &str = "https://api.mirrorstack.ai";
+pub(crate) const DEFAULT_API_BASE: &str = "https://api.mirrorstack.ai/account";
 
 /// Default api-platform applications-service host. Modules and apps live
 /// on a separate Lambda from the account service, but in prod both are
 /// exposed under the same `api.mirrorstack.ai` hostname (path-routed at
 /// the ingress). Local dev uses port 8082 — set via `.env`. Override
 /// with `MIRRORSTACK_APPS_API_URL`.
-pub(crate) const DEFAULT_APPS_API_BASE: &str = "https://api.mirrorstack.ai";
+pub(crate) const DEFAULT_APPS_API_BASE: &str = "https://api.mirrorstack.ai/apps";
 
 /// Default web-account host. Override with `MIRRORSTACK_WEB_URL`.
 pub(crate) const DEFAULT_WEB_BASE: &str = "https://account.mirrorstack.ai";
@@ -30,7 +32,7 @@ pub(crate) const DEFAULT_WEB_BASE: &str = "https://account.mirrorstack.ai";
 /// reached under the same `api.mirrorstack.ai` hostname in prod via
 /// path-routed ingress. Local dev uses port 8083 — set via `.env`.
 /// Override with `MIRRORSTACK_DISPATCH_URL`.
-pub(crate) const DEFAULT_DISPATCH_BASE: &str = "https://api.mirrorstack.ai";
+pub(crate) const DEFAULT_DISPATCH_BASE: &str = "https://api.mirrorstack.ai/dispatch";
 
 pub(crate) const ENV_API_URL: &str = "MIRRORSTACK_API_URL";
 pub(crate) const ENV_APPS_API_URL: &str = "MIRRORSTACK_APPS_API_URL";

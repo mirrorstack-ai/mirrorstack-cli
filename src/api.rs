@@ -1770,8 +1770,7 @@ mod tests {
         let _m = server
             .mock("POST", "/v1/apps/a-1/deploys")
             .match_body(mockito::Matcher::JsonString(
-                r#"{"env":"prod","files":[{"path":"index.html","size":5,"sha256":"aa"}]}"#
-                    .into(),
+                r#"{"env":"prod","files":[{"path":"index.html","size":5,"sha256":"aa"}]}"#.into(),
             ))
             .with_status(422)
             .with_body(
@@ -1831,15 +1830,8 @@ mod tests {
             .with_body(json!({"active_deploy_id": "d-1"}).to_string())
             .create();
 
-        let a = activate_app_stage(
-            &test_client(),
-            &server.url(),
-            "AT",
-            "a-1",
-            "prod",
-            "d-1",
-        )
-        .expect("ok");
+        let a = activate_app_stage(&test_client(), &server.url(), "AT", "a-1", "prod", "d-1")
+            .expect("ok");
         assert_eq!(a.active_deploy_id, "d-1");
     }
 
@@ -1852,15 +1844,8 @@ mod tests {
             .with_body(r#"{"error":{"code":"deploy_not_ready","message":"deploy is not ready"}}"#)
             .create();
 
-        let err = activate_app_stage(
-            &test_client(),
-            &server.url(),
-            "AT",
-            "a-1",
-            "prod",
-            "d-1",
-        )
-        .unwrap_err();
+        let err = activate_app_stage(&test_client(), &server.url(), "AT", "a-1", "prod", "d-1")
+            .unwrap_err();
         match err {
             ApiError::Server { status, code, .. } => {
                 assert_eq!(status, 409);

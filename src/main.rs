@@ -50,9 +50,6 @@ fn find_dotenv_upward() -> Option<PathBuf> {
         if candidate.is_file() {
             return Some(candidate);
         }
-        match dir.parent() {
-            Some(parent) => dir = parent,
-            None => return None,
-        }
+        dir = dir.parent()?;
     }
 }
