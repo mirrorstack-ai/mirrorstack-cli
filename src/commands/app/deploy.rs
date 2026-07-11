@@ -49,7 +49,7 @@ pub struct DeployArgs {
     #[arg(long)]
     app: String,
     /// Target stage environment.
-    #[arg(long, default_value = "production")]
+    #[arg(long, default_value = "prod")]
     env: String,
     /// Build directory to ship. Defaults to cwd. Dotfiles and
     /// node_modules never upload.
