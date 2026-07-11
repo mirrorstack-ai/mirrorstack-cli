@@ -1,4 +1,4 @@
-//! `mirrorstack app deploy` — ship a static build directory to the
+//! `mirrorstack app web deploy` — ship a static build directory to the
 //! platform's app hosting, served on `https://<slug>.mirrorstack.app`.
 //!
 //! Flow: walk the build dir into a manifest (path + size + sha256), POST

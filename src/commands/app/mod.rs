@@ -30,6 +30,22 @@ pub struct AppArgs {
 enum AppCommand {
     /// Create a new application on the platform.
     Create(CreateArgs),
+    /// Manage the app's web frontend (static hosting on
+    /// `https://<slug>.mirrorstack.app`).
+    Web(WebArgs),
+    /// Manage developer modules (the per-developer reusable units installed
+    /// into apps).
+    Module(super::module::ModuleArgs),
+}
+
+#[derive(Args)]
+pub struct WebArgs {
+    #[command(subcommand)]
+    command: WebCommand,
+}
+
+#[derive(Subcommand)]
+enum WebCommand {
     /// Deploy a static build directory to app hosting
     /// (`https://<slug>.mirrorstack.app`). Uploads, finalizes, and
     /// activates unless --no-activate.
@@ -52,7 +68,10 @@ struct CreateArgs {
 pub fn run(args: AppArgs) -> Result<()> {
     match args.command {
         AppCommand::Create(c) => create(c),
-        AppCommand::Deploy(d) => deploy::run(d),
+        AppCommand::Web(w) => match w.command {
+            WebCommand::Deploy(d) => deploy::run(d),
+        },
+        AppCommand::Module(m) => super::module::run(m),
     }
 }
 

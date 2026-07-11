@@ -75,8 +75,10 @@ enum Command {
     Logout(logout::LogoutArgs),
     /// Print the currently signed-in user.
     Whoami(whoami::WhoamiArgs),
-    /// Manage developer modules (the per-developer reusable units installed
-    /// into apps).
+    /// Deprecated: moved to `mirrorstack app module`. This hidden alias
+    /// keeps existing scripts working and will be removed in a future
+    /// release.
+    #[command(hide = true)]
     Module(module::ModuleArgs),
     /// Manage applications on the platform.
     #[command(visible_alias = "app")]

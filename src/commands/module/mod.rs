@@ -1,4 +1,6 @@
-//! `mirrorstack module …` — developer module management.
+//! `mirrorstack app module …` — developer module management. (The old
+//! top-level `mirrorstack module …` spelling still works as a hidden,
+//! deprecated alias.)
 //!
 //! Today: `module init` registers the module on the platform AND scaffolds a
 //! local source tree from the SDK template. The scaffolded tree is what
@@ -731,7 +733,7 @@ fn get_owned_module(
     match api::get_module(client, apps_base, access_token, slug) {
         Ok(Some(m)) => Ok(m),
         Ok(None) => Err(anyhow!(
-            "module '{slug}' not found on the platform (run `mirrorstack module register` first)"
+            "module '{slug}' not found on the platform (run `mirrorstack app module register` first)"
         )),
         Err(ApiError::Unauthenticated) => Err(session_expired()),
         Err(e) => Err(e.into()),
@@ -767,7 +769,7 @@ fn record_error_hint(code: &str) -> &'static str {
 fn deploy_error_hint(code: &str) -> &'static str {
     match code {
         "not_found" => {
-            " (the version record vanished mid-deploy — re-run `mirrorstack module deploy`)"
+            " (the version record vanished mid-deploy — re-run `mirrorstack app module deploy`)"
         }
         "invoke_target_invalid" => {
             " (expected a Lambda function name or full ARN, optional :qualifier, [A-Za-z0-9_-]{1,140})"
@@ -1087,7 +1089,7 @@ mod tests {
 
     #[test]
     fn deploy_error_hint_for_known_codes() {
-        assert!(deploy_error_hint("not_found").contains("mirrorstack module deploy"));
+        assert!(deploy_error_hint("not_found").contains("mirrorstack app module deploy"));
         assert!(deploy_error_hint("invoke_target_invalid").contains("ARN"));
         assert_eq!(deploy_error_hint("something_else"), "");
     }
