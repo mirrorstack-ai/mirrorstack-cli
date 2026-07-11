@@ -1822,7 +1822,7 @@ mod tests {
     fn activate_app_stage_success() {
         let mut server = Server::new();
         let _m = server
-            .mock("POST", "/v1/apps/a-1/stages/production/activate")
+            .mock("POST", "/v1/apps/a-1/stages/prod/activate")
             .match_header("authorization", "Bearer AT")
             .match_body(mockito::Matcher::JsonString(
                 r#"{"deploy_id":"d-1"}"#.into(),
@@ -1847,7 +1847,7 @@ mod tests {
     fn activate_app_stage_409_surfaces_code() {
         let mut server = Server::new();
         let _m = server
-            .mock("POST", "/v1/apps/a-1/stages/production/activate")
+            .mock("POST", "/v1/apps/a-1/stages/prod/activate")
             .with_status(409)
             .with_body(r#"{"error":{"code":"deploy_not_ready","message":"deploy is not ready"}}"#)
             .create();
