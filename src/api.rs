@@ -1723,7 +1723,7 @@ mod tests {
             .mock("POST", "/v1/apps/a-1/deploys")
             .match_header("authorization", "Bearer AT")
             .match_body(mockito::Matcher::JsonString(
-                r#"{"env":"production","note":"first ship","files":[{"path":"index.html","size":5,"sha256":"aa"}]}"#.into(),
+                r#"{"env":"prod","note":"first ship","files":[{"path":"index.html","size":5,"sha256":"aa"}]}"#.into(),
             ))
             .with_status(201)
             .with_body(
@@ -1745,7 +1745,7 @@ mod tests {
             "AT",
             "a-1",
             &CreateAppDeployInput {
-                env: "production",
+                env: "prod",
                 note: Some("first ship"),
                 files: &[DeployFile {
                     path: "index.html",
@@ -1770,7 +1770,7 @@ mod tests {
         let _m = server
             .mock("POST", "/v1/apps/a-1/deploys")
             .match_body(mockito::Matcher::JsonString(
-                r#"{"env":"production","files":[{"path":"index.html","size":5,"sha256":"aa"}]}"#
+                r#"{"env":"prod","files":[{"path":"index.html","size":5,"sha256":"aa"}]}"#
                     .into(),
             ))
             .with_status(422)
@@ -1785,7 +1785,7 @@ mod tests {
             "AT",
             "a-1",
             &CreateAppDeployInput {
-                env: "production",
+                env: "prod",
                 note: None,
                 files: &[DeployFile {
                     path: "index.html",
@@ -1836,7 +1836,7 @@ mod tests {
             &server.url(),
             "AT",
             "a-1",
-            "production",
+            "prod",
             "d-1",
         )
         .expect("ok");
@@ -1857,7 +1857,7 @@ mod tests {
             &server.url(),
             "AT",
             "a-1",
-            "production",
+            "prod",
             "d-1",
         )
         .unwrap_err();
