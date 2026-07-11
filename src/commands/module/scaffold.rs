@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn render_versions_default_is_dev_prerelease() {
-        // Pre-1.0 dev builds use `v0.1.0-dev` so `mirrorstack module deploy` can
+        // Pre-1.0 dev builds use `v0.1.0-dev` so `mirrorstack app module deploy` can
         // refuse `-dev` versions in CI (--yes) by convention. Promotion
         // happens at deploy time. See docs/module-identity-and-storage-prefix.md.
         let out = render(MAIN_GO, &ins("media", "Media"));

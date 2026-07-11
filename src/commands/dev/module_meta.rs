@@ -47,7 +47,7 @@ pub(super) fn read_module_id(module_dir: &Path) -> Result<String> {
     let meta = read_module_meta(module_dir)?;
     if meta.id.is_empty() {
         return Err(anyhow!(
-            "dev: module {} has no ID set. Run `mirrorstack modules register` first.",
+            "dev: module {} has no ID set. Run `mirrorstack app module register` first.",
             module_dir.display()
         ));
     }
@@ -326,7 +326,7 @@ func main() {
         Name: "Media",
         Icon: "extension",
         Versions: map[string]system.MigrationVersions{
-            // `-dev` marks local iteration; `mirrorstack module deploy`
+            // `-dev` marks local iteration; `mirrorstack app module deploy`
             // promotes it before shipping.
             "v0.1.0-dev": {App: "0001"},
         },

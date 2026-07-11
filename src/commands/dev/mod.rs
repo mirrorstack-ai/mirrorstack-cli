@@ -165,7 +165,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         let reason = if slug.is_empty() {
             "no main.go"
         } else {
-            "no ID — run `mirrorstack module register`"
+            "no ID — run `mirrorstack app module register`"
         };
         eprintln!(
             "  {} {} ({})",
@@ -177,7 +177,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
 
     if ready.is_empty() {
         return Err(anyhow!(
-            "no registered modules to run. Run `mirrorstack module register` first."
+            "no registered modules to run. Run `mirrorstack app module register` first."
         ));
     }
 
@@ -795,7 +795,7 @@ fn open_tunnels(
             }
             Err(tunnel::RegisterError::ModuleNotYours) => {
                 return Err(anyhow!(
-                    "dev: module {} isn't owned by you — only the module owner can open a dev tunnel.\nIf you scaffolded with `mirrorstack module init`, your `Config.ID` should match the platform's record; re-check it under `mirrorstack module list`.",
+                    "dev: module {} isn't owned by you — only the module owner can open a dev tunnel.\nIf you scaffolded with `mirrorstack app module init`, your `Config.ID` should match the platform's record; re-check it under `mirrorstack app module list`.",
                     m.dir.display()
                 ));
             }
