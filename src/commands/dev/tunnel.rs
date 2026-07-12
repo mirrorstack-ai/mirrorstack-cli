@@ -13,6 +13,7 @@
 //! deferred to Phase 3 per the design doc; this module's enum intentionally
 //! enumerates them so that PR only adds a handler arm.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -345,15 +346,16 @@ pub(super) async fn open(
         .timeout(MANIFEST_FETCH_TIMEOUT)
         .build()
         .context("dev: build manifest-hash http client")?;
-    tokio::spawn(run_tunnel_loop(
-        sink,
-        stream,
-        shutdown.clone(),
-        http,
-        register.local_url.to_string(),
-        ack.service_token.clone(),
-        register.internal_secret.map(str::to_string),
-    ));
+    // Built once per connection and shared via `Arc`: `local_url`,
+    // `service_token`, and `internal_secret` are invariant for the whole
+    // tunnel's lifetime, so every spawned relay task should bump a refcount
+    // rather than re-allocating its own copy of these strings.
+    let ctx = Arc::new(RelayCtx {
+        local_url: register.local_url.to_string(),
+        service_token: ack.service_token.clone(),
+        internal_secret: register.internal_secret.map(str::to_string),
+    });
+    tokio::spawn(run_tunnel_loop(sink, stream, shutdown.clone(), http, ctx));
 
     Ok(TunnelHandle {
         session_id: ack.session_id,
@@ -434,6 +436,17 @@ async fn await_register_ack(
     }
 }
 
+/// Connection-invariant values every relayed request needs: the local
+/// module's base URL and the CLI-minted auth its Internal scope requires.
+/// Built once per tunnel connection ([`open`]) and shared via `Arc` so each
+/// spawned relay task ([`spawn_rpc_relay_if_req`]) clones a cheap refcount
+/// instead of re-allocating these strings on every inbound `rpc.req`.
+struct RelayCtx {
+    local_url: String,
+    service_token: String,
+    internal_secret: Option<String>,
+}
+
 /// Long-running tunnel loop: ping every 30s, respond to server pings,
 /// shut down on signal. Surfaces transport failures via `warn_prefix()`
 /// so a silently-dying tunnel doesn't leave the user wondering why
@@ -444,9 +457,7 @@ async fn run_tunnel_loop(
     mut stream: WsReader,
     shutdown: Arc<Notify>,
     http: reqwest::Client,
-    local_url: String,
-    service_token: String,
-    internal_secret: Option<String>,
+    ctx: Arc<RelayCtx>,
 ) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     // The first tick fires immediately — consume it so the first ping is at
@@ -478,9 +489,9 @@ async fn run_tunnel_loop(
                 // platform, so fetching every beat is cheap and safe.
                 let hash = fetch_manifest_hash(
                     &http,
-                    &local_url,
-                    &service_token,
-                    internal_secret.as_deref(),
+                    &ctx.local_url,
+                    &ctx.service_token,
+                    ctx.internal_secret.as_deref(),
                 )
                 .await;
                 let ping = Frame::new(FrameType::Ping, ping_payload(hash.as_deref()));
@@ -499,25 +510,20 @@ async fn run_tunnel_loop(
             }
             msg = stream.next() => {
                 match msg {
-                    Some(Ok(Message::Text(t))) => {
-                        spawn_rpc_relay_if_req(
-                            &t.to_string(),
-                            &tx,
-                            &http,
-                            &local_url,
-                            &service_token,
-                            &internal_secret,
-                        );
-                    }
-                    Some(Ok(Message::Binary(b))) => {
-                        spawn_rpc_relay_if_req(
-                            &String::from_utf8_lossy(&b),
-                            &tx,
-                            &http,
-                            &local_url,
-                            &service_token,
-                            &internal_secret,
-                        );
+                    // Text and Binary both just carry a JSON frame — extract
+                    // the string once (borrowed where possible; only Binary's
+                    // lossy UTF-8 conversion may allocate) and relay through
+                    // one call, rather than duplicating the relay call per
+                    // variant. `t.to_string()` would force-copy the whole
+                    // frame before we even know it's an `rpc.req` worth
+                    // acting on, so borrow via `as_str()` instead.
+                    Some(Ok(m @ (Message::Text(_) | Message::Binary(_)))) => {
+                        let text: Cow<'_, str> = match &m {
+                            Message::Text(t) => Cow::Borrowed(t.as_str()),
+                            Message::Binary(b) => String::from_utf8_lossy(b),
+                            _ => unreachable!(),
+                        };
+                        spawn_rpc_relay_if_req(&text, &tx, &http, &ctx);
                     }
                     Some(Ok(Message::Ping(p))) => {
                         let _ = sink.send(Message::Pong(p)).await;
@@ -560,9 +566,7 @@ fn spawn_rpc_relay_if_req(
     text: &str,
     tx: &mpsc::UnboundedSender<Message>,
     http: &reqwest::Client,
-    local_url: &str,
-    service_token: &str,
-    internal_secret: &Option<String>,
+    ctx: &Arc<RelayCtx>,
 ) {
     let frame: Frame = match serde_json::from_str(text) {
         Ok(f) => f,
@@ -600,9 +604,7 @@ fn spawn_rpc_relay_if_req(
     tokio::spawn(relay_rpc_req(
         tx.clone(),
         http.clone(),
-        local_url.to_string(),
-        service_token.to_string(),
-        internal_secret.clone(),
+        ctx.clone(),
         frame.id,
         req,
     ));
@@ -613,17 +615,15 @@ fn spawn_rpc_relay_if_req(
 async fn relay_rpc_req(
     tx: mpsc::UnboundedSender<Message>,
     http: reqwest::Client,
-    local_url: String,
-    service_token: String,
-    internal_secret: Option<String>,
+    ctx: Arc<RelayCtx>,
     corr_id: String,
     req: RpcReqPayload,
 ) {
     let mut frame = match relay_rpc_req_inner(
         &http,
-        &local_url,
-        &service_token,
-        internal_secret.as_deref(),
+        &ctx.local_url,
+        &ctx.service_token,
+        ctx.internal_secret.as_deref(),
         &req,
     )
     .await
@@ -639,6 +639,27 @@ async fn relay_rpc_req(
         // shutting down — nothing left to report it to.
         let _ = tx.send(Message::Text(body));
     }
+}
+
+/// Attach the CLI-minted `X-MS-Platform-Token`/`X-MS-Internal-Secret`
+/// headers a module's Internal scope requires. Shared by
+/// [`fetch_manifest_hash`] (heartbeat GET) and [`relay_rpc_req_inner`]
+/// (relayed request) — both need the identical conditional-header logic:
+/// the token header is only sent when non-empty (pre-register-ack calls
+/// have none yet), the secret header only when the module was started
+/// with one.
+fn attach_internal_auth(
+    mut builder: reqwest::RequestBuilder,
+    service_token: &str,
+    internal_secret: Option<&str>,
+) -> reqwest::RequestBuilder {
+    if !service_token.is_empty() {
+        builder = builder.header("X-MS-Platform-Token", service_token);
+    }
+    if let Some(secret) = internal_secret {
+        builder = builder.header("X-MS-Internal-Secret", secret);
+    }
+    builder
 }
 
 /// Perform the actual local HTTP call for [`relay_rpc_req`]. Split out so
@@ -706,12 +727,7 @@ async fn relay_rpc_req_inner(
     // enforces these on every call, dispatch strips them off the original
     // inbound request before building the relay payload, so the CLI is the
     // one place that (re)attaches them.
-    if !service_token.is_empty() {
-        builder = builder.header("X-MS-Platform-Token", service_token);
-    }
-    if let Some(secret) = internal_secret {
-        builder = builder.header("X-MS-Internal-Secret", secret);
-    }
+    builder = attach_internal_auth(builder, service_token, internal_secret);
     if !body_bytes.is_empty() {
         builder = builder.body(body_bytes);
     }
@@ -780,13 +796,11 @@ async fn fetch_manifest_hash(
     service_token: &str,
     internal_secret: Option<&str>,
 ) -> Option<String> {
-    let mut req = client.get(format!("{local_url}{MODULE_MANIFEST_PATH}"));
-    if !service_token.is_empty() {
-        req = req.header("X-MS-Platform-Token", service_token);
-    }
-    if let Some(secret) = internal_secret {
-        req = req.header("X-MS-Internal-Secret", secret);
-    }
+    let req = attach_internal_auth(
+        client.get(format!("{local_url}{MODULE_MANIFEST_PATH}")),
+        service_token,
+        internal_secret,
+    );
     let resp = req.send().await.ok()?;
     let hash = resp
         .headers()
@@ -800,6 +814,31 @@ async fn fetch_manifest_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pull the next message off `rx`, assert it's `Message::Text`, and
+    /// parse it as a [`Frame`]. Shared by the `relay_rpc_req_*` tests below
+    /// — each previously duplicated this same unwrap-then-parse block.
+    async fn recv_frame(rx: &mut mpsc::UnboundedReceiver<Message>) -> Frame {
+        let msg = rx.recv().await.expect("expected a relay reply");
+        let Message::Text(text) = msg else {
+            panic!("expected a text message")
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// Build a [`RelayCtx`] for tests — a thin `Arc::new` wrapper so call
+    /// sites read the same as the pre-refactor plain-argument calls.
+    fn test_ctx(
+        local_url: impl Into<String>,
+        service_token: impl Into<String>,
+        internal_secret: Option<&str>,
+    ) -> Arc<RelayCtx> {
+        Arc::new(RelayCtx {
+            local_url: local_url.into(),
+            service_token: service_token.into(),
+            internal_secret: internal_secret.map(str::to_string),
+        })
+    }
 
     #[test]
     fn frame_serialization_round_trip() {
@@ -1029,19 +1068,13 @@ mod tests {
         relay_rpc_req(
             tx,
             reqwest::Client::new(),
-            server.url(),
-            "ptok".to_string(),
-            Some("sec".to_string()),
+            test_ctx(server.url(), "ptok", Some("sec")),
             "frm_corr".to_string(),
             req,
         )
         .await;
 
-        let msg = rx.recv().await.expect("expected a relay reply");
-        let Message::Text(text) = msg else {
-            panic!("expected a text message")
-        };
-        let frame: Frame = serde_json::from_str(&text).unwrap();
+        let frame = recv_frame(&mut rx).await;
         assert_eq!(frame.frame_type, FrameType::RpcResp);
         assert_eq!(frame.corr_id.as_deref(), Some("frm_corr"));
         let payload = frame.payload.unwrap();
@@ -1065,19 +1098,13 @@ mod tests {
         relay_rpc_req(
             tx,
             reqwest::Client::new(),
-            "http://127.0.0.1:1".to_string(),
-            String::new(),
-            None,
+            test_ctx("http://127.0.0.1:1", "", None),
             "frm_corr2".to_string(),
             req,
         )
         .await;
 
-        let msg = rx.recv().await.expect("expected a relay reply");
-        let Message::Text(text) = msg else {
-            panic!("expected a text message")
-        };
-        let frame: Frame = serde_json::from_str(&text).unwrap();
+        let frame = recv_frame(&mut rx).await;
         assert_eq!(frame.frame_type, FrameType::RpcErr);
         assert_eq!(frame.corr_id.as_deref(), Some("frm_corr2"));
         assert_eq!(frame.payload.unwrap()["code"], "local_module_unreachable");
@@ -1110,19 +1137,13 @@ mod tests {
         relay_rpc_req(
             tx,
             reqwest::Client::new(),
-            server.url(),
-            String::new(),
-            None,
+            test_ctx(server.url(), "", None),
             "frm_corr3".to_string(),
             req,
         )
         .await;
 
-        let msg = rx.recv().await.expect("expected a relay reply");
-        let Message::Text(text) = msg else {
-            panic!("expected a text message")
-        };
-        let frame: Frame = serde_json::from_str(&text).unwrap();
+        let frame = recv_frame(&mut rx).await;
         assert_eq!(frame.frame_type, FrameType::RpcErr);
         assert_eq!(frame.payload.unwrap()["code"], "local_body_too_large");
     }
@@ -1153,25 +1174,23 @@ mod tests {
         relay_rpc_req(
             tx,
             reqwest::Client::new(),
-            server.url(),
-            String::new(),
-            None,
+            test_ctx(server.url(), "", None),
             "frm_corr3b".to_string(),
             req,
         )
         .await;
 
-        let msg = rx.recv().await.expect("expected a relay reply");
-        let Message::Text(text) = msg else {
-            panic!("expected a text message")
-        };
+        let frame = recv_frame(&mut rx).await;
+        // Re-encode the parsed frame to check its size: JSON key order may
+        // differ from the bytes actually sent over the channel (serde_json
+        // parses objects into a sorted map), but the byte *count* is
+        // unaffected by key order, so this still pins the same transport-cap
+        // regression guard.
+        let encoded_len = serde_json::to_string(&frame).unwrap().len();
         assert!(
-            text.len() <= MAX_INBOUND_FRAME_BYTES,
-            "encoded rpc.resp frame ({} bytes) exceeds the transport cap ({} bytes)",
-            text.len(),
-            MAX_INBOUND_FRAME_BYTES
+            encoded_len <= MAX_INBOUND_FRAME_BYTES,
+            "encoded rpc.resp frame ({encoded_len} bytes) exceeds the transport cap ({MAX_INBOUND_FRAME_BYTES} bytes)"
         );
-        let frame: Frame = serde_json::from_str(&text).unwrap();
         assert_eq!(frame.frame_type, FrameType::RpcResp);
     }
 
@@ -1212,19 +1231,13 @@ mod tests {
         relay_rpc_req(
             tx,
             reqwest::Client::new(),
-            server.url(),
-            "cli-minted-token".to_string(),
-            Some("cli-minted-secret".to_string()),
+            test_ctx(server.url(), "cli-minted-token", Some("cli-minted-secret")),
             "frm_corr_auth".to_string(),
             req,
         )
         .await;
 
-        let msg = rx.recv().await.expect("expected a relay reply");
-        let Message::Text(text) = msg else {
-            panic!("expected a text message")
-        };
-        let frame: Frame = serde_json::from_str(&text).unwrap();
+        let frame = recv_frame(&mut rx).await;
         // mockito's match_header on both names, with only one value each,
         // asserts the request had exactly the CLI-minted value — if the
         // spoofed value had also been forwarded (appended), the request
@@ -1242,7 +1255,8 @@ mod tests {
         let http = reqwest::Client::new();
         let ping = Frame::new(FrameType::Ping, None);
         let text = serde_json::to_string(&ping).unwrap();
-        spawn_rpc_relay_if_req(&text, &tx, &http, "http://127.0.0.1:1", "", &None);
+        let ctx = test_ctx("http://127.0.0.1:1", "", None);
+        spawn_rpc_relay_if_req(&text, &tx, &http, &ctx);
         assert!(rx.try_recv().is_err());
     }
 }
