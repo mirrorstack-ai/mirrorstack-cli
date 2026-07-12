@@ -19,6 +19,7 @@ use super::{
 };
 
 mod deploy;
+mod ssr;
 
 #[derive(Args)]
 pub struct AppArgs {
@@ -30,7 +31,7 @@ pub struct AppArgs {
 enum AppCommand {
     /// Create a new application on the platform.
     Create(CreateArgs),
-    /// Manage the app's web frontend (static hosting on
+    /// Manage the app's web frontend (static or SSR hosting on
     /// `https://<slug>.mirrorstack.app`).
     Web(WebArgs),
     /// Manage developer modules (the per-developer reusable units installed
@@ -46,9 +47,10 @@ pub struct WebArgs {
 
 #[derive(Subcommand)]
 enum WebCommand {
-    /// Deploy a static build directory to app hosting
-    /// (`https://<slug>.mirrorstack.app`). Uploads, finalizes, and
-    /// activates unless --no-activate.
+    /// Deploy a build directory to app hosting
+    /// (`https://<slug>.mirrorstack.app`) — a static export, or a Next.js
+    /// standalone (SSR) build (auto-detected, or forced via --runtime).
+    /// Uploads, finalizes, and activates unless --no-activate.
     Deploy(deploy::DeployArgs),
 }
 

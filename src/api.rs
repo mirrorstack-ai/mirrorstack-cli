@@ -607,6 +607,10 @@ pub struct CreateAppDeployInput<'a> {
     pub env: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<&'a str>,
+    /// `"ssr"` for a packaged Next.js standalone bundle deploy; omitted
+    /// (server default: `"static"`) for today's static-export deploys.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<&'a str>,
     pub files: &'a [DeployFile<'a>],
 }
 
@@ -1747,6 +1751,7 @@ mod tests {
             &CreateAppDeployInput {
                 env: "prod",
                 note: Some("first ship"),
+                runtime: None,
                 files: &[DeployFile {
                     path: "index.html",
                     size: 5,
@@ -1762,6 +1767,48 @@ mod tests {
             d.uploads[0].headers.get("Content-Type").map(String::as_str),
             Some("text/html")
         );
+    }
+
+    #[test]
+    fn create_app_deploy_sends_runtime_when_ssr() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/a-1/deploys")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"env":"prod","runtime":"ssr","files":[{"path":"ssr-bundle.zip","size":9,"sha256":"bb"}]}"#.into(),
+            ))
+            .with_status(201)
+            .with_body(
+                json!({
+                    "deploy_id": "d-2",
+                    "uploads": [{
+                        "path": "ssr-bundle.zip",
+                        "url": "https://s3.example/put",
+                        "headers": {}
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let d = create_app_deploy(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "a-1",
+            &CreateAppDeployInput {
+                env: "prod",
+                note: None,
+                runtime: Some("ssr"),
+                files: &[DeployFile {
+                    path: "ssr-bundle.zip",
+                    size: 9,
+                    sha256: "bb",
+                }],
+            },
+        )
+        .expect("ok");
+        assert_eq!(d.deploy_id, "d-2");
     }
 
     #[test]
@@ -1786,6 +1833,7 @@ mod tests {
             &CreateAppDeployInput {
                 env: "prod",
                 note: None,
+                runtime: None,
                 files: &[DeployFile {
                     path: "index.html",
                     size: 5,

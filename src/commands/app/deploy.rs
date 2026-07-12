@@ -1,10 +1,18 @@
-//! `mirrorstack app web deploy` — ship a static build directory to the
-//! platform's app hosting, served on `https://<slug>.mirrorstack.app`.
+//! `mirrorstack app web deploy` — ship a build directory to the platform's
+//! app hosting, served on `https://<slug>.mirrorstack.app`.
 //!
-//! Flow: walk the build dir into a manifest (path + size + sha256), POST
-//! it for presigned S3 PUTs, upload every file (bounded fan-out), finalize
-//! (the platform spot-checks the objects), then activate the deploy on the
-//! stage unless `--no-activate`.
+//! Two runtimes.
+//!
+//! `static` (default): walk the build dir into a manifest (path + size +
+//! sha256), POST it for presigned S3 PUTs, upload every file (bounded
+//! fan-out), finalize (the platform spot-checks the objects), then
+//! activate the deploy on the stage unless `--no-activate`.
+//!
+//! `ssr`: package `--dir`'s `.next/standalone` + `.next/static` into a
+//! single Lambda-ready zip (see [`super::ssr`]), upload it as the deploy's
+//! one file, then finalize/activate exactly as above. Auto-detected from a
+//! `.next/standalone` subdirectory under `--dir`, or forced either way via
+//! `--runtime`.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -15,7 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
@@ -28,10 +36,13 @@ use crate::commands::{
 use crate::credentials;
 use crate::http;
 
+use super::ssr;
 use super::with_spinner;
 
 /// Platform caps on one deploy, mirrored client-side so the failure is a
-/// local error before any bytes move (the server re-validates).
+/// local error before any bytes move (the server re-validates). Applies to
+/// the static-file manifest; an SSR bundle is a single zip and isn't
+/// subject to the file-count cap.
 const MAX_TOTAL_BYTES: u64 = 26_214_400; // 25 MB
 const MAX_FILES: usize = 500;
 
@@ -42,6 +53,13 @@ const UPLOAD_CONCURRENCY: usize = 8;
 /// Generous per-PUT timeout: the largest legal deploy is 25 MB, which on
 /// a slow uplink can far exceed the 15s used for the JSON API calls.
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// `--runtime` override for the auto-detected build kind.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RuntimeArg {
+    Static,
+    Ssr,
+}
 
 #[derive(Args)]
 pub struct DeployArgs {
@@ -61,6 +79,12 @@ pub struct DeployArgs {
     /// Upload + finalize only; leave the stage on its current deploy.
     #[arg(long)]
     no_activate: bool,
+    /// Runtime to ship: `static` (a plain build/export directory) or `ssr`
+    /// (a Next.js standalone build). Auto-detected from `--dir` (SSR means
+    /// a `.next/standalone` subdirectory is present) when omitted; pass
+    /// this to override the detection.
+    #[arg(long, value_enum)]
+    runtime: Option<RuntimeArg>,
 }
 
 pub fn run(args: DeployArgs) -> Result<()> {
@@ -72,8 +96,11 @@ pub fn run(args: DeployArgs) -> Result<()> {
         return Err(anyhow!("{} is not a directory", dir.display()));
     }
 
-    let files = with_spinner("Scanning files…", || build_manifest(&dir))?;
-    let bytes_total: u64 = files.iter().map(|f| f.size).sum();
+    let is_ssr = match args.runtime {
+        Some(RuntimeArg::Ssr) => true,
+        Some(RuntimeArg::Static) => false,
+        None => ssr::looks_like_standalone(&dir),
+    };
 
     let mut creds = credentials::load_or_login_hint()?;
     let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
@@ -96,6 +123,26 @@ pub fn run(args: DeployArgs) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
 
+    if is_ssr {
+        deploy_ssr(&args, &dir, &app, &mut creds, &apps_base, &client)
+    } else {
+        deploy_static(&args, &dir, &app, &mut creds, &apps_base, &client)
+    }
+}
+
+/// Today's flow, byte-for-byte unchanged: walk `dir` into a static-file
+/// manifest, create the deploy, upload every file, finalize, activate.
+fn deploy_static(
+    args: &DeployArgs,
+    dir: &Path,
+    app: &api::App,
+    creds: &mut credentials::Credentials,
+    apps_base: &str,
+    client: &Client,
+) -> Result<()> {
+    let files = with_spinner("Scanning files…", || build_manifest(dir))?;
+    let bytes_total: u64 = files.iter().map(|f| f.size).sum();
+
     eprintln!(
         "  {} {} → {} ({} files, {})",
         style("Deploying:").dim(),
@@ -114,15 +161,16 @@ pub fn run(args: DeployArgs) -> Result<()> {
         })
         .collect();
     let created = with_spinner("Creating deploy…", || {
-        credentials::with_refresh_retry(&mut creds, |tok| {
+        credentials::with_refresh_retry(creds, |tok| {
             api::create_app_deploy(
-                &client,
-                &apps_base,
+                client,
+                apps_base,
                 tok,
                 &app.id,
                 &CreateAppDeployInput {
                     env: &args.env,
                     note: args.note.as_deref(),
+                    runtime: None,
                     files: &file_inputs,
                 },
             )
@@ -135,9 +183,90 @@ pub fn run(args: DeployArgs) -> Result<()> {
     let upload_client = http::client(UPLOAD_TIMEOUT)?;
     upload_all(&upload_client, &created.uploads, &files)?;
 
+    finish_deploy(args, app, creds, apps_base, client, &created.deploy_id)
+}
+
+/// SSR flow: package `dir`'s standalone build into one zip, ship it as the
+/// deploy's single file, then finalize/activate exactly like the static
+/// path (via the shared [`finish_deploy`] tail).
+fn deploy_ssr(
+    args: &DeployArgs,
+    dir: &Path,
+    app: &api::App,
+    creds: &mut credentials::Credentials,
+    apps_base: &str,
+    client: &Client,
+) -> Result<()> {
+    let (_bundle_dir, zip_path) =
+        with_spinner("Packaging SSR bundle…", || ssr::package_bundle(dir))?;
+    let (size, sha256) = hash_file(&zip_path)?;
+
+    eprintln!(
+        "  {} {} → {} (ssr bundle, {})",
+        style("Deploying:").dim(),
+        style(dir.display()).bold(),
+        style(format!("{}@{}", app.slug, args.env)).cyan().bold(),
+        human_bytes(size)
+    );
+
+    let file_inputs = [DeployFile {
+        path: "ssr-bundle.zip",
+        size,
+        sha256: &sha256,
+    }];
+    // `runtime: "ssr"` tells the platform this deploy's one file is a
+    // Lambda bundle, not a static-file manifest entry — see the PR
+    // description for the request-shape assumption this rests on.
+    let created = with_spinner("Creating deploy…", || {
+        credentials::with_refresh_retry(creds, |tok| {
+            api::create_app_deploy(
+                client,
+                apps_base,
+                tok,
+                &app.id,
+                &CreateAppDeployInput {
+                    env: &args.env,
+                    note: args.note.as_deref(),
+                    runtime: Some("ssr"),
+                    files: &file_inputs,
+                },
+            )
+        })
+    })
+    .map_err(api_err)?;
+
+    let bundle_file = ManifestFile {
+        rel_path: "ssr-bundle.zip".to_string(),
+        abs_path: zip_path,
+        size,
+        sha256,
+    };
+    let upload_client = http::client(UPLOAD_TIMEOUT)?;
+    upload_all(
+        &upload_client,
+        &created.uploads,
+        std::slice::from_ref(&bundle_file),
+    )?;
+    // `_bundle_dir` (the temp dir backing `bundle_file.abs_path`) stays
+    // alive through the upload above by still being in scope here.
+
+    finish_deploy(args, app, creds, apps_base, client, &created.deploy_id)
+}
+
+/// Shared tail for both runtimes: finalize the already-uploaded deploy,
+/// then activate it (unless `--no-activate`), printing the same status
+/// lines either way.
+fn finish_deploy(
+    args: &DeployArgs,
+    app: &api::App,
+    creds: &mut credentials::Credentials,
+    apps_base: &str,
+    client: &Client,
+    deploy_id: &str,
+) -> Result<()> {
     with_spinner("Finalizing…", || {
-        credentials::with_refresh_retry(&mut creds, |tok| {
-            api::finalize_app_deploy(&client, &apps_base, tok, &app.id, &created.deploy_id)
+        credentials::with_refresh_retry(creds, |tok| {
+            api::finalize_app_deploy(client, apps_base, tok, &app.id, deploy_id)
         })
     })
     .map_err(api_err)?;
@@ -148,7 +277,7 @@ pub fn run(args: DeployArgs) -> Result<()> {
             ok_mark(),
             style(format!("{}@{}", app.slug, args.env)).cyan().bold()
         );
-        eprintln!("  {} {}", style("deploy:").dim(), created.deploy_id);
+        eprintln!("  {} {}", style("deploy:").dim(), deploy_id);
         eprintln!(
             "  {} activate it from the app's deployment settings, or re-run without --no-activate",
             style("next:").dim()
@@ -157,15 +286,8 @@ pub fn run(args: DeployArgs) -> Result<()> {
     }
 
     with_spinner("Activating…", || {
-        credentials::with_refresh_retry(&mut creds, |tok| {
-            api::activate_app_stage(
-                &client,
-                &apps_base,
-                tok,
-                &app.id,
-                &args.env,
-                &created.deploy_id,
-            )
+        credentials::with_refresh_retry(creds, |tok| {
+            api::activate_app_stage(client, apps_base, tok, &app.id, &args.env, deploy_id)
         })
     })
     .map_err(api_err)?;
@@ -175,7 +297,7 @@ pub fn run(args: DeployArgs) -> Result<()> {
         ok_mark(),
         style(format!("{}@{}", app.slug, args.env)).cyan().bold()
     );
-    eprintln!("  {} {}", style("deploy:").dim(), created.deploy_id);
+    eprintln!("  {} {}", style("deploy:").dim(), deploy_id);
     eprintln!(
         "  {} {}",
         style("url:").dim(),
@@ -197,7 +319,8 @@ fn api_err(e: ApiError) -> anyhow::Error {
 }
 
 /// One file under the deploy root: its manifest entry plus where to read
-/// the bytes back at upload time.
+/// the bytes back at upload time. Also doubles as the single-entry
+/// manifest for an SSR bundle upload.
 #[derive(Debug)]
 struct ManifestFile {
     /// Forward-slash path relative to the deploy root — the S3 key tail.
@@ -561,5 +684,14 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(4302), "4.2 KB");
         assert_eq!(human_bytes(MAX_TOTAL_BYTES), "25.0 MB");
+    }
+
+    #[test]
+    fn hash_file_matches_ssr_module_shape() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "ssr-bundle.zip", "hello");
+        let (size, sha256) = hash_file(&dir.path().join("ssr-bundle.zip")).unwrap();
+        assert_eq!(size, 5);
+        assert_eq!(sha256, HELLO_SHA256);
     }
 }
