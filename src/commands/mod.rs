@@ -77,11 +77,6 @@ enum Command {
     Logout(logout::LogoutArgs),
     /// Print the currently signed-in user.
     Whoami(whoami::WhoamiArgs),
-    /// Deprecated: moved to `mirrorstack app module`. This hidden alias
-    /// keeps existing scripts working and will be removed in a future
-    /// release.
-    #[command(hide = true)]
-    Module(module::ModuleArgs),
     /// Manage applications on the platform.
     #[command(visible_alias = "app")]
     Apps(app::AppArgs),
@@ -96,7 +91,6 @@ impl Cli {
             Command::Login(args) => login::run(args),
             Command::Logout(args) => logout::run(args),
             Command::Whoami(args) => whoami::run(args),
-            Command::Module(args) => module::run(args),
             Command::Apps(args) => app::run(args),
             Command::Dev(args) => dev::run(args),
         }
