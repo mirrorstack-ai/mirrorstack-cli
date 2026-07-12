@@ -1,6 +1,4 @@
-//! `mirrorstack app module …` — developer module management. (The old
-//! top-level `mirrorstack module …` spelling still works as a hidden,
-//! deprecated alias.)
+//! `mirrorstack app module …` — developer module management.
 //!
 //! Today: `module init` registers the module on the platform AND scaffolds a
 //! local source tree from the SDK template. The scaffolded tree is what
