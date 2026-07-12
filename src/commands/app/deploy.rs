@@ -1,10 +1,19 @@
-//! `mirrorstack app web deploy` — ship a static build directory to the
-//! platform's app hosting, served on `https://<slug>.mirrorstack.app`.
+//! `mirrorstack app web deploy` — ship a build directory to the platform's
+//! app hosting, served on `https://<slug>.mirrorstack.app`.
 //!
-//! Flow: walk the build dir into a manifest (path + size + sha256), POST
-//! it for presigned S3 PUTs, upload every file (bounded fan-out), finalize
-//! (the platform spot-checks the objects), then activate the deploy on the
-//! stage unless `--no-activate`.
+//! Two runtimes.
+//!
+//! `static` (default): walk the build dir into a manifest (path + size +
+//! sha256), POST it for presigned S3 PUTs, upload every file (bounded
+//! fan-out), finalize (the platform spot-checks the objects), then
+//! activate the deploy on the stage unless `--no-activate`.
+//!
+//! `ssr`: package `--dir`'s `.next/standalone` + `.next/static` into a
+//! single Lambda-ready zip (see [`super::ssr`]), check it against the same
+//! 250 MB ceiling the platform enforces server-side, upload it as the
+//! deploy's one file, then finalize/activate exactly as above.
+//! Auto-detected from a `.next/standalone` subdirectory under `--dir`, or
+//! forced either way via `--runtime`.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -15,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
@@ -28,12 +37,23 @@ use crate::commands::{
 use crate::credentials;
 use crate::http;
 
+use super::ssr;
 use super::with_spinner;
 
 /// Platform caps on one deploy, mirrored client-side so the failure is a
-/// local error before any bytes move (the server re-validates).
+/// local error before any bytes move (the server re-validates). Applies to
+/// the static-file manifest; an SSR bundle is a single zip and isn't
+/// subject to the file-count cap.
 const MAX_TOTAL_BYTES: u64 = 26_214_400; // 25 MB
 const MAX_FILES: usize = 500;
+
+/// Cap on the packaged SSR bundle zip, mirrored client-side for the same
+/// reason as `MAX_TOTAL_BYTES` above but for a different artifact shape:
+/// this is AWS Lambda's real ceiling for an S3-sourced deployment package,
+/// and the ceiling api-platform enforces server-side for `runtime: "ssr"`
+/// deploys. Distinct from `MAX_TOTAL_BYTES` (the static-file-manifest
+/// cap) — do not conflate the two.
+const MAX_SSR_BUNDLE_BYTES: u64 = 250 * 1024 * 1024; // 250 MB
 
 /// Bounded fan-out for the presigned PUTs. S3 happily takes more, but 8
 /// keeps memory (one file body per in-flight PUT) and socket use small.
@@ -42,6 +62,13 @@ const UPLOAD_CONCURRENCY: usize = 8;
 /// Generous per-PUT timeout: the largest legal deploy is 25 MB, which on
 /// a slow uplink can far exceed the 15s used for the JSON API calls.
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// `--runtime` override for the auto-detected build kind.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum RuntimeArg {
+    Static,
+    Ssr,
+}
 
 #[derive(Args)]
 pub struct DeployArgs {
@@ -61,6 +88,12 @@ pub struct DeployArgs {
     /// Upload + finalize only; leave the stage on its current deploy.
     #[arg(long)]
     no_activate: bool,
+    /// Runtime to ship: `static` (a plain build/export directory) or `ssr`
+    /// (a Next.js standalone build). Auto-detected from `--dir` (SSR means
+    /// a `.next/standalone` subdirectory is present) when omitted; pass
+    /// this to override the detection.
+    #[arg(long, value_enum)]
+    runtime: Option<RuntimeArg>,
 }
 
 pub fn run(args: DeployArgs) -> Result<()> {
@@ -72,8 +105,11 @@ pub fn run(args: DeployArgs) -> Result<()> {
         return Err(anyhow!("{} is not a directory", dir.display()));
     }
 
-    let files = with_spinner("Scanning files…", || build_manifest(&dir))?;
-    let bytes_total: u64 = files.iter().map(|f| f.size).sum();
+    let is_ssr = match args.runtime {
+        Some(RuntimeArg::Ssr) => true,
+        Some(RuntimeArg::Static) => false,
+        None => ssr::looks_like_standalone(&dir),
+    };
 
     let mut creds = credentials::load_or_login_hint()?;
     let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
@@ -96,6 +132,26 @@ pub fn run(args: DeployArgs) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
 
+    if is_ssr {
+        deploy_ssr(&args, &dir, &app, &mut creds, &apps_base, &client)
+    } else {
+        deploy_static(&args, &dir, &app, &mut creds, &apps_base, &client)
+    }
+}
+
+/// Today's flow, byte-for-byte unchanged: walk `dir` into a static-file
+/// manifest, create the deploy, upload every file, finalize, activate.
+fn deploy_static(
+    args: &DeployArgs,
+    dir: &Path,
+    app: &api::App,
+    creds: &mut credentials::Credentials,
+    apps_base: &str,
+    client: &Client,
+) -> Result<()> {
+    let files = with_spinner("Scanning files…", || build_manifest(dir))?;
+    let bytes_total: u64 = files.iter().map(|f| f.size).sum();
+
     eprintln!(
         "  {} {} → {} ({} files, {})",
         style("Deploying:").dim(),
@@ -114,15 +170,16 @@ pub fn run(args: DeployArgs) -> Result<()> {
         })
         .collect();
     let created = with_spinner("Creating deploy…", || {
-        credentials::with_refresh_retry(&mut creds, |tok| {
+        credentials::with_refresh_retry(creds, |tok| {
             api::create_app_deploy(
-                &client,
-                &apps_base,
+                client,
+                apps_base,
                 tok,
                 &app.id,
                 &CreateAppDeployInput {
                     env: &args.env,
                     note: args.note.as_deref(),
+                    runtime: None,
                     files: &file_inputs,
                 },
             )
@@ -135,9 +192,126 @@ pub fn run(args: DeployArgs) -> Result<()> {
     let upload_client = http::client(UPLOAD_TIMEOUT)?;
     upload_all(&upload_client, &created.uploads, &files)?;
 
+    finish_deploy(args, app, creds, apps_base, client, &created.deploy_id)
+}
+
+/// SSR flow: package `dir`'s standalone build into one zip, ship it as the
+/// deploy's single file, then finalize/activate exactly like the static
+/// path (via the shared [`finish_deploy`] tail).
+///
+/// Thin wrapper over [`deploy_ssr_with_cap`] passing the real production
+/// ceiling — the split exists so tests can exercise the exact same
+/// packaging/upload/finalize logic against a tiny cap instead of needing a
+/// genuine 250 MB fixture on disk to prove the guard rejects.
+fn deploy_ssr(
+    args: &DeployArgs,
+    dir: &Path,
+    app: &api::App,
+    creds: &mut credentials::Credentials,
+    apps_base: &str,
+    client: &Client,
+) -> Result<()> {
+    deploy_ssr_with_cap(
+        args,
+        dir,
+        app,
+        creds,
+        apps_base,
+        client,
+        MAX_SSR_BUNDLE_BYTES,
+    )
+}
+
+fn deploy_ssr_with_cap(
+    args: &DeployArgs,
+    dir: &Path,
+    app: &api::App,
+    creds: &mut credentials::Credentials,
+    apps_base: &str,
+    client: &Client,
+    max_bundle_bytes: u64,
+) -> Result<()> {
+    let (_bundle_dir, zip_path) =
+        with_spinner("Packaging SSR bundle…", || ssr::package_bundle(dir))?;
+    let (size, sha256) = hash_file(&zip_path)?;
+
+    eprintln!(
+        "  {} {} → {} (ssr bundle, {})",
+        style("Deploying:").dim(),
+        style(dir.display()).bold(),
+        style(format!("{}@{}", app.slug, args.env)).cyan().bold(),
+        human_bytes(size)
+    );
+
+    // Check the packaged zip against the same ceiling api-platform enforces
+    // server-side *before* touching the network — a build that's too large
+    // fails locally and instantly instead of after a full upload attempt.
+    if size > max_bundle_bytes {
+        return Err(anyhow!(
+            "SSR bundle too large: {} (capped at {}, the same ceiling the platform enforces for Lambda-packaged deploys) — trim the standalone build or exclude unused dependencies",
+            human_bytes(size),
+            human_bytes(max_bundle_bytes)
+        ));
+    }
+
+    let file_inputs = [DeployFile {
+        path: "ssr-bundle.zip",
+        size,
+        sha256: &sha256,
+    }];
+    // `runtime: "ssr"` tells the platform this deploy's one file is a
+    // Lambda bundle, not a static-file manifest entry — see the PR
+    // description for the request-shape assumption this rests on.
+    let created = with_spinner("Creating deploy…", || {
+        credentials::with_refresh_retry(creds, |tok| {
+            api::create_app_deploy(
+                client,
+                apps_base,
+                tok,
+                &app.id,
+                &CreateAppDeployInput {
+                    env: &args.env,
+                    note: args.note.as_deref(),
+                    runtime: Some("ssr"),
+                    files: &file_inputs,
+                },
+            )
+        })
+    })
+    .map_err(api_err)?;
+
+    let bundle_file = ManifestFile {
+        rel_path: "ssr-bundle.zip".to_string(),
+        abs_path: zip_path,
+        size,
+        sha256,
+    };
+    let upload_client = http::client(UPLOAD_TIMEOUT)?;
+    upload_all(
+        &upload_client,
+        &created.uploads,
+        std::slice::from_ref(&bundle_file),
+    )?;
+    // `_bundle_dir` (the temp dir backing `bundle_file.abs_path`) stays
+    // alive through the upload above by still being in scope here.
+
+    finish_deploy(args, app, creds, apps_base, client, &created.deploy_id)
+}
+
+/// Shared tail for both runtimes: finalize the already-uploaded deploy,
+/// then activate it (unless `--no-activate`), printing the same status
+/// lines either way.
+fn finish_deploy(
+    args: &DeployArgs,
+    app: &api::App,
+    creds: &mut credentials::Credentials,
+    apps_base: &str,
+    client: &Client,
+    deploy_id: &str,
+) -> Result<()> {
     with_spinner("Finalizing…", || {
-        credentials::with_refresh_retry(&mut creds, |tok| {
-            api::finalize_app_deploy(&client, &apps_base, tok, &app.id, &created.deploy_id)
+        credentials::with_refresh_retry(creds, |tok| {
+            api::finalize_app_deploy(client, apps_base, tok, &app.id, deploy_id)
         })
     })
     .map_err(api_err)?;
@@ -148,7 +322,7 @@ pub fn run(args: DeployArgs) -> Result<()> {
             ok_mark(),
             style(format!("{}@{}", app.slug, args.env)).cyan().bold()
         );
-        eprintln!("  {} {}", style("deploy:").dim(), created.deploy_id);
+        eprintln!("  {} {}", style("deploy:").dim(), deploy_id);
         eprintln!(
             "  {} activate it from the app's deployment settings, or re-run without --no-activate",
             style("next:").dim()
@@ -157,15 +331,8 @@ pub fn run(args: DeployArgs) -> Result<()> {
     }
 
     with_spinner("Activating…", || {
-        credentials::with_refresh_retry(&mut creds, |tok| {
-            api::activate_app_stage(
-                &client,
-                &apps_base,
-                tok,
-                &app.id,
-                &args.env,
-                &created.deploy_id,
-            )
+        credentials::with_refresh_retry(creds, |tok| {
+            api::activate_app_stage(client, apps_base, tok, &app.id, &args.env, deploy_id)
         })
     })
     .map_err(api_err)?;
@@ -175,7 +342,7 @@ pub fn run(args: DeployArgs) -> Result<()> {
         ok_mark(),
         style(format!("{}@{}", app.slug, args.env)).cyan().bold()
     );
-    eprintln!("  {} {}", style("deploy:").dim(), created.deploy_id);
+    eprintln!("  {} {}", style("deploy:").dim(), deploy_id);
     eprintln!(
         "  {} {}",
         style("url:").dim(),
@@ -197,7 +364,8 @@ fn api_err(e: ApiError) -> anyhow::Error {
 }
 
 /// One file under the deploy root: its manifest entry plus where to read
-/// the bytes back at upload time.
+/// the bytes back at upload time. Also doubles as the single-entry
+/// manifest for an SSR bundle upload.
 #[derive(Debug)]
 struct ManifestFile {
     /// Forward-slash path relative to the deploy root — the S3 key tail.
@@ -407,8 +575,9 @@ fn upload_progress(len: u64) -> ProgressBar {
     pb
 }
 
-/// `1023 B` / `4.2 KB` / `25.0 MB` — one decimal above bytes, enough for
-/// a size line capped at 25 MB.
+/// `1023 B` / `4.2 KB` / `25.0 MB` — one decimal above bytes. Shared by
+/// both size lines: the static-manifest cap (25 MB) and the SSR bundle
+/// cap (250 MB).
 fn human_bytes(n: u64) -> String {
     const KB: f64 = 1024.0;
     let n = n as f64;
@@ -561,5 +730,256 @@ mod tests {
         assert_eq!(human_bytes(512), "512 B");
         assert_eq!(human_bytes(4302), "4.2 KB");
         assert_eq!(human_bytes(MAX_TOTAL_BYTES), "25.0 MB");
+    }
+
+    #[test]
+    fn hash_file_matches_ssr_module_shape() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "ssr-bundle.zip", "hello");
+        let (size, sha256) = hash_file(&dir.path().join("ssr-bundle.zip")).unwrap();
+        assert_eq!(size, 5);
+        assert_eq!(sha256, HELLO_SHA256);
+    }
+
+    // ---- deploy_ssr() end-to-end -----------------------------------------
+    //
+    // The tests below drive `deploy_ssr`/`deploy_ssr_with_cap` themselves
+    // (not just the `ssr` module's packaging helpers, which have their own
+    // coverage in `super::ssr::tests`), through the same mockito convention
+    // `api.rs` uses for the JSON API calls. The presigned "S3 PUT" target is
+    // a raw `TcpListener` capture stub — mockito's `Matcher` can match a
+    // request body but can't hand the raw bytes back for inspection, and we
+    // need the actual uploaded zip to assert its internal structure. This
+    // mirrors the raw-TCP fake-backend pattern `commands::dev::proxy`'s own
+    // tests already use.
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    use mockito::Server;
+    use serde_json::json;
+
+    fn ssr_fixture(dir: &Path) {
+        write(dir, ".next/standalone/server.js", "server");
+        write(dir, ".next/standalone/node_modules/pkg/index.js", "pkg");
+        write(dir, ".next/static/chunks/app.js", "chunk");
+    }
+
+    fn test_args() -> DeployArgs {
+        DeployArgs {
+            app: "a-1".to_string(),
+            env: "prod".to_string(),
+            dir: None,
+            note: None,
+            no_activate: false,
+            runtime: None,
+        }
+    }
+
+    fn test_app() -> api::App {
+        api::App {
+            id: "a-1".to_string(),
+            name: "Test App".to_string(),
+            slug: "test-app".to_string(),
+            owner_id: None,
+            created_at: None,
+        }
+    }
+
+    fn test_creds() -> credentials::Credentials {
+        credentials::Credentials {
+            access_token: "AT".to_string(),
+            refresh_token: "RT".to_string(),
+            expires_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+        }
+    }
+
+    /// Accepts exactly one connection, reads a full HTTP request (headers +
+    /// a `Content-Length` body), stashes the raw body in the returned
+    /// `Arc<Mutex<Vec<u8>>>`, and replies `200`. Standing in for a presigned
+    /// S3 PUT target: the returned URL is what a `create_app_deploy` mock
+    /// response can point `uploads[0].url` at.
+    fn spawn_upload_capture() -> (String, Arc<Mutex<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind capture listener");
+        let port = listener.local_addr().expect("local_addr").port();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_writer = Arc::clone(&captured);
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept upload connection");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            let header_end = loop {
+                let n = stream.read(&mut chunk).expect("read upload request");
+                assert!(n > 0, "connection closed before headers completed");
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let content_length: usize = headers
+                .lines()
+                .find_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+
+            let mut body = buf[header_end..].to_vec();
+            while body.len() < content_length {
+                let n = stream.read(&mut chunk).expect("read upload body");
+                assert!(n > 0, "connection closed before full body received");
+                body.extend_from_slice(&chunk[..n]);
+            }
+            *captured_writer.lock().expect("captured mutex") = body;
+
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("write upload response");
+        });
+
+        (format!("http://127.0.0.1:{port}/upload"), captured)
+    }
+
+    #[test]
+    fn deploy_ssr_end_to_end_packages_uploads_finalizes_and_activates() {
+        let dir = TempDir::new().unwrap();
+        ssr_fixture(dir.path());
+
+        let (upload_url, captured) = spawn_upload_capture();
+
+        let mut server = Server::new();
+        let _create = server
+            .mock("POST", "/v1/apps/a-1/deploys")
+            .match_header("authorization", "Bearer AT")
+            .with_status(201)
+            .with_body(
+                json!({
+                    "deploy_id": "d-1",
+                    "uploads": [{
+                        "path": "ssr-bundle.zip",
+                        "url": upload_url,
+                        "headers": {}
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        let _finalize = server
+            .mock("POST", "/v1/apps/a-1/deploys/d-1/finalize")
+            .with_status(200)
+            .with_body(json!({"status": "ready"}).to_string())
+            .create();
+        let _activate = server
+            .mock("POST", "/v1/apps/a-1/stages/prod/activate")
+            .with_status(200)
+            .with_body(json!({"active_deploy_id": "d-1"}).to_string())
+            .create();
+
+        let args = test_args();
+        let app = test_app();
+        let mut creds = test_creds();
+        let client = http::client(Duration::from_secs(15)).unwrap();
+
+        deploy_ssr(&args, dir.path(), &app, &mut creds, &server.url(), &client)
+            .expect("deploy_ssr ok");
+
+        let bytes = captured.lock().expect("captured mutex").clone();
+        assert!(!bytes.is_empty(), "no bytes reached the upload stub");
+
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("uploaded bytes are a zip");
+        let mut names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        names.sort();
+        assert!(names.contains(&"run.sh".to_string()), "{names:?}");
+        assert!(names.contains(&"server.js".to_string()), "{names:?}");
+        assert!(
+            names.contains(&".next/static/chunks/app.js".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            names.contains(&"node_modules/pkg/index.js".to_string()),
+            "{names:?}"
+        );
+
+        let mut run_sh = archive.by_name("run.sh").unwrap();
+        let mut contents = String::new();
+        run_sh.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "#!/bin/bash\nexec node server.js\n");
+        drop(run_sh);
+
+        const S_IFLNK: u32 = 0xA000;
+        for i in 0..archive.len() {
+            let entry = archive.by_index(i).unwrap();
+            if let Some(mode) = entry.unix_mode() {
+                assert_ne!(mode & 0xF000, S_IFLNK, "{:?} is a symlink", entry.name());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_ssr_propagates_symlink_rejection_from_real_packaging() {
+        // Proves `deploy_ssr` runs the real `ssr::package_bundle` symlink
+        // guard itself (not a stub) — the failure must surface before any
+        // network call, so an unroutable-looking `apps_base` never gets
+        // dialed.
+        let dir = TempDir::new().unwrap();
+        ssr_fixture(dir.path());
+        std::os::unix::fs::symlink("/etc/hosts", dir.path().join(".next/standalone/leaky-link"))
+            .unwrap();
+
+        let args = test_args();
+        let app = test_app();
+        let mut creds = test_creds();
+        let client = http::client(Duration::from_secs(15)).unwrap();
+
+        let err = deploy_ssr(
+            &args,
+            dir.path(),
+            &app,
+            &mut creds,
+            "http://127.0.0.1:1",
+            &client,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn deploy_ssr_with_cap_rejects_oversized_bundle_before_any_upload() {
+        // Real packaging + real zip, checked against a tiny cap standing in
+        // for `MAX_SSR_BUNDLE_BYTES` — proves the GAP-1 size guard runs on
+        // the actual packaged artifact and rejects before any network call
+        // (no mock is registered on `server`, so a network attempt would
+        // surface as a very different, non-"too large" error).
+        let dir = TempDir::new().unwrap();
+        ssr_fixture(dir.path());
+
+        let server = Server::new();
+        let args = test_args();
+        let app = test_app();
+        let mut creds = test_creds();
+        let client = http::client(Duration::from_secs(15)).unwrap();
+
+        let err = deploy_ssr_with_cap(
+            &args,
+            dir.path(),
+            &app,
+            &mut creds,
+            &server.url(),
+            &client,
+            1, // 1 byte: any real zip trips this
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("too large"), "{msg}");
+        assert!(msg.contains("1 B"), "{msg}");
     }
 }
