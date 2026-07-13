@@ -144,7 +144,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     let mut ready = Vec::new();
     let mut skipped = Vec::new();
     for m in &all_modules {
-        match module_meta::read_module_meta(&m.abs_dir) {
+        match module_meta::read_module_meta(&m.abs_dir, root) {
             Ok(meta) if !meta.id.is_empty() => ready.push(m.clone()),
             Ok(meta) => skipped.push((m.dir.display().to_string(), meta.slug)),
             Err(_) => skipped.push((m.dir.display().to_string(), String::new())),
@@ -209,7 +209,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         let secret = internal_secret
             .as_deref()
             .expect("tunnel mode mints a secret");
-        let state = open_tunnels(&ready, args.local_url.as_deref(), secret)?;
+        let state = open_tunnels(root, &ready, args.local_url.as_deref(), secret)?;
         // `open_tunnels` pushes handles in `ready` order, so zip is aligned.
         for (m, handle) in ready.iter().zip(state.0.iter()) {
             let slug = m.dir.file_name().unwrap().to_string_lossy();
@@ -304,7 +304,7 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
     // doesn't have to re-parse main.go per module.
     let mut ready = Vec::new();
     for m in &all_modules {
-        match module_meta::read_module_meta(&m.abs_dir) {
+        match module_meta::read_module_meta(&m.abs_dir, root) {
             Ok(meta) if !meta.id.is_empty() => ready.push((m.clone(), meta.id)),
             _ => {
                 eprintln!("{} skipping {} (no ID)", warn_prefix(), m.dir.display());
@@ -374,10 +374,12 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
         // are written by the outer run (host) and arrive via the bind mount.
         let token_file = platform_token_file(root, &slug);
 
-        // `module_id` is what read_module_meta sourced from this module's
-        // .env (MS_MODULE_ID) — pass the same value through to the spawned
-        // process so the module's own os.Getenv("MS_MODULE_ID") at runtime
-        // resolves without re-reading the file a second time.
+        // `module_id` is what read_module_meta sourced from the workspace
+        // root's .env (its MS_MODULE_ID_<SLUG> keyed entry) — pass the plain
+        // value through to the spawned process (see module_process_envs) so
+        // the module's own os.Getenv("MS_MODULE_ID") at runtime resolves.
+        // The <SLUG> suffix is a root-.env bookkeeping detail; it never
+        // reaches the child process.
         let mut envs: Vec<(String, String)> =
             module_process_envs(&db_url, port, module_id, &token_file);
         // Pass through env vars from compose (MS_INTERNAL_SECRET is the
@@ -553,10 +555,15 @@ fn kill_wait(c: &mut Child) {
 
 /// Base env vars every spawned module process gets: local DB, its
 /// deterministic internal port, its per-session platform-token file path,
-/// and MS_MODULE_ID (the same per-environment value tunnel registration
-/// used) so the module's own `os.Getenv("MS_MODULE_ID")` resolves. Isolated
-/// as a pure function so the value list is unit-testable without spinning
-/// up workspace discovery / docker / a real child process.
+/// and a PLAIN `MS_MODULE_ID` (the same per-environment value tunnel
+/// registration used, resolved from the workspace root's `.env` under this
+/// module's `MS_MODULE_ID_<SLUG>` key) so the module's own
+/// `os.Getenv("MS_MODULE_ID")` resolves. The `<SLUG>` suffix is a root-.env
+/// lookup convention only — this function deliberately injects the
+/// unsuffixed name, since each child process only ever sees its own single
+/// module's environment. Isolated as a pure function so the value list is
+/// unit-testable without spinning up workspace discovery / docker / a real
+/// child process.
 fn module_process_envs(
     db_url: &str,
     port: u16,
@@ -745,8 +752,11 @@ fn line_prefix(label: &str) -> String {
 /// The rotated refresh pair is persisted back to credentials between
 /// modules. `internal_secret` is the per-session value sent on every
 /// register frame so dispatch can attach X-MS-Internal-Secret on forwarded
-/// requests.
+/// requests. `root` is the workspace directory holding `go.work` — each
+/// module's ID is resolved from `root`'s `.env`, keyed by that module's slug
+/// (see `module_meta::env_key_for_slug`).
 fn open_tunnels(
+    root: &Path,
     modules: &[workspace::WorkspaceModule],
     local_url_base: Option<&str>,
     internal_secret: &str,
@@ -769,7 +779,7 @@ fn open_tunnels(
     };
 
     for m in modules {
-        let module_id = module_meta::read_module_id(&m.abs_dir)?;
+        let module_id = module_meta::read_module_id(&m.abs_dir, root)?;
         let slug = m.dir.file_name().unwrap().to_string_lossy();
         let module_local_url = format!("{local_url}{MODULE_ROUTE_PREFIX}{slug}");
 
@@ -939,5 +949,26 @@ mod tests {
             "MS_PLATFORM_TOKEN_FILE".to_string(),
             "/tmp/.ms-platform-token-media".to_string()
         )));
+    }
+
+    #[test]
+    fn module_process_envs_never_leaks_the_suffixed_env_key() {
+        // The MS_MODULE_ID_<SLUG> suffix is a root-.env lookup convention
+        // only — the spawned child process must see the plain name, never
+        // a slug-suffixed variant (module_meta::env_key_for_slug output).
+        let envs = module_process_envs(
+            "postgres://x/y",
+            18080,
+            "moauthcoreid",
+            Path::new("/tmp/.ms-platform-token-oauth-core"),
+        );
+        assert!(
+            envs.iter().any(|(k, _)| k == "MS_MODULE_ID"),
+            "expected a plain MS_MODULE_ID key"
+        );
+        assert!(
+            !envs.iter().any(|(k, _)| k.starts_with("MS_MODULE_ID_")),
+            "child env must not carry a suffixed MS_MODULE_ID_* key: {envs:?}"
+        );
     }
 }

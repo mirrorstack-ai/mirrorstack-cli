@@ -14,6 +14,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 
+use crate::commands::dev::module_meta;
+
 const MAIN_GO: &str = include_str!("../../../templates/module/main.go.tmpl");
 const MCP_GO: &str = include_str!("../../../templates/module/mcp.go.tmpl");
 const ROUTES_GO: &str = include_str!("../../../templates/module/routes.go.tmpl");
@@ -30,10 +32,11 @@ const MODULE_ID_TOKEN: &str = "__MS_MODULE_ID__";
 /// Inputs collected by the caller before scaffolding.
 ///
 /// `module_id` is the platform-assigned UUID — stable across slug renames,
-/// which is why both the scaffolded `.env`'s `MS_MODULE_ID` and the SQL
-/// table prefix derive from it rather than from the URL slug. `Config.ID`
-/// itself is no longer a template substitution target: the scaffolded
-/// `main.go` reads it from `MS_MODULE_ID` at runtime instead.
+/// which is why both the scaffolded `.env`'s `MS_MODULE_ID_<SLUG>` entry and
+/// the SQL table prefix derive from it rather than from the URL slug.
+/// `Config.ID` itself is no longer a template substitution target: the
+/// scaffolded `main.go` reads it from the plain `MS_MODULE_ID` at runtime
+/// instead — the `<SLUG>` suffix never reaches the template.
 pub(super) struct Inputs<'a> {
     pub slug: &'a str,
     pub name: &'a str,
@@ -71,13 +74,20 @@ pub(super) fn write_tree(target: &Path, inputs: &Inputs<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Write the fresh module's `.env` — the platform-assigned ID for THIS
-/// environment, read by the scaffolded `main.go` via `os.Getenv`. A fresh
-/// scaffold has nothing to upsert (unlike `register`'s
-/// `module_meta::write_module_id`, which preserves an existing `.env`).
+/// Write the fresh module's root `.env` — the platform-assigned ID for THIS
+/// environment, keyed on the module's slug (`MS_MODULE_ID_<SLUG>`, same
+/// convention `register` uses for a monorepo's shared root `.env`) and read
+/// by the scaffolded `main.go` via the plain `os.Getenv("MS_MODULE_ID")` at
+/// runtime — the `<SLUG>` suffix is a root-`.env`-file lookup convention
+/// only, never a template substitution target. `init` scaffolds one module
+/// per target dir, so that dir doubles as both module dir and root — same
+/// rule `deploy` uses for a standalone module. A fresh scaffold has nothing
+/// to upsert (unlike `register`'s `module_meta::write_module_id`, which
+/// preserves an existing `.env`'s other entries).
 fn write_env_file(target: &Path, inputs: &Inputs<'_>) -> Result<()> {
     let path = target.join(".env");
-    let body = format!("MS_MODULE_ID={}\n", sanitize_module_id(inputs.module_id));
+    let key = module_meta::env_key_for_slug(inputs.slug);
+    let body = format!("{key}={}\n", sanitize_module_id(inputs.module_id));
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -316,12 +326,24 @@ mod tests {
     }
 
     #[test]
-    fn write_tree_env_file_carries_sanitized_module_id() {
+    fn write_tree_env_file_carries_suffixed_key_and_sanitized_module_id() {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("media");
         write_tree(&target, &ins("media", "Media")).unwrap();
         let env = fs::read_to_string(target.join(".env")).unwrap();
-        assert_eq!(env, format!("MS_MODULE_ID={SAMPLE_SANITIZED}\n"));
+        assert_eq!(env, format!("MS_MODULE_ID_MEDIA={SAMPLE_SANITIZED}\n"));
+    }
+
+    #[test]
+    fn write_tree_env_file_key_uses_slug_not_a_bare_ms_module_id() {
+        // Every scaffold, even a single-module one, gets the suffixed key —
+        // no special-casing by module count (see module_meta::env_key_for_slug).
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("relay-test-module");
+        write_tree(&target, &ins("relay-test-module", "Relay Test Module")).unwrap();
+        let env = fs::read_to_string(target.join(".env")).unwrap();
+        assert!(env.starts_with("MS_MODULE_ID_RELAY_TEST_MODULE="));
+        assert!(!env.starts_with("MS_MODULE_ID="));
     }
 
     #[test]
