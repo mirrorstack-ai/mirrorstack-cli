@@ -192,7 +192,7 @@ pub(super) struct RegisterPayload<'a> {
 pub(super) struct RegisterAck {
     pub session_id: String,
     /// The per-tunnel service token. The dev runner writes it to a
-    /// per-module `.ms-platform-token-<slug>` file so each spawned module
+    /// per-module `.secret/ms-platform-token-<slug>` file so each spawned module
     /// authenticates platform-initiated calls against ITS own session.
     pub service_token: String,
     /// RFC3339 — informational; the L1.5 reconnect contract makes the
@@ -285,7 +285,7 @@ type RegisterResult<T> = std::result::Result<T, RegisterError>;
 ///
 /// `service_token` is the per-tunnel dispatch-minted token from the
 /// register ack. The dev runner writes it to a per-module
-/// `.ms-platform-token-<slug>` file so each spawned module authenticates
+/// `.secret/ms-platform-token-<slug>` file so each spawned module authenticates
 /// platform-initiated calls (lifecycle install, manifest read) against
 /// ITS own session.
 pub(super) struct TunnelHandle {

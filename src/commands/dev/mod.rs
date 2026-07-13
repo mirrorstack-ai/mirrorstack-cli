@@ -18,7 +18,7 @@
 //! Tunnel mode exposes modules to remote callers (via dispatch's Leaf-1
 //! 307), so each module MUST enforce Internal-scope auth rather than
 //! bypass it. Two cooperating mechanisms make that happen:
-//!   - Per-module `.ms-platform-token-<slug>` files carry the
+//!   - Per-module `.secret/ms-platform-token-<slug>` files carry the
 //!     dispatch-minted `stk_*` service token from each tunnel's register
 //!     ack. The runner points each module's MS_PLATFORM_TOKEN_FILE at its
 //!     own file (see docs/platform-module-auth.md). This is the primary
@@ -103,11 +103,11 @@ const PROXY_PORT_DEFAULT: u16 = 8080;
 const MODULE_ROUTE_PREFIX: &str = "/_m/";
 
 /// Per-module platform-token file. The name is a host↔container contract:
-/// the outer run writes it next to go.work, and the inner runner points
-/// each module's MS_PLATFORM_TOKEN_FILE at it through the `.:/modules`
-/// bind mount.
+/// the outer run writes it into `.secret/` next to go.work, and the inner
+/// runner points each module's MS_PLATFORM_TOKEN_FILE at it through the
+/// `.:/modules` bind mount.
 fn platform_token_file(root: &Path, slug: &str) -> PathBuf {
-    root.join(format!(".ms-platform-token-{slug}"))
+    root.join(".secret").join(format!("ms-platform-token-{slug}"))
 }
 
 /// How often the supervisor polls module sources for changes — matches the
@@ -187,9 +187,9 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     // (only the first module's token), which authenticated whichever module
     // registered first and 401'd every other module on every
     // platform-initiated call (lifecycle install, manifest read, dev-tunnel
-    // API). The files land in `root` and reach the runner through the
-    // `.:/modules` bind mount; the inner runner (`run_inner`) points each
-    // module's MS_PLATFORM_TOKEN_FILE at `.ms-platform-token-<slug>`.
+    // API). The files land in `root/.secret/` and reach the runner through
+    // the `.:/modules` bind mount; the inner runner (`run_inner`) points
+    // each module's MS_PLATFORM_TOKEN_FILE at `.secret/ms-platform-token-<slug>`.
     let mut token_files: Vec<PathBuf> = Vec::new();
 
     // Per-session MS_INTERNAL_SECRET. Sent on each register frame (so
@@ -210,6 +210,8 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
             .as_deref()
             .expect("tunnel mode mints a secret");
         let state = open_tunnels(root, &ready, args.local_url.as_deref(), secret)?;
+        std::fs::create_dir_all(root.join(".secret"))
+            .context("dev: create .secret directory for platform token files")?;
         // `open_tunnels` pushes handles in `ready` order, so zip is aligned.
         for (m, handle) in ready.iter().zip(state.0.iter()) {
             let slug = m.dir.file_name().unwrap().to_string_lossy();
@@ -238,7 +240,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         .stderr(Stdio::inherit());
 
     // MS_PLATFORM_TOKEN_FILE is set per-module by the inner runner (each
-    // module reads its own `.ms-platform-token-<slug>`). MS_INTERNAL_SECRET
+    // module reads its own `.secret/ms-platform-token-<slug>`). MS_INTERNAL_SECRET
     // is injected once on the compose env; the runner forwards it to every
     // module process as the SDK's legacy InternalAuth fallback.
     if let Some(secret) = &internal_secret {
