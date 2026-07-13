@@ -1,11 +1,25 @@
 //! Read the developer's module identity off the scaffolded source tree.
 //!
-//! Parses `Config.ID`, `Config.Slug`, `Config.Name`, and the newest
-//! `Config.Versions` key out of `main.go`. These fields drive tunnel
-//! registration, platform registration, and deploy.
+//! Parses `Config.Slug`, `Config.Name`, and the newest `Config.Versions` key
+//! out of `main.go`. `Config.ID` is different: it's a per-environment value
+//! (local dev and prod each get their own platform-minted ID for the same
+//! source tree), so it lives in ONE git-ignored `.env` file at the workspace
+//! root (the directory holding `go.work` — or, for a freshly scaffolded
+//! standalone module with no `go.work` yet, the scaffold target dir itself)
+//! rather than a `main.go` literal or a per-module file. A monorepo's root
+//! `.env` holds one `MS_MODULE_ID_<SLUG>` key per module (SCREAMING_SNAKE_CASE
+//! of the slug — see [`env_key_for_slug`]) so multiple modules' IDs coexist
+//! in that one file without collision.
+//!
+//! That suffix is a root-`.env`/CLI-tooling-only bookkeeping convention. It
+//! never reaches a module's own runtime: each module process only ever sees
+//! its OWN environment (a separate `mirrorstack dev` child process, or its
+//! own separate Lambda), so the scaffolded `main.go` keeps reading the
+//! plain, unsuffixed `os.Getenv("MS_MODULE_ID")`, and `dev/mod.rs` injects a
+//! plain `MS_MODULE_ID=<value>` into just that module's child env.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
@@ -20,18 +34,22 @@ pub(crate) struct ModuleMeta {
     pub version: Option<String>,
 }
 
-/// Read ID, Slug, Name, and the newest version from `main.go` in `module_dir`.
-pub(crate) fn read_module_meta(module_dir: &Path) -> Result<ModuleMeta> {
+/// Read ID, Slug, Name, and the newest version for `module_dir`. Slug, Name,
+/// and version come from `main.go` in `module_dir`; ID comes from `root`'s
+/// `.env`, keyed on the slug just parsed (see module docs). `root` is the
+/// workspace directory holding `go.work` (or `module_dir` itself, for a
+/// standalone module with no `go.work`).
+pub(crate) fn read_module_meta(module_dir: &Path, root: &Path) -> Result<ModuleMeta> {
     let path = module_dir.join("main.go");
     let body =
         fs::read_to_string(&path).with_context(|| format!("dev: read {}", path.display()))?;
-    let id = extract_field(&body, "ID").unwrap_or_default();
     let slug = extract_field(&body, "Slug").ok_or_else(|| {
         anyhow!(
             "dev: couldn't find `Slug: \"...\"` in {}. Is this a MirrorStack module?",
             path.display()
         )
     })?;
+    let id = read_env_module_id(root, &slug);
     let name = extract_field(&body, "Name").unwrap_or_else(|| slug.clone());
     let version = latest_version(&extract_versions_keys(&body));
     Ok(ModuleMeta {
@@ -43,8 +61,8 @@ pub(crate) fn read_module_meta(module_dir: &Path) -> Result<ModuleMeta> {
 }
 
 /// Convenience wrapper that returns just the ID (for tunnel registration).
-pub(super) fn read_module_id(module_dir: &Path) -> Result<String> {
-    let meta = read_module_meta(module_dir)?;
+pub(super) fn read_module_id(module_dir: &Path, root: &Path) -> Result<String> {
+    let meta = read_module_meta(module_dir, root)?;
     if meta.id.is_empty() {
         return Err(anyhow!(
             "dev: module {} has no ID set. Run `mirrorstack app module register` first.",
@@ -52,6 +70,52 @@ pub(super) fn read_module_id(module_dir: &Path) -> Result<String> {
         ));
     }
     Ok(meta.id)
+}
+
+/// Path to the workspace root's `.env` file — holds one `MS_MODULE_ID_<SLUG>`
+/// key per module. Gitignored; not part of the git-committed source tree.
+fn env_path(root: &Path) -> PathBuf {
+    root.join(".env")
+}
+
+/// Root-`.env` key for a module's platform ID: `MS_MODULE_ID_<SLUG>`, where
+/// `<SLUG>` is the slug SCREAMING_SNAKE_CASEd (uppercased, `-` → `_`). e.g.
+/// `oauth-core` → `MS_MODULE_ID_OAUTH_CORE`, `users-profile` →
+/// `MS_MODULE_ID_USERS_PROFILE`. Suffixing every key (even for a
+/// single-module workspace) keeps one uniform rule instead of special-casing
+/// by module count — and is what lets a monorepo root `.env` hold multiple
+/// modules' IDs without collision.
+///
+/// This is a root-`.env`-file/CLI-lookup-only convention: it never appears
+/// in the scaffold template (`main.go` reads plain `os.Getenv("MS_MODULE_ID")`)
+/// or in a spawned module's own child-process environment (see
+/// `dev::module_process_envs`).
+pub(crate) fn env_key_for_slug(slug: &str) -> String {
+    format!(
+        "MS_MODULE_ID_{}",
+        slug.to_ascii_uppercase().replace('-', "_")
+    )
+}
+
+/// Read `MS_MODULE_ID_<SLUG>` out of `<root>/.env`. Returns an empty string
+/// when the file is missing or the key isn't set (or set empty) — all of
+/// which mean "not registered in this environment yet," mirroring the old
+/// empty-`ID:""`-literal convention this replaces. Parsing (quoting,
+/// comments, blank lines) is delegated to `dotenvy` — the same crate the
+/// CLI already uses for its own `.env` loading in `main.rs` — instead of a
+/// hand-rolled `KEY=value` scanner.
+fn read_env_module_id(root: &Path, slug: &str) -> String {
+    let key = env_key_for_slug(slug);
+    let Ok(iter) = dotenvy::from_path_iter(env_path(root)) else {
+        return String::new();
+    };
+    for item in iter {
+        let Ok((k, val)) = item else { continue };
+        if k == key && !val.is_empty() {
+            return val;
+        }
+    }
+    String::new()
 }
 
 /// Extract the value of a `Field: "..."` pattern from Go source.
@@ -244,67 +308,36 @@ pub(crate) fn promote_version(module_dir: &Path, from: &str, to: &str) -> Result
     Ok(())
 }
 
-/// Write `new_id` into the `ID: "..."` field in `main.go`. If the field
-/// has an empty string (`ID: ""`), it's replaced. If the field is missing
-/// entirely, it's inserted after the `Slug:` line.
-pub(crate) fn write_module_id(module_dir: &Path, new_id: &str) -> Result<()> {
-    let path = module_dir.join("main.go");
-    let body =
-        fs::read_to_string(&path).with_context(|| format!("dev: read {}", path.display()))?;
+/// Write `MS_MODULE_ID_<SLUG>=<new_id>` into `<root>/.env`, creating the
+/// file if it doesn't exist yet. Upserts on that module's key so any other
+/// module's entry (monorepo: several modules share one root `.env`) or other
+/// local-only vars already in the file survive re-running `register`.
+pub(crate) fn write_module_id(root: &Path, slug: &str, new_id: &str) -> Result<()> {
+    let key = env_key_for_slug(slug);
+    let prefix = format!("{key}=");
+    let path = env_path(root);
+    let existing = fs::read_to_string(&path).unwrap_or_default();
 
-    let new_body = if let Some(start) = body.find("ID:") {
-        let after_id = &body[start..];
-        if let Some(q1) = after_id.find('"') {
-            let abs_q1 = start + q1 + 1;
-            let after_q1 = &body[abs_q1..];
-            if let Some(q2) = after_q1.find('"') {
-                let abs_q2 = abs_q1 + q2;
-                format!("{}{}{}", &body[..abs_q1], new_id, &body[abs_q2..])
+    let mut found = false;
+    let mut lines: Vec<String> = existing
+        .lines()
+        .map(|line| {
+            if !found && line.trim_start().starts_with(&prefix) {
+                found = true;
+                format!("{key}={new_id}")
             } else {
-                return Err(anyhow!("malformed ID field in {}", path.display()));
+                line.to_string()
             }
-        } else {
-            return Err(anyhow!("malformed ID field in {}", path.display()));
-        }
-    } else {
-        // Insert ID field after Slug line
-        if let Some(slug_pos) = body.find("Slug:") {
-            let after_slug = &body[slug_pos..];
-            if let Some(nl) = after_slug.find('\n') {
-                let insert_pos = slug_pos + nl + 1;
-                let indent = detect_indent(&body, slug_pos);
-                format!(
-                    "{}{}ID:   \"{}\",\n{}",
-                    &body[..insert_pos],
-                    indent,
-                    new_id,
-                    &body[insert_pos..]
-                )
-            } else {
-                return Err(anyhow!("unexpected EOF after Slug in {}", path.display()));
-            }
-        } else {
-            return Err(anyhow!("no Slug or ID field found in {}", path.display()));
-        }
-    };
+        })
+        .collect();
+    if !found {
+        lines.push(format!("{key}={new_id}"));
+    }
 
+    let mut new_body = lines.join("\n");
+    new_body.push('\n');
     fs::write(&path, new_body).with_context(|| format!("dev: write {}", path.display()))?;
     Ok(())
-}
-
-fn detect_indent(source: &str, field_pos: usize) -> String {
-    let before = &source[..field_pos];
-    if let Some(nl) = before.rfind('\n') {
-        let line_start = &before[nl + 1..field_pos];
-        // Extract leading whitespace
-        let ws: String = line_start
-            .chars()
-            .take_while(|c| c.is_whitespace())
-            .collect();
-        ws
-    } else {
-        String::new()
-    }
 }
 
 fn find_after<'a>(haystack: &'a str, needle: &str) -> Option<&'a str> {
@@ -372,14 +405,104 @@ func main() {
     }
 
     #[test]
-    fn read_module_meta_from_disk() {
+    fn read_module_meta_id_comes_from_env_not_main_go() {
+        // SAMPLE_MAIN_GO carries a stale ID literal (the old scaffold
+        // shape) but no root .env exists — the clean break means that
+        // literal is never read as the ID anymore. Slug/Name/Version still
+        // parse from main.go as before.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("main.go"), SAMPLE_MAIN_GO).unwrap();
-        let meta = read_module_meta(tmp.path()).unwrap();
-        assert_eq!(meta.id, "mbb8a3f8b123456789abcdef012345678");
+        let meta = read_module_meta(tmp.path(), tmp.path()).unwrap();
+        assert_eq!(meta.id, "");
         assert_eq!(meta.slug, "media");
         assert_eq!(meta.name, "Media");
         assert_eq!(meta.version.as_deref(), Some("v0.1.0-dev"));
+    }
+
+    #[test]
+    fn read_module_meta_id_reads_suffixed_key_from_root_env_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.go"), SAMPLE_MAIN_GO).unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "MS_MODULE_ID_MEDIA=menvsourced123\n",
+        )
+        .unwrap();
+        let meta = read_module_meta(tmp.path(), tmp.path()).unwrap();
+        assert_eq!(meta.id, "menvsourced123");
+    }
+
+    #[test]
+    fn read_module_meta_id_reads_from_separate_workspace_root() {
+        // The realistic monorepo shape: module_dir (main.go) is a
+        // subdirectory of root (.env + go.work), not the same directory.
+        let tmp = tempfile::tempdir().unwrap();
+        let module_dir = tmp.path().join("media");
+        std::fs::create_dir(&module_dir).unwrap();
+        std::fs::write(module_dir.join("main.go"), SAMPLE_MAIN_GO).unwrap();
+        std::fs::write(tmp.path().join(".env"), "MS_MODULE_ID_MEDIA=mrootid\n").unwrap();
+        let meta = read_module_meta(&module_dir, tmp.path()).unwrap();
+        assert_eq!(meta.id, "mrootid");
+    }
+
+    #[test]
+    fn env_key_for_slug_screaming_snake_cases() {
+        assert_eq!(env_key_for_slug("oauth-core"), "MS_MODULE_ID_OAUTH_CORE");
+        assert_eq!(
+            env_key_for_slug("users-profile"),
+            "MS_MODULE_ID_USERS_PROFILE"
+        );
+        assert_eq!(
+            env_key_for_slug("relay-test-module"),
+            "MS_MODULE_ID_RELAY_TEST_MODULE"
+        );
+        assert_eq!(env_key_for_slug("media"), "MS_MODULE_ID_MEDIA");
+    }
+
+    #[test]
+    fn root_env_holds_multiple_modules_without_collision() {
+        // The actual monorepo scenario being fixed: one root .env, several
+        // modules' suffixed keys coexisting — each module's read only ever
+        // sees its own value.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "MS_MODULE_ID_OAUTH_CORE=moauthcoreid\nMS_MODULE_ID_OAUTH_GOOGLE=moauthgoogleid\nMS_MODULE_ID_USERS_PROFILE=museridprofileid\n",
+        )
+        .unwrap();
+        assert_eq!(read_env_module_id(tmp.path(), "oauth-core"), "moauthcoreid");
+        assert_eq!(
+            read_env_module_id(tmp.path(), "oauth-google"),
+            "moauthgoogleid"
+        );
+        assert_eq!(
+            read_env_module_id(tmp.path(), "users-profile"),
+            "museridprofileid"
+        );
+    }
+
+    #[test]
+    fn read_env_module_id_ignores_comments_and_blank_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "# local dev id\n\nMS_MODULE_ID_MEDIA=mfromfile\n",
+        )
+        .unwrap();
+        assert_eq!(read_env_module_id(tmp.path(), "media"), "mfromfile");
+    }
+
+    #[test]
+    fn read_env_module_id_empty_when_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(read_env_module_id(tmp.path(), "media"), "");
+    }
+
+    #[test]
+    fn read_env_module_id_empty_when_key_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".env"), "OTHER_VAR=x\n").unwrap();
+        assert_eq!(read_env_module_id(tmp.path(), "media"), "");
     }
 
     #[test]
@@ -410,7 +533,10 @@ func main() {
         assert!(extract_versions_keys(src).is_empty());
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("main.go"), src).unwrap();
-        assert_eq!(read_module_meta(tmp.path()).unwrap().version, None);
+        assert_eq!(
+            read_module_meta(tmp.path(), tmp.path()).unwrap().version,
+            None
+        );
     }
 
     #[test]
@@ -462,7 +588,7 @@ func main() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("main.go"), SAMPLE_MAIN_GO).unwrap();
         promote_version(tmp.path(), "v0.1.0-dev", "v0.1.0").unwrap();
-        let meta = read_module_meta(tmp.path()).unwrap();
+        let meta = read_module_meta(tmp.path(), tmp.path()).unwrap();
         assert_eq!(meta.version.as_deref(), Some("v0.1.0"));
         // Only the Versions key changed; identity fields are untouched.
         assert_eq!(meta.slug, "media");
@@ -479,57 +605,111 @@ func main() {
     }
 
     #[test]
-    fn read_module_id_from_disk() {
+    fn read_module_id_from_root_env_file() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("main.go"), SAMPLE_MAIN_GO).unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "MS_MODULE_ID_MEDIA=mbb8a3f8b123456789abcdef012345678\n",
+        )
+        .unwrap();
         assert_eq!(
-            read_module_id(tmp.path()).unwrap(),
+            read_module_id(tmp.path(), tmp.path()).unwrap(),
             "mbb8a3f8b123456789abcdef012345678"
         );
     }
 
     #[test]
-    fn read_module_id_errors_when_empty() {
+    fn read_module_id_errors_when_env_missing() {
+        // No .env at all — the "unregistered in this environment" case
+        // register is expected to detect and mint a fresh registration for,
+        // even for an old-style module with a stale main.go ID literal.
         let tmp = tempfile::tempdir().unwrap();
-        let src = r#"
-package main
-func main() {
-    ms.Init(ms.Config{
-        ID:   "",
-        Slug: "media",
-        Name: "Media",
-    })
-}
-"#;
-        std::fs::write(tmp.path().join("main.go"), src).unwrap();
-        let err = read_module_id(tmp.path()).unwrap_err().to_string();
+        std::fs::write(tmp.path().join("main.go"), SAMPLE_MAIN_GO).unwrap();
+        let err = read_module_id(tmp.path(), tmp.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no ID set"));
+    }
+
+    #[test]
+    fn read_module_id_errors_when_env_key_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.go"), SAMPLE_MAIN_GO).unwrap();
+        std::fs::write(tmp.path().join(".env"), "MS_MODULE_ID_MEDIA=\n").unwrap();
+        let err = read_module_id(tmp.path(), tmp.path())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no ID set"));
     }
 
     #[test]
     fn read_module_id_missing_main_errors() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = read_module_id(tmp.path()).unwrap_err().to_string();
+        let err = read_module_id(tmp.path(), tmp.path())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("read"));
     }
 
     #[test]
-    fn write_module_id_replaces_empty() {
+    fn write_module_id_creates_root_env_file_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
-        let src = "    ID:   \"\",\n    Slug: \"media\",\n";
-        std::fs::write(tmp.path().join("main.go"), src).unwrap();
-        write_module_id(tmp.path(), "m123abc").unwrap();
-        let result = std::fs::read_to_string(tmp.path().join("main.go")).unwrap();
-        assert!(result.contains("ID:   \"m123abc\""));
+        write_module_id(tmp.path(), "media", "m123abc").unwrap();
+        let result = std::fs::read_to_string(tmp.path().join(".env")).unwrap();
+        assert_eq!(result, "MS_MODULE_ID_MEDIA=m123abc\n");
     }
 
     #[test]
-    fn write_module_id_replaces_existing() {
+    fn write_module_id_upserts_existing_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "MS_MODULE_ID_MEDIA=moldid\nOTHER_VAR=keepme\n",
+        )
+        .unwrap();
+        write_module_id(tmp.path(), "media", "mnewid").unwrap();
+        let result = std::fs::read_to_string(tmp.path().join(".env")).unwrap();
+        assert!(result.contains("MS_MODULE_ID_MEDIA=mnewid"));
+        assert!(!result.contains("moldid"));
+        // Other local vars in .env survive the upsert.
+        assert!(result.contains("OTHER_VAR=keepme"));
+    }
+
+    #[test]
+    fn write_module_id_appends_when_env_file_lacks_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".env"), "OTHER_VAR=keepme\n").unwrap();
+        write_module_id(tmp.path(), "media", "mnewid").unwrap();
+        let result = std::fs::read_to_string(tmp.path().join(".env")).unwrap();
+        assert!(result.contains("OTHER_VAR=keepme"));
+        assert!(result.contains("MS_MODULE_ID_MEDIA=mnewid"));
+    }
+
+    #[test]
+    fn write_module_id_only_touches_its_own_key_when_other_modules_present() {
+        // The monorepo scenario: writing oauth-core's ID must not disturb
+        // users-profile's already-registered entry in the same root .env.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "MS_MODULE_ID_USERS_PROFILE=museridprofileid\n",
+        )
+        .unwrap();
+        write_module_id(tmp.path(), "oauth-core", "moauthcoreid").unwrap();
+        let result = std::fs::read_to_string(tmp.path().join(".env")).unwrap();
+        assert!(result.contains("MS_MODULE_ID_USERS_PROFILE=museridprofileid"));
+        assert!(result.contains("MS_MODULE_ID_OAUTH_CORE=moauthcoreid"));
+    }
+
+    #[test]
+    fn write_module_id_does_not_touch_main_go() {
+        // register's write is .env-only now — main.go (with its stale
+        // literal, if any) is left completely alone.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("main.go"), SAMPLE_MAIN_GO).unwrap();
-        write_module_id(tmp.path(), "mnewid").unwrap();
-        let result = std::fs::read_to_string(tmp.path().join("main.go")).unwrap();
-        assert!(result.contains("\"mnewid\""));
-        assert!(!result.contains("mbb8a3f8b123456789abcdef012345678"));
+        write_module_id(tmp.path(), "media", "mnewid").unwrap();
+        let main_go = std::fs::read_to_string(tmp.path().join("main.go")).unwrap();
+        assert_eq!(main_go, SAMPLE_MAIN_GO);
     }
 }

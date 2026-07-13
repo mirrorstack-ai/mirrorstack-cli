@@ -6,6 +6,7 @@ package main
 import (
 	"embed"
 	"log"
+	"os"
 
 	ms "github.com/mirrorstack-ai/app-module-sdk"
 	"github.com/mirrorstack-ai/app-module-sdk/system"
@@ -24,11 +25,12 @@ var postInitHooks []func()
 
 func main() {
 	if err := ms.Init(ms.Config{
-		// ID is derived from the platform-assigned UUID — stable across slug
-		// renames. Don't change it; renaming the URL slug doesn't require
-		// changing this. Renaming this WOULD require migrating every schema
-		// and table whose name is derived from it.
-		ID:   "__MS_MODULE_ID__",
+		// ID is the platform-assigned module ID for THIS environment, read
+		// from MS_MODULE_ID at runtime (set via ./.env locally, injected as
+		// a deploy-time secret in CI/CD). Each environment — local dev, prod
+		// — mints its own ID, so it can't live as a literal in this
+		// git-committed file; the same source tree runs everywhere.
+		ID: os.Getenv("MS_MODULE_ID"),
 		// Slug is the catalog handle (e.g. "oauth"). Mutable via catalog UI;
 		// the storage prefix at install time is <username>_<slug>_. Renames
 		// force a new recorded version with auto-generated rename migrations.

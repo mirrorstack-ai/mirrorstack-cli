@@ -43,8 +43,9 @@ enum ModuleCommand {
     /// Interactive by default; pass --yes for non-interactive use.
     Init(InitArgs),
     /// Register all unregistered modules in the workspace with the
-    /// platform. Scans go.work, finds modules with empty IDs, creates
-    /// them via the API, and writes the assigned ID back into main.go.
+    /// platform. Scans go.work, finds modules with no MS_MODULE_ID_<SLUG>
+    /// key in the workspace root's .env, creates them via the API, and
+    /// writes the assigned ID back under that module's key in .env.
     Register(RegisterArgs),
     /// Deploy the version your code declares (the newest Config.Versions
     /// key in ./main.go) to a live Lambda invoke target. Records the
@@ -294,7 +295,7 @@ fn register(args: RegisterArgs) -> Result<()> {
 
     for rel_dir in &module_dirs {
         let abs_dir = cwd.join(rel_dir);
-        let meta = match module_meta::read_module_meta(&abs_dir) {
+        let meta = match module_meta::read_module_meta(&abs_dir, &cwd) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("{} skipping {}: {e}", warn_prefix(), rel_dir);
@@ -394,15 +395,22 @@ fn register(args: RegisterArgs) -> Result<()> {
             }
         };
 
-        // Write the ID back into main.go
+        // Write the ID into the workspace root's .env, keyed by this
+        // module's slug — a per-environment value, not a main.go literal,
+        // so the same source tree can carry a different platform-assigned
+        // ID per environment (local dev, prod), and so a monorepo's
+        // multiple modules can each keep their own entry in the one root
+        // .env instead of scattering a file per module directory.
         let sanitized_id = sanitize_module_id(&module_id);
-        module_meta::write_module_id(&abs_dir, &sanitized_id)
-            .with_context(|| format!("write ID to {}/main.go", rel_dir))?;
+        let env_key = module_meta::env_key_for_slug(&meta.slug);
+        module_meta::write_module_id(&cwd, &meta.slug, &sanitized_id)
+            .with_context(|| format!("write {env_key} to {}/.env", cwd.display()))?;
         eprintln!(
-            "  {} wrote ID {} → {}/main.go",
+            "  {} wrote {}={} → {}/.env",
             style("→").dim(),
+            env_key,
             style(&sanitized_id).dim(),
-            rel_dir
+            cwd.display()
         );
         registered += 1;
     }
@@ -686,9 +694,13 @@ fn print_already_recorded(slug: &str, version: &str) {
     );
 }
 
-/// Read main.go metadata with a deploy-flavoured error.
+/// Read main.go metadata with a deploy-flavoured error. `deploy` runs
+/// standalone against a single module directory (no `go.work` requirement,
+/// unlike `register`/`dev`), so `dir` doubles as both the module dir and the
+/// root its `.env` is read from — the same "root == scaffold target" rule
+/// `init` uses for a fresh standalone module.
 fn read_meta(dir: &Path) -> Result<ModuleMeta> {
-    module_meta::read_module_meta(dir).map_err(|e| {
+    module_meta::read_module_meta(dir, dir).map_err(|e| {
         anyhow!(
             "couldn't read the module from {}: {e}. Run from the module directory, or pass --module <slug> / --dir <path>.",
             dir.display()
@@ -718,10 +730,10 @@ fn canonical_version(raw: &str) -> Result<String> {
     Ok(canonical.to_string())
 }
 
-/// Resolve the platform UUID by slug. main.go's Config.ID is the sanitized
-/// `m<hex>` form, not the raw UUID the version endpoints take.
-/// GET /v1/modules/{slug} is caller-scoped, so this doubles as an
-/// ownership check.
+/// Resolve the platform UUID by slug. The workspace root `.env`'s
+/// `MS_MODULE_ID_<SLUG>` value is the sanitized `m<hex>` form, not the raw
+/// UUID the version endpoints take. GET /v1/modules/{slug} is caller-scoped,
+/// so this doubles as an ownership check.
 fn get_owned_module(
     client: &reqwest::blocking::Client,
     apps_base: &str,
