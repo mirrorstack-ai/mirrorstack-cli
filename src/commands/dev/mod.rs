@@ -374,14 +374,12 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
         // are written by the outer run (host) and arrive via the bind mount.
         let token_file = platform_token_file(root, &slug);
 
-        let mut envs: Vec<(String, String)> = vec![
-            ("MS_LOCAL_DB_URL".into(), db_url.clone()),
-            ("PORT".into(), port.to_string()),
-            (
-                "MS_PLATFORM_TOKEN_FILE".into(),
-                token_file.display().to_string(),
-            ),
-        ];
+        // `module_id` is what read_module_meta sourced from this module's
+        // .env (MS_MODULE_ID) — pass the same value through to the spawned
+        // process so the module's own os.Getenv("MS_MODULE_ID") at runtime
+        // resolves without re-reading the file a second time.
+        let mut envs: Vec<(String, String)> =
+            module_process_envs(&db_url, port, module_id, &token_file);
         // Pass through env vars from compose (MS_INTERNAL_SECRET is the
         // per-session secret minted by the outer run; the rest are infra).
         for var in [
@@ -551,6 +549,29 @@ fn supervise_module(spec: ModuleSpec) {
 fn kill_wait(c: &mut Child) {
     let _ = c.kill();
     let _ = c.wait();
+}
+
+/// Base env vars every spawned module process gets: local DB, its
+/// deterministic internal port, its per-session platform-token file path,
+/// and MS_MODULE_ID (the same per-environment value tunnel registration
+/// used) so the module's own `os.Getenv("MS_MODULE_ID")` resolves. Isolated
+/// as a pure function so the value list is unit-testable without spinning
+/// up workspace discovery / docker / a real child process.
+fn module_process_envs(
+    db_url: &str,
+    port: u16,
+    module_id: &str,
+    token_file: &Path,
+) -> Vec<(String, String)> {
+    vec![
+        ("MS_LOCAL_DB_URL".into(), db_url.to_string()),
+        ("PORT".into(), port.to_string()),
+        ("MS_MODULE_ID".into(), module_id.to_string()),
+        (
+            "MS_PLATFORM_TOKEN_FILE".into(),
+            token_file.display().to_string(),
+        ),
+    ]
 }
 
 /// `go build -buildvcs=false -o <bin> .` in the module dir. Compile errors
@@ -897,4 +918,26 @@ fn mint_internal_secret() -> Result<String> {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_process_envs_includes_ms_module_id() {
+        let envs = module_process_envs(
+            "postgres://x/y",
+            18080,
+            "mbb8a3f8b123456789abcdef012345678",
+            Path::new("/tmp/.ms-platform-token-media"),
+        );
+        assert!(envs.contains(&(
+            "MS_MODULE_ID".to_string(),
+            "mbb8a3f8b123456789abcdef012345678".to_string()
+        )));
+        assert!(envs.contains(&("PORT".to_string(), "18080".to_string())));
+        assert!(envs.contains(&("MS_LOCAL_DB_URL".to_string(), "postgres://x/y".to_string())));
+        assert!(envs.contains(&(
+            "MS_PLATFORM_TOKEN_FILE".to_string(),
+            "/tmp/.ms-platform-token-media".to_string()
+        )));
+    }
+}

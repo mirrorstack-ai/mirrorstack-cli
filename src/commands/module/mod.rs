@@ -43,8 +43,9 @@ enum ModuleCommand {
     /// Interactive by default; pass --yes for non-interactive use.
     Init(InitArgs),
     /// Register all unregistered modules in the workspace with the
-    /// platform. Scans go.work, finds modules with empty IDs, creates
-    /// them via the API, and writes the assigned ID back into main.go.
+    /// platform. Scans go.work, finds modules with no MS_MODULE_ID in
+    /// .env, creates them via the API, and writes the assigned ID to
+    /// each module's .env.
     Register(RegisterArgs),
     /// Deploy the version your code declares (the newest Config.Versions
     /// key in ./main.go) to a live Lambda invoke target. Records the
@@ -394,12 +395,14 @@ fn register(args: RegisterArgs) -> Result<()> {
             }
         };
 
-        // Write the ID back into main.go
+        // Write the ID into .env — a per-environment value, not a main.go
+        // literal, so the same source tree can carry a different
+        // platform-assigned ID per environment (local dev, prod).
         let sanitized_id = sanitize_module_id(&module_id);
         module_meta::write_module_id(&abs_dir, &sanitized_id)
-            .with_context(|| format!("write ID to {}/main.go", rel_dir))?;
+            .with_context(|| format!("write ID to {}/.env", rel_dir))?;
         eprintln!(
-            "  {} wrote ID {} → {}/main.go",
+            "  {} wrote ID {} → {}/.env",
             style("→").dim(),
             style(&sanitized_id).dim(),
             rel_dir
@@ -718,8 +721,8 @@ fn canonical_version(raw: &str) -> Result<String> {
     Ok(canonical.to_string())
 }
 
-/// Resolve the platform UUID by slug. main.go's Config.ID is the sanitized
-/// `m<hex>` form, not the raw UUID the version endpoints take.
+/// Resolve the platform UUID by slug. The module's `.env` MS_MODULE_ID is
+/// the sanitized `m<hex>` form, not the raw UUID the version endpoints take.
 /// GET /v1/modules/{slug} is caller-scoped, so this doubles as an
 /// ownership check.
 fn get_owned_module(

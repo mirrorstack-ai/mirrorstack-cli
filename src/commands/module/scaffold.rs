@@ -19,6 +19,7 @@ const MCP_GO: &str = include_str!("../../../templates/module/mcp.go.tmpl");
 const ROUTES_GO: &str = include_str!("../../../templates/module/routes.go.tmpl");
 const GO_MOD: &str = include_str!("../../../templates/module/go.mod.tmpl");
 const SQL_INIT: &str = include_str!("../../../templates/module/sql/app/0001_init.up.sql.tmpl");
+const GITIGNORE: &str = include_str!("../../../templates/module/.gitignore.tmpl");
 
 // Placeholder tokens. Kept in one place so the contract between the .tmpl
 // files and this renderer is auditable from a single grep.
@@ -29,8 +30,10 @@ const MODULE_ID_TOKEN: &str = "__MS_MODULE_ID__";
 /// Inputs collected by the caller before scaffolding.
 ///
 /// `module_id` is the platform-assigned UUID — stable across slug renames,
-/// which is why both `Config.ID` and the table prefix derive from it rather
-/// than from the URL slug.
+/// which is why both the scaffolded `.env`'s `MS_MODULE_ID` and the SQL
+/// table prefix derive from it rather than from the URL slug. `Config.ID`
+/// itself is no longer a template substitution target: the scaffolded
+/// `main.go` reads it from `MS_MODULE_ID` at runtime instead.
 pub(super) struct Inputs<'a> {
     pub slug: &'a str,
     pub name: &'a str,
@@ -63,6 +66,25 @@ pub(super) fn write_tree(target: &Path, inputs: &Inputs<'_>) -> Result<()> {
     write_file(target, "routes.go", ROUTES_GO, inputs)?;
     write_file(target, "go.mod", GO_MOD, inputs)?;
     write_file(target, "sql/app/0001_init.up.sql", SQL_INIT, inputs)?;
+    write_file(target, ".gitignore", GITIGNORE, inputs)?;
+    write_env_file(target, inputs)?;
+    Ok(())
+}
+
+/// Write the fresh module's `.env` — the platform-assigned ID for THIS
+/// environment, read by the scaffolded `main.go` via `os.Getenv`. A fresh
+/// scaffold has nothing to upsert (unlike `register`'s
+/// `module_meta::write_module_id`, which preserves an existing `.env`).
+fn write_env_file(target: &Path, inputs: &Inputs<'_>) -> Result<()> {
+    let path = target.join(".env");
+    let body = format!("MS_MODULE_ID={}\n", sanitize_module_id(inputs.module_id));
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| format!("scaffold: create {}", path.display()))?;
+    f.write_all(body.as_bytes())
+        .with_context(|| format!("scaffold: write {}", path.display()))?;
     Ok(())
 }
 
@@ -126,16 +148,23 @@ mod tests {
     }
 
     #[test]
-    fn render_substitutes_module_id_into_config_id() {
+    fn render_config_id_reads_env_var_not_a_literal() {
+        // Config.ID is no longer a compile-time literal — it's read from
+        // MS_MODULE_ID at runtime so the same source tree can carry a
+        // different platform-assigned ID per environment (local dev, prod).
         let out = render(MAIN_GO, &ins("my-mod", "My Mod"));
         assert!(
-            out.contains(&format!(r#"ID:   "{}""#, SAMPLE_SANITIZED)),
-            "rendered main.go missing UUID-derived Config.ID"
+            out.contains(r#"ID: os.Getenv("MS_MODULE_ID"),"#),
+            "rendered main.go missing os.Getenv(\"MS_MODULE_ID\") Config.ID"
         );
         assert!(out.contains(r#"Name: "My Mod""#));
         assert!(!out.contains("__MS_SLUG__"));
         assert!(!out.contains("__MS_NAME__"));
         assert!(!out.contains("__MS_MODULE_ID__"));
+        assert!(
+            !out.contains(SAMPLE_SANITIZED),
+            "main.go must not carry the sanitized ID as a literal anymore"
+        );
     }
 
     #[test]
@@ -276,12 +305,35 @@ mod tests {
             "routes.go",
             "go.mod",
             "sql/app/0001_init.up.sql",
+            ".gitignore",
+            ".env",
         ] {
             let p = target.join(rel);
             assert!(p.exists(), "missing {}", p.display());
         }
         let main = fs::read_to_string(target.join("main.go")).unwrap();
-        assert!(main.contains(&format!(r#"ID:   "{}""#, SAMPLE_SANITIZED)));
+        assert!(main.contains(r#"ID: os.Getenv("MS_MODULE_ID"),"#));
+    }
+
+    #[test]
+    fn write_tree_env_file_carries_sanitized_module_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("media");
+        write_tree(&target, &ins("media", "Media")).unwrap();
+        let env = fs::read_to_string(target.join(".env")).unwrap();
+        assert_eq!(env, format!("MS_MODULE_ID={SAMPLE_SANITIZED}\n"));
+    }
+
+    #[test]
+    fn write_tree_gitignore_covers_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("media");
+        write_tree(&target, &ins("media", "Media")).unwrap();
+        let gitignore = fs::read_to_string(target.join(".gitignore")).unwrap();
+        assert!(
+            gitignore.lines().any(|l| l.trim() == ".env"),
+            "scaffolded .gitignore must ignore .env: {gitignore:?}"
+        );
     }
 
     #[test]
