@@ -48,9 +48,10 @@ enum ModuleCommand {
     /// writes the assigned ID back under that module's key in .env.
     Register(RegisterArgs),
     /// Deploy the version your code declares (the newest Config.Versions
-    /// key in ./main.go) to a live Lambda invoke target. Records the
-    /// version with its CHANGELOG.md section first when it isn't recorded
-    /// yet — records are immutable, bump the key to ship a new entry.
+    /// key in ./main.go). Records the version with its CHANGELOG.md section
+    /// first when it isn't recorded yet — records are immutable, bump the
+    /// key to ship a new entry. The prod transport target is derived by the
+    /// platform from the module's own identity, never supplied by the caller.
     Deploy(DeployArgs),
 }
 
@@ -92,9 +93,6 @@ pub struct RegisterArgs {
 
 #[derive(Args)]
 pub struct DeployArgs {
-    /// Lambda function name or full ARN, with an optional :qualifier.
-    #[arg(long)]
-    target: String,
     /// Module slug. Defaults to Config.Slug parsed from ./main.go.
     #[arg(long)]
     module: Option<String>,
@@ -102,6 +100,9 @@ pub struct DeployArgs {
     /// README.md. Defaults to cwd.
     #[arg(long)]
     dir: Option<PathBuf>,
+    /// Deploy transport status. Defaults to the platform's default ("active").
+    #[arg(long, value_parser = ["active", "draining", "disabled"])]
+    status: Option<String>,
     /// Non-interactive mode. Refuses `-dev` versions instead of offering
     /// to promote them.
     #[arg(long, short)]
@@ -503,8 +504,12 @@ fn deploy(args: DeployArgs) -> Result<()> {
             &module.id,
             &version,
             &SetModuleDeployInput {
-                invoke_target: &args.target,
-                status: None,
+                // Platform-derived from the module's own identity
+                // (Milestone H P4 / decision 12) — the server ignores
+                // whatever is sent here, so there is nothing meaningful
+                // for the caller to supply.
+                invoke_target: "",
+                status: args.status.as_deref(),
             },
         )
     });
@@ -781,9 +786,14 @@ fn deploy_error_hint(code: &str) -> &'static str {
         "not_found" => {
             " (the version record vanished mid-deploy — re-run `mirrorstack app module deploy`)"
         }
+        // The platform derives invoke_target from the module's own slug and
+        // only sanity-checks that derivation — this can't be triggered by
+        // anything the CLI sends, but the code is still surfaced if the
+        // platform ever rejects a slug shape.
         "invoke_target_invalid" => {
-            " (expected a Lambda function name or full ARN, optional :qualifier, [A-Za-z0-9_-]{1,140})"
+            " (the platform couldn't derive a valid deploy target from this module's slug — this is a platform-side issue, not something to fix locally)"
         }
+        "status_invalid" => " (--status must be one of: active, draining, disabled)",
         _ => "",
     }
 }
@@ -1100,7 +1110,8 @@ mod tests {
     #[test]
     fn deploy_error_hint_for_known_codes() {
         assert!(deploy_error_hint("not_found").contains("mirrorstack app module deploy"));
-        assert!(deploy_error_hint("invoke_target_invalid").contains("ARN"));
+        assert!(deploy_error_hint("invoke_target_invalid").contains("platform"));
+        assert!(deploy_error_hint("status_invalid").contains("--status"));
         assert_eq!(deploy_error_hint("something_else"), "");
     }
 
