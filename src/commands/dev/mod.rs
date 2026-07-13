@@ -107,7 +107,8 @@ const MODULE_ROUTE_PREFIX: &str = "/_m/";
 /// runner points each module's MS_PLATFORM_TOKEN_FILE at it through the
 /// `.:/modules` bind mount.
 fn platform_token_file(root: &Path, slug: &str) -> PathBuf {
-    root.join(".secret").join(format!("ms-platform-token-{slug}"))
+    root.join(".secret")
+        .join(format!("ms-platform-token-{slug}"))
 }
 
 /// How often the supervisor polls module sources for changes — matches the
