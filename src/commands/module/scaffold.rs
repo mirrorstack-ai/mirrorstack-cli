@@ -29,11 +29,29 @@ const SLUG_TOKEN: &str = "__MS_SLUG__";
 const NAME_TOKEN: &str = "__MS_NAME__";
 const MODULE_ID_TOKEN: &str = "__MS_MODULE_ID__";
 
+/// Runtime placeholder the SDK's db.Querier wrapper resolves against
+/// `Config.ID` on every query, at request time (see
+/// app-module-sdk/internal/core/db_placeholder.go). Scaffolded SQL emits
+/// THIS token in place of MODULE_ID_TOKEN — not the sanitized module_id — so
+/// the table-name prefix baked into sql/app/0001_init.up.sql never goes
+/// stale: baking today's platform-assigned UUID in as literal text drifts
+/// the moment the module is deleted and re-registered under a fresh catalog
+/// UUID (Config.ID changes at runtime, but literal table names compiled into
+/// SQL/Go source would not). MODULE_ID_TOKEN itself remains a
+/// scaffold-time-only marker (substituted here, at generation time); this is
+/// a *different* token that survives into the generated source and is
+/// resolved by the SDK at every query instead.
+const RUNTIME_MODULE_ID_PLACEHOLDER: &str = "__MODULE_ID__";
+
 /// Inputs collected by the caller before scaffolding.
 ///
 /// `module_id` is the platform-assigned UUID — stable across slug renames,
-/// which is why both the scaffolded `.env`'s `MS_MODULE_ID_<SLUG>` entry and
-/// the SQL table prefix derive from it rather than from the URL slug.
+/// which is why the scaffolded `.env`'s `MS_MODULE_ID_<SLUG>` entry derives
+/// from it rather than from the URL slug. The generated SQL's table-name
+/// prefix does NOT derive from `module_id` — it emits the SDK's runtime
+/// `__MODULE_ID__` placeholder instead (see RUNTIME_MODULE_ID_PLACEHOLDER),
+/// so it stays correct even if this module is later deleted and
+/// re-registered under a different UUID.
 /// `Config.ID` itself is no longer a template substitution target: the
 /// scaffolded `main.go` reads it from the plain `MS_MODULE_ID` at runtime
 /// instead — the `<SLUG>` suffix never reaches the template.
@@ -119,7 +137,7 @@ fn write_file(target: &Path, rel: &str, body: &str, inputs: &Inputs<'_>) -> Resu
 fn render(body: &str, inputs: &Inputs<'_>) -> String {
     body.replace(SLUG_TOKEN, inputs.slug)
         .replace(NAME_TOKEN, inputs.name)
-        .replace(MODULE_ID_TOKEN, &sanitize_module_id(inputs.module_id))
+        .replace(MODULE_ID_TOKEN, RUNTIME_MODULE_ID_PLACEHOLDER)
 }
 
 /// Convert a platform UUID (`bb8a3f8b-1234-5678-9abc-def012345678`) into a
@@ -269,11 +287,20 @@ mod tests {
     }
 
     #[test]
-    fn render_sql_uses_module_id_table_prefix() {
+    fn render_sql_uses_runtime_module_id_placeholder() {
+        // The scaffold must NOT bake the sanitized (real) module ID into the
+        // generated SQL as a literal — that's exactly the drift bug this
+        // change fixes. It emits the SDK's runtime placeholder token
+        // instead, which app-module-sdk's db.Querier wrapper resolves
+        // against Config.ID on every query.
         let out = render(SQL_INIT, &ins("my-mod", "My Mod"));
-        let expected = format!("CREATE TABLE IF NOT EXISTS {}_items", SAMPLE_SANITIZED);
-        assert!(out.contains(&expected), "missing {expected:?}");
+        let expected = "CREATE TABLE IF NOT EXISTS __MODULE_ID___items";
+        assert!(out.contains(expected), "missing {expected:?}");
         assert!(!out.contains("__MS_MODULE_ID__"));
+        assert!(
+            !out.contains(SAMPLE_SANITIZED),
+            "scaffolded SQL must not bake in the sanitized module ID as a literal"
+        );
     }
 
     #[test]
