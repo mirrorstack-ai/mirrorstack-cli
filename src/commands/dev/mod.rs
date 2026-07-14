@@ -689,8 +689,24 @@ fn build_module(spec: &ModuleSpec, label: &str) -> bool {
 
 /// Spawn the built module binary and tap its stdout/stderr into the
 /// forwarder (terminal prefix + shipper sink).
+///
+/// `env_clear()` is load-bearing, not cosmetic: this CLI process's own env
+/// carries the *entire* root `.env` (main.rs's `load_dotenv` loads it
+/// wholesale via dotenvy, which sets every key — including every sibling
+/// module's suffixed `MS_MODULE_ID_<SLUG>` — as a real process env var, not
+/// just something the CLI parses locally). `Command` inherits the parent
+/// env by default, so without the clear here, every spawned module would
+/// see every *other* module's platform ID on top of the curated
+/// `spec.envs` list — exactly the cross-module leak this whole `.env`
+/// scheme exists to prevent. PATH is re-added explicitly since the module
+/// binary may need it (e.g. to exec a subprocess); nothing else from the
+/// CLI's own env passes through implicitly.
 fn start_module(spec: &ModuleSpec, label: &'static str) -> Option<Child> {
     let mut cmd = Command::new(&spec.bin);
+    cmd.env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
+    }
     cmd.current_dir(&spec.dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1044,6 +1060,59 @@ mod tests {
         assert!(
             !envs.iter().any(|(k, _)| k.starts_with("MS_MODULE_ID_")),
             "child env must not carry a suffixed MS_MODULE_ID_* key: {envs:?}"
+        );
+    }
+
+    /// Real spawn, not just the `Vec` `module_process_envs` returns. Regression
+    /// for the actual leak: `main.rs`'s `load_dotenv` loads the *whole* root
+    /// `.env` into this CLI process's own env (dotenvy sets every key it
+    /// finds, not just the ones this module cares about), so every sibling
+    /// module's suffixed `MS_MODULE_ID_<SLUG>` becomes a real var on this
+    /// process. `Command` inherits the parent env by default, so without an
+    /// explicit `env_clear()` in `start_module`, that suffixed key would
+    /// leak into every spawned module regardless of what `spec.envs` says.
+    /// Simulates the loaded root `.env` by setting the poisoned var directly,
+    /// spawns `/usr/bin/env` (which just dumps its own env to stdout) through
+    /// `start_module`, and asserts the forwarded output never carries it.
+    #[cfg(unix)]
+    #[test]
+    fn start_module_does_not_leak_parent_process_env_into_child() {
+        // SAFETY: test-only process-global env mutation; no other test reads
+        // or depends on this key, and it's removed at the end.
+        unsafe {
+            std::env::set_var("MS_MODULE_ID_OAUTH_CORE", "leaked-sibling-id");
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let spec = ModuleSpec {
+            slug: "media".into(),
+            dir: std::env::temp_dir(),
+            bin: PathBuf::from("/usr/bin/env"),
+            envs: vec![("MS_MODULE_ID".into(), "own-id".into())],
+            sink: Some(tx),
+            watch: false,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+
+        let mut child = start_module(&spec, "test").expect("spawn /usr/bin/env");
+        child.wait().expect("child exits");
+
+        let mut lines = Vec::new();
+        while let Ok(entry) = rx.recv_timeout(Duration::from_secs(2)) {
+            lines.push(entry.msg);
+        }
+
+        unsafe {
+            std::env::remove_var("MS_MODULE_ID_OAUTH_CORE");
+        }
+
+        assert!(
+            lines.iter().any(|l| l == "MS_MODULE_ID=own-id"),
+            "expected the child's own plain MS_MODULE_ID in its env: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("MS_MODULE_ID_")),
+            "child process env must not inherit a sibling's suffixed MS_MODULE_ID_* key: {lines:?}"
         );
     }
 }
