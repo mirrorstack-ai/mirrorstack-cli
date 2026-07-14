@@ -47,7 +47,8 @@ use rand::rngs::OsRng;
 use reqwest::blocking::Client;
 
 use super::{
-    DEFAULT_DISPATCH_BASE, ENV_DISPATCH_URL, ok_mark, resolve_base, session_expired, warn_prefix,
+    DEFAULT_APPS_API_BASE, DEFAULT_DISPATCH_BASE, ENV_APPS_API_URL, ENV_DISPATCH_URL, ok_mark,
+    resolve_base, session_expired, warn_prefix,
 };
 use crate::{api, credentials, http};
 
@@ -55,6 +56,7 @@ mod log_shipper;
 pub(crate) mod module_meta;
 mod proxy;
 mod reload;
+mod share;
 mod tunnel;
 mod workspace;
 
@@ -72,6 +74,12 @@ pub struct DevArgs {
     /// Run all registered modules directly (used inside Docker runner).
     #[arg(long)]
     all: bool,
+    /// Publish each module's built web bundle to the CDN so REMOTE viewers of
+    /// a prod dev-tunnel can load it. Only meaningful with --tunnel; in
+    /// local-only mode the bundle already serves from localhost and this has
+    /// no effect (a warning says so). Off by default — today's behavior.
+    #[arg(long)]
+    share: bool,
     /// Watch module sources and rebuild/restart on change (used with
     /// --all). On by default so the compose runner hot-reloads; pass
     /// --watch=false for a one-shot run.
@@ -182,6 +190,17 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         ));
     }
 
+    // --share only means something for a prod dev-tunnel: a remote viewer
+    // can't reach the dev's localhost, so the bundle must go to the CDN. In
+    // local-only mode the browser IS on the dev's machine and the localhost
+    // bundle serves fine — sharing would be dead work. Warn, don't error.
+    if args.share && !args.tunnel {
+        eprintln!(
+            "{} --share has no effect without --tunnel: local-only dev serves the bundle from localhost.",
+            warn_prefix()
+        );
+    }
+
     // Per-module platform-token files. Each tunnel session gets its OWN
     // dispatch-minted service token, so each module process must read the
     // token for ITS session. The old behavior wrote a single shared file
@@ -232,6 +251,31 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         None
     };
 
+    // With --share on a live tunnel, spin up the host-side bundle watcher.
+    // It's the only process holding the user access token (credentials.json,
+    // never mounted into the runner) AND able to read each module's built
+    // web/dist/index.js (via the compose bind mount) AND aware of the tunnel
+    // session registration whose bundleUrl the confirm step updates — so the
+    // upload belongs here, not in the container (see share.rs). Best-effort:
+    // a share failure never blocks the tunnel.
+    let share_state = if args.tunnel && args.share {
+        let targets = build_share_targets(root, &ready);
+        if targets.is_empty() {
+            eprintln!(
+                "{} --share: no module ships a web bundle — nothing to share",
+                warn_prefix()
+            );
+            None
+        } else {
+            let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
+            let stop = Arc::new(AtomicBool::new(false));
+            let handle = share::spawn_watcher(apps_base, targets, stop.clone());
+            Some((stop, handle))
+        }
+    } else {
+        None
+    };
+
     eprintln!("{} starting docker compose…", ok_mark());
     let mut compose = Command::new("docker");
     compose
@@ -254,6 +298,12 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         }
         _ => anyhow!("dev: docker compose up: {e}"),
     })?;
+
+    // Stop the share watcher and let its current scan drain before we return.
+    if let Some((stop, handle)) = share_state {
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+    }
 
     // Cleanup per-module token files.
     for f in &token_files {
@@ -280,6 +330,28 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Build the `--share` watcher's target list from the ready modules: one
+/// entry per web-bundle-shipping module, carrying its slug, catalog id, and
+/// the host path to its built bundle. Modules that ship no web bundle
+/// (`ShareTarget::for_module` returns None) or whose id can't be resolved
+/// (shouldn't happen — `open_tunnels` already resolved every id) are skipped.
+fn build_share_targets(
+    root: &Path,
+    ready: &[workspace::WorkspaceModule],
+) -> Vec<share::ShareTarget> {
+    let mut targets = Vec::new();
+    for m in ready {
+        let slug = m.dir.file_name().unwrap().to_string_lossy().to_string();
+        let Ok(module_id) = module_meta::read_module_id(&m.abs_dir, root) else {
+            continue;
+        };
+        if let Some(t) = share::ShareTarget::for_module(&m.abs_dir, slug, module_id) {
+            targets.push(t);
+        }
+    }
+    targets
 }
 
 // ── Inner mode: inside Docker, run modules directly ─────────────────

@@ -751,6 +751,120 @@ pub fn activate_app_stage(
     Err(envelope_error(resp))
 }
 
+/// Body for `POST /v1/modules/{moduleId}/dev-bundle/presign` — declares the
+/// bundle the CLI is about to upload. The platform derives the S3 key
+/// server-side from `(moduleId, ownerUserID, sha256)`; the CLI never picks
+/// the key. `content_type` is always `application/javascript` and
+/// `size_bytes` is the raw bundle length (server caps it at 32 MiB).
+#[derive(Debug, Serialize)]
+pub struct DevBundlePresignInput<'a> {
+    pub content_type: &'a str,
+    pub size_bytes: u64,
+    /// Lowercase hex SHA-256 of the bundle bytes (64 chars).
+    pub sha256: &'a str,
+}
+
+/// Response from the dev-bundle presign step: a short-lived presigned S3 PUT
+/// plus the server-derived key the CLI echoes back on confirm.
+#[derive(Debug, Deserialize)]
+pub struct DevBundlePresign {
+    pub upload_url: String,
+    pub key: String,
+    /// RFC3339 presign expiry — informational only (the PUT follows
+    /// immediately, so the CLI never acts on it).
+    #[allow(dead_code)]
+    pub expires_at: String,
+}
+
+/// POST /v1/modules/{moduleId}/dev-bundle/presign — mint a presigned S3 PUT
+/// for a dev-tunnel web bundle (opt-in `--share`). Owner-gated: a module the
+/// caller doesn't own (or an unknown/non-UUID id) collapses to 404
+/// `not_found`. `415` rejects a non-`application/javascript` content type;
+/// `413` rejects an oversize (>32 MiB) declaration; `422` rejects an
+/// ill-formed sha256 — all surfaced as `ApiError::Server` so the caller can
+/// log the specific reason.
+pub fn presign_dev_bundle(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+    input: &DevBundlePresignInput,
+) -> Result<DevBundlePresign, ApiError> {
+    let endpoint = format!(
+        "{}/v1/modules/{}/dev-bundle/presign",
+        apps_base.trim_end_matches('/'),
+        module_id
+    );
+
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .json(input)
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<DevBundlePresign>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
+/// Body for `POST /v1/modules/{moduleId}/dev-bundle/confirm` — the key the
+/// presign step returned. The platform HEAD-verifies the uploaded object,
+/// records the CDN URL as the live tunnel session's dev-bundle pointer, and
+/// returns that URL.
+#[derive(Debug, Serialize)]
+pub struct DevBundleConfirmInput<'a> {
+    pub key: &'a str,
+}
+
+/// Response from the dev-bundle confirm step: the CDN URL now served as the
+/// module's `bundleUrl` for the live dev tunnel.
+#[derive(Debug, Deserialize)]
+pub struct DevBundleConfirmed {
+    pub url: String,
+}
+
+/// POST /v1/modules/{moduleId}/dev-bundle/confirm — finalize a dev-bundle
+/// upload. The platform HEAD-verifies the object (content-type,
+/// size ≤ 32 MiB, declared sha256) and points the live tunnel session at the
+/// resulting CDN URL. `403` (IDOR: key outside the caller's own prefix),
+/// `410` (upload missing), and `422` (`confirm_mismatch`) come back as
+/// `ApiError::Server`.
+pub fn confirm_dev_bundle(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+    key: &str,
+) -> Result<DevBundleConfirmed, ApiError> {
+    let endpoint = format!(
+        "{}/v1/modules/{}/dev-bundle/confirm",
+        apps_base.trim_end_matches('/'),
+        module_id
+    );
+
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .json(&DevBundleConfirmInput { key })
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<DevBundleConfirmed>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
 /// Body of a successful `POST /v1/auth/sessions/refresh`. The platform
 /// rotates the refresh token on every refresh (replay defense), so we
 /// must persist the new one back to credentials. expires_at is RFC3339
@@ -1898,6 +2012,206 @@ mod tests {
             ApiError::Server { status, code, .. } => {
                 assert_eq!(status, 409);
                 assert_eq!(code, "deploy_not_ready");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn presign_dev_bundle_success_sends_declaration() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/dev-bundle/presign")
+            .match_header("authorization", "Bearer AT")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"content_type":"application/javascript","size_bytes":422,"sha256":"abc123"}"#
+                    .into(),
+            ))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "upload_url": "https://s3.example/put?sig=1",
+                    "key": "modules/mod-uuid/dev/u-1/abc123/web/index.js",
+                    "expires_at": "2026-07-14T00:15:00Z"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let p = presign_dev_bundle(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            &DevBundlePresignInput {
+                content_type: "application/javascript",
+                size_bytes: 422,
+                sha256: "abc123",
+            },
+        )
+        .expect("ok");
+        assert_eq!(p.upload_url, "https://s3.example/put?sig=1");
+        assert_eq!(p.key, "modules/mod-uuid/dev/u-1/abc123/web/index.js");
+    }
+
+    #[test]
+    fn presign_dev_bundle_413_oversize_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/dev-bundle/presign")
+            .with_status(413)
+            .with_body(r#"{"error":{"code":"bundle_too_large","message":"bundle exceeds 32 MiB"}}"#)
+            .create();
+
+        let err = presign_dev_bundle(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            &DevBundlePresignInput {
+                content_type: "application/javascript",
+                size_bytes: 99,
+                sha256: "abc123",
+            },
+        )
+        .unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 413);
+                assert_eq!(code, "bundle_too_large");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn presign_dev_bundle_404_not_owner_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/dev-bundle/presign")
+            .with_status(404)
+            .with_body(r#"{"error":{"code":"not_found","message":"module not found"}}"#)
+            .create();
+
+        let err = presign_dev_bundle(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            &DevBundlePresignInput {
+                content_type: "application/javascript",
+                size_bytes: 1,
+                sha256: "abc123",
+            },
+        )
+        .unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 404);
+                assert_eq!(code, "not_found");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn presign_dev_bundle_401_is_unauthenticated() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/dev-bundle/presign")
+            .with_status(401)
+            .create();
+
+        let err = presign_dev_bundle(
+            &test_client(),
+            &server.url(),
+            "expired",
+            "mod-uuid",
+            &DevBundlePresignInput {
+                content_type: "application/javascript",
+                size_bytes: 1,
+                sha256: "abc123",
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
+    }
+
+    #[test]
+    fn confirm_dev_bundle_success_returns_cdn_url() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/dev-bundle/confirm")
+            .match_header("authorization", "Bearer AT")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"key":"modules/mod-uuid/dev/u-1/abc123/web/index.js"}"#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "url": "https://cdn.mirrorstack.ai/modules/mod-uuid/dev/u-1/abc123/web/index.js"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let c = confirm_dev_bundle(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            "modules/mod-uuid/dev/u-1/abc123/web/index.js",
+        )
+        .expect("ok");
+        assert_eq!(
+            c.url,
+            "https://cdn.mirrorstack.ai/modules/mod-uuid/dev/u-1/abc123/web/index.js"
+        );
+    }
+
+    #[test]
+    fn confirm_dev_bundle_422_mismatch_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/dev-bundle/confirm")
+            .with_status(422)
+            .with_body(
+                r#"{"error":{"code":"confirm_mismatch","message":"object hash does not match declared sha256"}}"#,
+            )
+            .create();
+
+        let err = confirm_dev_bundle(&test_client(), &server.url(), "AT", "mod-uuid", "some/key")
+            .unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 422);
+                assert_eq!(code, "confirm_mismatch");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirm_dev_bundle_403_idor_surfaces_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/dev-bundle/confirm")
+            .with_status(403)
+            .with_body(r#"{"error":{"code":"forbidden","message":"key outside caller prefix"}}"#)
+            .create();
+
+        let err = confirm_dev_bundle(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            "modules/other/dev/u-2/x/web/index.js",
+        )
+        .unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 403);
+                assert_eq!(code, "forbidden");
             }
             other => panic!("expected Server, got {other:?}"),
         }
