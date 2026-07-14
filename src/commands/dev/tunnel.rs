@@ -447,6 +447,15 @@ struct RelayCtx {
     internal_secret: Option<String>,
 }
 
+/// A relay reply queued for the sink, paired with the `corr_id` of the
+/// `rpc.req` it answers. Carrying the id alongside the already-serialized
+/// frame lets [`run_tunnel_loop`] name *which* request it dropped if the
+/// sink send fails, without re-parsing the frame body on the hot path.
+struct RelayReply {
+    corr_id: String,
+    msg: Message,
+}
+
 /// Long-running tunnel loop: ping every 30s, respond to server pings,
 /// shut down on signal. Surfaces transport failures via `warn_prefix()`
 /// so a silently-dying tunnel doesn't leave the user wondering why
@@ -469,7 +478,7 @@ async fn run_tunnel_loop(
     // rather than being sent directly from the spawned relay task: a
     // `SplitSink` can't be shared/sent across concurrent tasks, and `sink`
     // is already owned by this loop for pings/pongs/close.
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<RelayReply>();
     loop {
         tokio::select! {
             _ = shutdown.notified() => {
@@ -502,10 +511,33 @@ async fn run_tunnel_loop(
                     }
                 }
             }
-            Some(msg) = rx.recv() => {
-                if let Err(e) = sink.send(msg).await {
-                    eprintln!("{} tunnel: relay reply send failed ({e}); closing tunnel", warn_prefix());
-                    return;
+            Some(reply) = rx.recv() => {
+                // A single relay-reply send failure must NOT tear down the
+                // tunnel. API Gateway severs the WSS connection when one
+                // `PostToConnection` frame overflows its ~128 KB ceiling, so
+                // this send can return `Broken pipe` for one oversized reply.
+                // Returning here would kill the socket owner, the heartbeat,
+                // and the reader — flapping the module to 503 for *every*
+                // request over a single bad frame. Instead: log the dropped
+                // reply (scoped to its corr_id), drop it, and keep serving.
+                // Dispatch already degrades one missing reply gracefully
+                // (its BLPOP times out → 502 for that request only).
+                //
+                // We deliberately do NOT try to tell "socket dead" from "one
+                // frame too big" here: tungstenite surfaces both as a plain
+                // per-send error, and a fragile consecutive-failure counter
+                // would only approximate what two liveness paths already
+                // detect authoritatively. A genuinely dead socket is torn
+                // down by whichever fires first — the `stream.next()` arm
+                // (Close/Err/None below) or the 30s heartbeat ping (whose
+                // send failure still returns). Both trip within one ping
+                // interval, so a wedged socket cannot spin here forever.
+                if let Err(e) = sink.send(reply.msg).await {
+                    eprintln!(
+                        "{} tunnel: relay reply send failed for {} ({e}); dropping this reply, keeping tunnel open",
+                        warn_prefix(),
+                        reply.corr_id
+                    );
                 }
             }
             msg = stream.next() => {
@@ -564,7 +596,7 @@ fn ping_payload(hash: Option<&str>) -> Option<serde_json::Value> {
 /// during the handshake; the SQL plane is still deferred) is ignored.
 fn spawn_rpc_relay_if_req(
     text: &str,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::UnboundedSender<RelayReply>,
     http: &reqwest::Client,
     ctx: &Arc<RelayCtx>,
 ) {
@@ -613,7 +645,7 @@ fn spawn_rpc_relay_if_req(
 /// Relay one `rpc.req` to the local module and send `rpc.resp`/`rpc.err`
 /// (correlated on `corr_id`, the original frame's `id`) back on `tx`.
 async fn relay_rpc_req(
-    tx: mpsc::UnboundedSender<Message>,
+    tx: mpsc::UnboundedSender<RelayReply>,
     http: reqwest::Client,
     ctx: Arc<RelayCtx>,
     corr_id: String,
@@ -631,13 +663,17 @@ async fn relay_rpc_req(
         Ok(resp) => Frame::new(FrameType::RpcResp, serde_json::to_value(&resp).ok()),
         Err(err) => Frame::new(FrameType::RpcErr, serde_json::to_value(&err).ok()),
     };
-    frame.corr_id = Some(corr_id);
+    frame.corr_id = Some(corr_id.clone());
     if let Ok(body) = serde_json::to_string(&frame) {
         // The receiving end (`rx.recv()` in `run_tunnel_loop`) only goes
         // away when the loop itself is exiting/exited, so a send failure
         // here just means we lost the reply to a tunnel that's already
-        // shutting down — nothing left to report it to.
-        let _ = tx.send(Message::Text(body));
+        // shutting down — nothing left to report it to. The `corr_id` rides
+        // along so the loop can name this request if the sink send fails.
+        let _ = tx.send(RelayReply {
+            corr_id,
+            msg: Message::Text(body),
+        });
     }
 }
 
@@ -818,9 +854,9 @@ mod tests {
     /// Pull the next message off `rx`, assert it's `Message::Text`, and
     /// parse it as a [`Frame`]. Shared by the `relay_rpc_req_*` tests below
     /// — each previously duplicated this same unwrap-then-parse block.
-    async fn recv_frame(rx: &mut mpsc::UnboundedReceiver<Message>) -> Frame {
-        let msg = rx.recv().await.expect("expected a relay reply");
-        let Message::Text(text) = msg else {
+    async fn recv_frame(rx: &mut mpsc::UnboundedReceiver<RelayReply>) -> Frame {
+        let reply = rx.recv().await.expect("expected a relay reply");
+        let Message::Text(text) = reply.msg else {
             panic!("expected a text message")
         };
         serde_json::from_str(&text).unwrap()
@@ -1057,7 +1093,7 @@ mod tests {
             .create_async()
             .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<RelayReply>();
         let req = RpcReqPayload {
             method: "GET".to_string(),
             path: "/hello".to_string(),
@@ -1086,7 +1122,7 @@ mod tests {
 
     #[tokio::test]
     async fn relay_rpc_req_unreachable_module_sends_rpc_err() {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<RelayReply>();
         let req = RpcReqPayload {
             method: "GET".to_string(),
             path: "/x".to_string(),
@@ -1111,6 +1147,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_reply_carries_corr_id_for_scoped_drop_logging() {
+        // The queued reply carries the originating `corr_id` alongside the
+        // serialized frame so `run_tunnel_loop` can name *which* request it
+        // dropped when a sink send fails — without re-parsing the frame on
+        // the hot path. Guards against the id being silently dropped from the
+        // channel item, which would unscope the "keeping tunnel open" warning
+        // that replaces the old whole-tunnel teardown.
+        let (tx, mut rx) = mpsc::unbounded_channel::<RelayReply>();
+        let req = RpcReqPayload {
+            method: "GET".to_string(),
+            path: "/x".to_string(),
+            query: String::new(),
+            headers: HashMap::new(),
+            body: None,
+        };
+        // Unreachable module → rpc.err, but the reply is still enqueued with
+        // its corr_id (the drop path we guard is transport, not the module).
+        relay_rpc_req(
+            tx,
+            reqwest::Client::new(),
+            test_ctx("http://127.0.0.1:1", "", None),
+            "frm_scope".to_string(),
+            req,
+        )
+        .await;
+
+        let reply = rx.recv().await.expect("expected a relay reply");
+        assert_eq!(reply.corr_id, "frm_scope");
+        // The wrapper's corr_id mirrors the frame's, so logging either names
+        // the same request.
+        let Message::Text(text) = reply.msg else {
+            panic!("expected a text message")
+        };
+        let frame: Frame = serde_json::from_str(&text).unwrap();
+        assert_eq!(frame.corr_id.as_deref(), Some("frm_scope"));
+    }
+
+    #[tokio::test]
     async fn relay_rpc_req_oversized_response_is_rejected() {
         let mut server = mockito::Server::new_async().await;
         // One byte over MAX_RELAY_BODY_BYTES (the raw-body cap), not
@@ -1126,7 +1200,7 @@ mod tests {
             .create_async()
             .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<RelayReply>();
         let req = RpcReqPayload {
             method: "GET".to_string(),
             path: "/big".to_string(),
@@ -1163,7 +1237,7 @@ mod tests {
             .create_async()
             .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<RelayReply>();
         let req = RpcReqPayload {
             method: "GET".to_string(),
             path: "/big-ok".to_string(),
@@ -1211,7 +1285,7 @@ mod tests {
             .create_async()
             .await;
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<RelayReply>();
         let mut headers = HashMap::new();
         headers.insert(
             "X-MS-Platform-Token".to_string(),
@@ -1251,7 +1325,7 @@ mod tests {
     fn spawn_rpc_relay_if_req_ignores_non_rpc_req_frames() {
         // Regression guard: a ping/pong/close text frame (or any frame type
         // other than rpc.req) must not panic or attempt a relay.
-        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<RelayReply>();
         let http = reqwest::Client::new();
         let ping = Frame::new(FrameType::Ping, None);
         let text = serde_json::to_string(&ping).unwrap();
