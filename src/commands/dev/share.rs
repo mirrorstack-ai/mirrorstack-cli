@@ -98,6 +98,29 @@ impl ShareTarget {
     }
 }
 
+/// The dev-bundle REST endpoints (`/v1/modules/{id}/dev-bundle/...`) key on the
+/// dashed catalog UUID, but the tunnel — and `MS_MODULE_ID_<SLUG>` / the value
+/// `read_module_id` resolves — use the sanitized `m<32-hex>` form. Convert
+/// `m5dcba905ba6c4242a9c3696f9efc92e9` -> `5dcba905-ba6c-4242-a9c3-696f9efc92e9`
+/// so presign/confirm resolve the module instead of 404ing on a non-UUID id.
+/// A value that isn't the `m` + 32-hex shape is passed through unchanged (it's
+/// already a UUID, or an unexpected id the server will reject on its own).
+fn catalog_uuid(module_id: &str) -> String {
+    let hex = module_id.strip_prefix('m').unwrap_or(module_id);
+    if hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32],
+        )
+    } else {
+        module_id.to_string()
+    }
+}
+
 /// Lowercase hex SHA-256 of `bytes`. The content address that both gates
 /// re-uploads (unchanged bytes → same hash → skip) and, server-side, becomes
 /// the CDN key segment.
@@ -121,6 +144,9 @@ fn upload_bundle(
     bytes: &[u8],
     sha256: &str,
 ) -> Result<String, ApiError> {
+    // The REST endpoints key on the dashed catalog UUID, not the tunnel's
+    // m<hex> form that `module_id` carries here.
+    let module_id = &catalog_uuid(module_id);
     let presign = credentials::with_refresh_retry(creds, |tok| {
         api::presign_dev_bundle(
             api_client,
@@ -363,6 +389,21 @@ mod tests {
     #[test]
     fn sha256_hex_changes_with_content() {
         assert_ne!(sha256_hex(b"a"), sha256_hex(b"b"));
+    }
+
+    #[test]
+    fn catalog_uuid_reverses_m_hex_to_dashed_uuid() {
+        assert_eq!(
+            catalog_uuid("m5dcba905ba6c4242a9c3696f9efc92e9"),
+            "5dcba905-ba6c-4242-a9c3-696f9efc92e9"
+        );
+        // Already a dashed UUID → passed through unchanged.
+        assert_eq!(
+            catalog_uuid("5dcba905-ba6c-4242-a9c3-696f9efc92e9"),
+            "5dcba905-ba6c-4242-a9c3-696f9efc92e9"
+        );
+        // Not the m+32-hex shape → unchanged.
+        assert_eq!(catalog_uuid("not-an-id"), "not-an-id");
     }
 
     #[test]
