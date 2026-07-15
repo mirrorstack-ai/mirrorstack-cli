@@ -26,23 +26,25 @@ fn authorize_url_carries_required_params() {
         verifier: "v".into(),
         challenge: "abc".into(),
     };
-    let raw = authorize_url("https://example.com", "STATE", &p);
-    let u = url::Url::parse(&raw).expect("parse");
-    assert_eq!(u.path(), "/authorize");
+    for redirect_uri in [REDIRECT_URI_SCHEME, REDIRECT_URI_OOB] {
+        let raw = authorize_url("https://example.com", redirect_uri, "STATE", &p);
+        let u = url::Url::parse(&raw).expect("parse");
+        assert_eq!(u.path(), "/authorize");
 
-    let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
-    assert_eq!(q.get("client_id").map(String::as_str), Some(CLIENT_ID));
-    assert_eq!(
-        q.get("redirect_uri").map(String::as_str),
-        Some(REDIRECT_URI)
-    );
-    assert_eq!(q.get("response_type").map(String::as_str), Some("code"));
-    assert_eq!(q.get("code_challenge").map(String::as_str), Some("abc"));
-    assert_eq!(
-        q.get("code_challenge_method").map(String::as_str),
-        Some("S256")
-    );
-    assert_eq!(q.get("state").map(String::as_str), Some("STATE"));
+        let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
+        assert_eq!(q.get("client_id").map(String::as_str), Some(CLIENT_ID));
+        assert_eq!(
+            q.get("redirect_uri").map(String::as_str),
+            Some(redirect_uri)
+        );
+        assert_eq!(q.get("response_type").map(String::as_str), Some("code"));
+        assert_eq!(q.get("code_challenge").map(String::as_str), Some("abc"));
+        assert_eq!(
+            q.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(q.get("state").map(String::as_str), Some("STATE"));
+    }
 }
 
 #[test]
@@ -51,7 +53,7 @@ fn authorize_url_trims_trailing_slash() {
         verifier: "v".into(),
         challenge: "c".into(),
     };
-    let raw = authorize_url("https://example.com/", "s", &p);
+    let raw = authorize_url("https://example.com/", REDIRECT_URI_OOB, "s", &p);
     assert!(
         raw.starts_with("https://example.com/authorize?"),
         "got {raw}"
@@ -75,31 +77,35 @@ mod exchange {
 
     #[test]
     fn success_returns_tokens() {
-        let mut server = Server::new();
-        let m = server
-            .mock("POST", "/v1/oauth/token")
-            .match_header("accept", "application/json")
-            .match_body(Matcher::AllOf(vec![
-                Matcher::UrlEncoded("grant_type".into(), "authorization_code".into()),
-                Matcher::UrlEncoded("code".into(), "AUTHCODE".into()),
-                Matcher::UrlEncoded("code_verifier".into(), "VERIFIER".into()),
-            ]))
-            .with_status(200)
-            .with_body(
-                json!({"access_token":"AT","token_type":"Bearer","expires_in":900,"refresh_token":"RT"})
-                    .to_string(),
-            )
-            .create();
+        for redirect_uri in [REDIRECT_URI_SCHEME, REDIRECT_URI_OOB] {
+            let mut server = Server::new();
+            let m = server
+                .mock("POST", "/v1/oauth/token")
+                .match_header("accept", "application/json")
+                .match_body(Matcher::AllOf(vec![
+                    Matcher::UrlEncoded("grant_type".into(), "authorization_code".into()),
+                    Matcher::UrlEncoded("code".into(), "AUTHCODE".into()),
+                    Matcher::UrlEncoded("code_verifier".into(), "VERIFIER".into()),
+                    Matcher::UrlEncoded("redirect_uri".into(), redirect_uri.into()),
+                ]))
+                .with_status(200)
+                .with_body(
+                    json!({"access_token":"AT","token_type":"Bearer","expires_in":900,"refresh_token":"RT"})
+                        .to_string(),
+                )
+                .create();
 
-        let pkce = Pkce {
-            verifier: "VERIFIER".into(),
-            challenge: "C".into(),
-        };
-        let tr = exchange_code(&http(), &server.url(), "AUTHCODE", &pkce).expect("ok");
-        m.assert();
-        assert_eq!(tr.access_token, "AT");
-        assert_eq!(tr.refresh_token, "RT");
-        assert_eq!(tr.expires_in, 900);
+            let pkce = Pkce {
+                verifier: "VERIFIER".into(),
+                challenge: "C".into(),
+            };
+            let tr =
+                exchange_code(&http(), &server.url(), redirect_uri, "AUTHCODE", &pkce).expect("ok");
+            m.assert();
+            assert_eq!(tr.access_token, "AT");
+            assert_eq!(tr.refresh_token, "RT");
+            assert_eq!(tr.expires_in, 900);
+        }
     }
 
     #[test]
@@ -120,6 +126,7 @@ mod exchange {
             let err = exchange_code(
                 &http(),
                 &server.url(),
+                REDIRECT_URI_OOB,
                 "X",
                 &Pkce {
                     verifier: "v".into(),
@@ -147,6 +154,7 @@ mod exchange {
         let err = exchange_code(
             &http(),
             &server.url(),
+            REDIRECT_URI_OOB,
             "X",
             &Pkce {
                 verifier: "v".into(),
@@ -169,6 +177,7 @@ mod exchange {
         let err = exchange_code(
             &http(),
             &server.url(),
+            REDIRECT_URI_OOB,
             "X",
             &Pkce {
                 verifier: "v".into(),

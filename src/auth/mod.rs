@@ -1,9 +1,9 @@
 //! OAuth 2.0 authorization-code + PKCE client. Pairs with api-platform's
 //! `/v1/oauth/*` endpoints and the web-account `/authorize` consent page.
 //!
-//! OOB delivery (`urn:ietf:wg:oauth:2.0:oob`): the user pastes the code
-//! displayed on the consent page back into the terminal. Custom-scheme
-//! and per-OS handler registration is the follow-up tracked at #7.
+//! Custom-scheme delivery (`mirrorstack://callback`) is the default. OOB
+//! delivery (`urn:ietf:wg:oauth:2.0:oob`), where the user pastes the code
+//! displayed on the consent page back into the terminal, is the fallback.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -21,9 +21,11 @@ use crate::http;
 /// api-platform migration `011_oauth.up.sql`.
 pub const CLIENT_ID: &str = "mirrorstack-cli";
 
-/// RFC 6749 §1.3.1 OOB sentinel — used while custom-scheme delivery is
-/// not yet shipped (mirrorstack-cli#7).
-pub const REDIRECT_URI: &str = "urn:ietf:wg:oauth:2.0:oob";
+/// RFC 6749 §1.3.1 OOB sentinel used by the paste-in fallback.
+pub const REDIRECT_URI_OOB: &str = "urn:ietf:wg:oauth:2.0:oob";
+
+/// Custom URL-scheme callback handled by the CLI's per-OS registration.
+pub const REDIRECT_URI_SCHEME: &str = "mirrorstack://callback";
 
 /// PKCE method the platform accepts. RFC 7636 §4.3.
 const CHALLENGE_METHOD: &str = "S256";
@@ -47,13 +49,13 @@ impl Pkce {
 }
 
 /// Build the consent-page URL the user opens in a browser.
-pub fn authorize_url(web_base: &str, state: &str, pkce: &Pkce) -> String {
+pub fn authorize_url(web_base: &str, redirect_uri: &str, state: &str, pkce: &Pkce) -> String {
     let base = web_base.trim_end_matches('/');
     let mut u = Url::parse(&format!("{base}/authorize"))
         .unwrap_or_else(|_| Url::parse("https://account.mirrorstack.ai/authorize").unwrap());
     u.query_pairs_mut()
         .append_pair("client_id", CLIENT_ID)
-        .append_pair("redirect_uri", REDIRECT_URI)
+        .append_pair("redirect_uri", redirect_uri)
         .append_pair("response_type", "code")
         .append_pair("code_challenge", &pkce.challenge)
         .append_pair("code_challenge_method", CHALLENGE_METHOD)
@@ -61,9 +63,8 @@ pub fn authorize_url(web_base: &str, state: &str, pkce: &Pkce) -> String {
     u.into()
 }
 
-/// 16 random bytes, base64url-no-pad. State is required by the auth
-/// server but not validated end-to-end in OOB (paste only carries the
-/// code). Generalizes when custom-scheme delivery lands.
+/// 16 random bytes, base64url-no-pad. State is validated by custom-scheme
+/// delivery; OOB paste carries only the code.
 pub fn random_state() -> Result<String, AuthError> {
     random_b64url(16)
 }
@@ -80,10 +81,11 @@ pub struct TokenResponse {
     pub refresh_token: String,
 }
 
-/// Exchange the pasted auth code (+ PKCE verifier) for tokens.
+/// Exchange the authorization code (+ PKCE verifier) for tokens.
 pub fn exchange_code(
     http: &Client,
     api_base: &str,
+    redirect_uri: &str,
     code: &str,
     pkce: &Pkce,
 ) -> Result<TokenResponse, AuthError> {
@@ -93,7 +95,7 @@ pub fn exchange_code(
         ("client_id", CLIENT_ID),
         ("code", code),
         ("code_verifier", &pkce.verifier),
-        ("redirect_uri", REDIRECT_URI),
+        ("redirect_uri", redirect_uri),
     ];
 
     let resp = http

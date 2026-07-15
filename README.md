@@ -13,13 +13,14 @@ Pre-built releases (brew, scoop, deb) coming with the next milestone.
 ## Commands
 
 ```bash
-mirrorstack login           # Sign in via OAuth (PKCE)
-mirrorstack logout          # Revoke the current session and wipe local credentials
-mirrorstack whoami          # Print the currently signed-in user
-mirrorstack app module init # Register a new module on the platform
-mirrorstack app web deploy  # Deploy a static build directory to app hosting
-mirrorstack --help          # Show help
-mirrorstack --version       # Show CLI version
+mirrorstack login              # Opens the browser and completes automatically on macOS/Linux
+mirrorstack login --no-browser # Sign in on SSH/headless (paste the code shown on the page)
+mirrorstack logout             # Revoke the current session and wipe local credentials
+mirrorstack whoami             # Print the currently signed-in user
+mirrorstack app module init    # Register a new module on the platform
+mirrorstack app web deploy     # Deploy a static build directory to app hosting
+mirrorstack --help             # Show help
+mirrorstack --version          # Show CLI version
 ```
 
 ## Local development

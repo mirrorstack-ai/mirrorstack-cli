@@ -12,6 +12,7 @@ mod browser;
 mod commands;
 mod credentials;
 mod http;
+mod scheme;
 
 fn main() -> ExitCode {
     load_dotenv();

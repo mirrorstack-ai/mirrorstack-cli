@@ -73,6 +73,10 @@ pub struct Cli {
 enum Command {
     /// Sign in to MirrorStack via OAuth.
     Login(login::LoginArgs),
+    /// Internal: receive an OAuth callback URL from the OS URL-scheme handler
+    /// and relay it to the waiting `login` over the per-attempt unix socket.
+    #[command(name = "__oauth-deliver", hide = true)]
+    OauthDeliver { url: String },
     /// Sign out: revoke the current session and remove local credentials.
     Logout(logout::LogoutArgs),
     /// Print the currently signed-in user.
@@ -89,6 +93,7 @@ impl Cli {
     pub fn run(self) -> Result<()> {
         match self.command {
             Command::Login(args) => login::run(args),
+            Command::OauthDeliver { url } => crate::scheme::deliver(&url),
             Command::Logout(args) => logout::run(args),
             Command::Whoami(args) => whoami::run(args),
             Command::Apps(args) => app::run(args),
