@@ -45,7 +45,7 @@ mod unix {
     use std::thread;
     use std::time::Duration;
 
-    use super::super::relay::{UnixRelay, deliver_to, socket_key};
+    use super::super::relay::{UnixRelay, deliver_to, is_nonce, socket_key};
     use super::super::{RelayHandle, WaitError};
 
     // Bind at a caller-owned temp path (via a short `$TMPDIR`, not the mutable
@@ -55,7 +55,7 @@ mod unix {
     fn relay_round_trip_is_single_use() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("rt.sock");
-        let relay = UnixRelay::bind_path(path.clone()).expect("bind relay");
+        let relay = UnixRelay::bind_path(path.clone(), "RTSTATE").expect("bind relay");
 
         let callback_url = "mirrorstack://callback?code=RT&state=RTSTATE".to_owned();
         let delivered = (path.clone(), callback_url.clone());
@@ -79,14 +79,48 @@ mod unix {
     #[test]
     fn relay_times_out() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let relay = UnixRelay::bind_path(dir.path().join("to.sock")).expect("bind relay");
+        let relay = UnixRelay::bind_path(dir.path().join("to.sock"), "TOSTATE").expect("bind relay");
         let result = relay.wait(Duration::from_millis(250));
         assert!(matches!(result, Err(WaitError::Timeout)));
+    }
+
+    // A same-UID peer that connects with the wrong `state` (or none) must not
+    // be able to end the attempt: it is ignored and the relay waits out its
+    // deadline for the authentic callback.
+    #[test]
+    fn relay_ignores_unauthenticated_peer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("auth.sock");
+        let relay = UnixRelay::bind_path(path.clone(), "REALSTATE").expect("bind relay");
+
+        // Wrong state, and an error callback with no state — both must be
+        // ignored rather than aborting or short-circuiting the wait.
+        let _ = deliver_to(&path, "mirrorstack://callback?code=SPOOF&state=WRONG");
+        let _ = deliver_to(&path, "mirrorstack://callback?error=access_denied");
+
+        let result = relay.wait(Duration::from_millis(400));
+        assert!(
+            matches!(result, Err(WaitError::Timeout)),
+            "unauthenticated peers must not end the wait: {result:?}"
+        );
     }
 
     #[test]
     fn socket_key_stays_within_the_af_unix_limit() {
         assert_eq!(socket_key(&"a".repeat(22)).len(), 16);
         assert_eq!(socket_key("short"), "short");
+    }
+
+    // A malicious `state` (any web page can invoke the registered scheme
+    // handler) must not escape the per-user oauth dir when turned into a
+    // socket filename.
+    #[test]
+    fn nonce_validation_rejects_path_escape() {
+        assert!(is_nonce("abcDEF123-_"));
+        assert!(!is_nonce("/run/docker"));
+        assert!(!is_nonce("../../../../tmp/evil"));
+        assert!(!is_nonce("has space"));
+        assert!(!is_nonce(""));
+        assert!(!is_nonce(&"a".repeat(200)));
     }
 }

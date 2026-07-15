@@ -66,6 +66,7 @@ impl RelayHandle for FakeRelay {
 struct FakeIo {
     code: String,
     opened: Vec<String>,
+    shown: Vec<String>,
     warns: Vec<String>,
 }
 
@@ -74,6 +75,7 @@ impl FakeIo {
         Self {
             code: code.into(),
             opened: Vec::new(),
+            shown: Vec::new(),
             warns: Vec::new(),
         }
     }
@@ -82,6 +84,10 @@ impl FakeIo {
 impl LoginIo for FakeIo {
     fn open_browser(&mut self, authorize_url: &str) {
         self.opened.push(authorize_url.into());
+    }
+
+    fn show_url(&mut self, authorize_url: &str) {
+        self.shown.push(authorize_url.into());
     }
 
     fn note(&mut self, _msg: &str) {}
@@ -189,6 +195,36 @@ fn unsupported_uses_oob() {
     assert!(result.is_ok(), "got {result:?}");
     mock.assert();
     assert!(io.warns.is_empty(), "unexpected warnings: {:?}", io.warns);
+}
+
+#[test]
+fn no_browser_skips_browser_and_uses_oob() {
+    let mut server = Server::new();
+    let mock = token_mock(&mut server, auth::REDIRECT_URI_OOB, "OOBCODE");
+    let mut cfg = cfg(&server);
+    cfg.no_browser = true;
+    // Registration + relay must be skipped entirely under --no-browser.
+    let reg = FakeRegistrar {
+        outcome: RegistrationOutcome::Registered,
+    };
+    let factory = FakeRelayFactory {
+        behavior: RelayBehavior::GoodCallback,
+    };
+    let mut io = FakeIo::new("OOBCODE");
+
+    let result = run_with(&reg, &factory, &mut io, &cfg);
+
+    assert!(result.is_ok(), "got {result:?}");
+    mock.assert();
+    assert!(
+        io.opened.is_empty(),
+        "--no-browser must not open a browser: {:?}",
+        io.opened
+    );
+    assert!(
+        !io.shown.is_empty(),
+        "--no-browser should still print the sign-in URL"
+    );
 }
 
 #[test]

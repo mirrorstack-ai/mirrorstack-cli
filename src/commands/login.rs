@@ -29,6 +29,7 @@ pub struct LoginArgs {
 
 trait LoginIo {
     fn open_browser(&mut self, authorize_url: &str);
+    fn show_url(&mut self, authorize_url: &str);
     fn note(&mut self, msg: &str);
     fn warn(&mut self, msg: &str);
     fn read_code(&mut self) -> Result<String>;
@@ -43,6 +44,11 @@ impl LoginIo for StdIo {
         if browser::open(authorize_url).is_err() {
             self.warn("could not auto-open browser; copy the URL above and paste it manually");
         }
+    }
+
+    fn show_url(&mut self, authorize_url: &str) {
+        println!("To sign in, open this URL in a browser:\n");
+        println!("  {authorize_url}\n");
     }
 
     fn note(&mut self, msg: &str) {
@@ -163,7 +169,14 @@ fn oob(
     pkce: &auth::Pkce,
 ) -> Result<auth::TokenResponse> {
     let url = auth::authorize_url(&cfg.web_base, auth::REDIRECT_URI_OOB, state, pkce);
-    io.open_browser(&url);
+    // `--no-browser` (SSH/headless) must not touch a browser; only print the
+    // URL. The scheme→OOB fallback (no_browser=false) still auto-opens so the
+    // user lands on the page that shows the paste-in code.
+    if cfg.no_browser {
+        io.show_url(&url);
+    } else {
+        io.open_browser(&url);
+    }
     let code = io.read_code()?;
     let code = code.trim();
     if code.is_empty() {
