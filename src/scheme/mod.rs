@@ -4,6 +4,13 @@
 //! to the waiting `login` command. Unsupported platforms (Windows, headless)
 //! fall back to OOB paste.
 
+// The relay, per-OS registration, and their error/helper types are all built
+// only on unix (see the cfg(unix) module + item gates below). On other targets
+// (the windows CI build) every one of them is legitimately unused, so silence
+// dead_code there rather than cfg-gating each type, trait, and helper piecemeal
+// — the whole module is inert on Windows by design.
+#![cfg_attr(not(unix), allow(dead_code))]
+
 use std::time::Duration;
 
 use url::Url;
