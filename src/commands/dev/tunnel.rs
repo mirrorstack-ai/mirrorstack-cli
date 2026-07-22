@@ -340,12 +340,10 @@ pub(super) async fn open(
     .context("dev: register_ack timeout")??;
 
     let shutdown = Arc::new(Notify::new());
-    // Async client for the heartbeat's local manifest fetch. Client-level
-    // timeout guards every GET so a wedged module can't stall the ping loop.
-    let http = reqwest::Client::builder()
-        .timeout(MANIFEST_FETCH_TIMEOUT)
-        .build()
-        .context("dev: build manifest-hash http client")?;
+    // Async client for the heartbeat's local manifest fetch and every WSS
+    // HTTP-relay call. Client-level timeout guards every GET so a wedged
+    // module can't stall the ping loop.
+    let http = relay_http_client().context("dev: build manifest-hash http client")?;
     // Built once per connection and shared via `Arc`: `local_url`,
     // `service_token`, and `internal_secret` are invariant for the whole
     // tunnel's lifetime, so every spawned relay task should bump a refcount
@@ -675,6 +673,21 @@ async fn relay_rpc_req(
             msg: Message::Text(body),
         });
     }
+}
+
+/// HTTP client for the tunnel's local calls (heartbeat manifest GET +
+/// relayed `rpc.req`). Redirects are NEVER followed: a module's 3xx (e.g.
+/// oauth-core's `/public/start` → accounts.google.com) must be relayed
+/// verbatim so the BROWSER chases the Location — following it here relays
+/// the redirect target's response instead, which breaks the flow outright
+/// and (with Google's multi-KB headers) blows API Gateway's response
+/// limits into a bare 502. Dispatch's direct-dial client pins the same
+/// semantics with Go's `http.ErrUseLastResponse`.
+fn relay_http_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(MANIFEST_FETCH_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
 }
 
 /// Attach the CLI-minted `X-MS-Platform-Token`/`X-MS-Internal-Secret`
@@ -1117,6 +1130,58 @@ mod tests {
         assert_eq!(payload["status"], 201);
         let body_b64 = payload["body"].as_str().unwrap();
         assert_eq!(STANDARD.decode(body_b64).unwrap(), b"hi there");
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn relay_rpc_req_relays_redirect_verbatim() {
+        // A module 3xx (oauth-core /public/start → accounts.google.com) must
+        // reach dispatch as-is so the BROWSER follows the Location. reqwest's
+        // default policy chases it and relays the redirect target's response
+        // instead — the bug this pins. Uses the production client
+        // (relay_http_client, Policy::none()), not Client::new().
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("GET", "/public/start")
+            .with_status(302)
+            .with_header(
+                "location",
+                "https://accounts.google.com/o/oauth2/v2/auth?state=x",
+            )
+            .with_header("set-cookie", "ms_oauth_state=abc; Path=/; HttpOnly")
+            .create_async()
+            .await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<RelayReply>();
+        let req = RpcReqPayload {
+            method: "GET".to_string(),
+            path: "/public/start".to_string(),
+            query: String::new(),
+            headers: HashMap::new(),
+            body: None,
+        };
+        relay_rpc_req(
+            tx,
+            relay_http_client().unwrap(),
+            test_ctx(server.url(), "ptok", Some("sec")),
+            "frm_redirect".to_string(),
+            req,
+        )
+        .await;
+
+        let frame = recv_frame(&mut rx).await;
+        assert_eq!(frame.frame_type, FrameType::RpcResp);
+        assert_eq!(frame.corr_id.as_deref(), Some("frm_redirect"));
+        let payload = frame.payload.unwrap();
+        assert_eq!(payload["status"], 302);
+        assert_eq!(
+            payload["headers"]["location"][0],
+            "https://accounts.google.com/o/oauth2/v2/auth?state=x"
+        );
+        assert_eq!(
+            payload["headers"]["set-cookie"][0],
+            "ms_oauth_state=abc; Path=/; HttpOnly"
+        );
         m.assert_async().await;
     }
 

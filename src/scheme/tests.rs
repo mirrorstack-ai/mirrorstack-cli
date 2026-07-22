@@ -79,7 +79,8 @@ mod unix {
     #[test]
     fn relay_times_out() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let relay = UnixRelay::bind_path(dir.path().join("to.sock"), "TOSTATE").expect("bind relay");
+        let relay =
+            UnixRelay::bind_path(dir.path().join("to.sock"), "TOSTATE").expect("bind relay");
         let result = relay.wait(Duration::from_millis(250));
         assert!(matches!(result, Err(WaitError::Timeout)));
     }
