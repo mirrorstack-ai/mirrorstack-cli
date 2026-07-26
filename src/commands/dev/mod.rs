@@ -60,6 +60,23 @@ mod share;
 mod tunnel;
 mod workspace;
 
+const PASSTHROUGH_ENV: [&str; 10] = [
+    "MS_INTERNAL_SECRET",
+    "REDIS_URL",
+    "AWS_ENDPOINT_URL",
+    "AWS_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    // Platform plane. `env_clear()` in `start_module` means anything not
+    // named here never reaches the module, and the SDK's dispatch fallback
+    // is a local port that a tunnel session does not run. Dropping
+    // MS_DISPATCH_URL breaks every ms.Call/Emit/Notify request.
+    "MS_DISPATCH_URL",
+    "MS_PUBLIC_BASE_URL",
+    "MS_PLATFORM_BROKER_BASE",
+    "MS_PLATFORM_ASSERTION_PUBLIC_KEY",
+];
+
 #[derive(Args)]
 pub struct DevArgs {
     /// Working directory containing go.work.
@@ -458,19 +475,9 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
         let mut envs: Vec<(String, String)> =
             module_process_envs(&db_url, port, module_id, &token_file);
         // Pass through env vars from compose (MS_INTERNAL_SECRET is the
-        // per-session secret minted by the outer run; the rest are infra).
-        for var in [
-            "MS_INTERNAL_SECRET",
-            "REDIS_URL",
-            "AWS_ENDPOINT_URL",
-            "AWS_REGION",
-            "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY",
-        ] {
-            if let Ok(val) = std::env::var(var) {
-                envs.push((var.into(), val));
-            }
-        }
+        // per-session secret minted by the outer run; the rest configure
+        // infrastructure and the platform plane).
+        append_passthrough_env(&mut envs);
 
         eprintln!("  {} {} on internal :{}", style("✓").green(), slug, port);
 
@@ -656,6 +663,14 @@ fn module_process_envs(
     ]
 }
 
+fn append_passthrough_env(envs: &mut Vec<(String, String)>) {
+    for var in PASSTHROUGH_ENV {
+        if let Ok(val) = std::env::var(var) {
+            envs.push((var.into(), val));
+        }
+    }
+}
+
 /// `go build -buildvcs=false -o <bin> .` in the module dir. Compile errors
 /// are mirrored to the terminal and shipped like module stderr so build
 /// failures show up in the dev console Logcat too.
@@ -699,8 +714,9 @@ fn build_module(spec: &ModuleSpec, label: &str) -> bool {
 /// see every *other* module's platform ID on top of the curated
 /// `spec.envs` list — exactly the cross-module leak this whole `.env`
 /// scheme exists to prevent. PATH is re-added explicitly since the module
-/// binary may need it (e.g. to exec a subprocess); nothing else from the
-/// CLI's own env passes through implicitly.
+/// binary may need it (e.g. to exec a subprocess); the curated `spec.envs`
+/// includes the explicit infra and platform-plane allowlist above, but
+/// nothing else from the CLI's own env passes through implicitly.
 fn start_module(spec: &ModuleSpec, label: &'static str) -> Option<Child> {
     let mut cmd = Command::new(&spec.bin);
     cmd.env_clear();
@@ -1063,6 +1079,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn passthrough_env_includes_infra_and_platform_plane() {
+        for expected in [
+            "MS_INTERNAL_SECRET",
+            "REDIS_URL",
+            "AWS_ENDPOINT_URL",
+            "AWS_REGION",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "MS_DISPATCH_URL",
+            "MS_PUBLIC_BASE_URL",
+            "MS_PLATFORM_BROKER_BASE",
+            "MS_PLATFORM_ASSERTION_PUBLIC_KEY",
+        ] {
+            assert!(
+                PASSTHROUGH_ENV.contains(&expected),
+                "passthrough allowlist is missing {expected}"
+            );
+        }
+    }
+
     /// Real spawn, not just the `Vec` `module_process_envs` returns. Regression
     /// for the actual leak: `main.rs`'s `load_dotenv` loads the *whole* root
     /// `.env` into this CLI process's own env (dotenvy sets every key it
@@ -1071,24 +1108,36 @@ mod tests {
     /// process. `Command` inherits the parent env by default, so without an
     /// explicit `env_clear()` in `start_module`, that suffixed key would
     /// leak into every spawned module regardless of what `spec.envs` says.
-    /// Simulates the loaded root `.env` by setting the poisoned var directly,
-    /// spawns `/usr/bin/env` (which just dumps its own env to stdout) through
-    /// `start_module`, and asserts the forwarded output never carries it.
+    /// Simulates the loaded root `.env` and compose platform configuration by
+    /// setting the vars directly, spawns `/usr/bin/env` (which just dumps its
+    /// own env to stdout) through `start_module`, and asserts the allowlisted
+    /// platform vars are forwarded while the poisoned sibling var is not.
     #[cfg(unix)]
     #[test]
     fn start_module_does_not_leak_parent_process_env_into_child() {
+        let old_module_id = std::env::var_os("MS_MODULE_ID_OAUTH_CORE");
+        let old_dispatch_url = std::env::var_os("MS_DISPATCH_URL");
+        let old_assertion_key = std::env::var_os("MS_PLATFORM_ASSERTION_PUBLIC_KEY");
+
         // SAFETY: test-only process-global env mutation; no other test reads
-        // or depends on this key, and it's removed at the end.
+        // or depends on these keys, and their prior values are restored below.
         unsafe {
             std::env::set_var("MS_MODULE_ID_OAUTH_CORE", "leaked-sibling-id");
+            std::env::set_var("MS_DISPATCH_URL", "https://api.mirrorstack.ai/dispatch");
+            std::env::set_var(
+                "MS_PLATFORM_ASSERTION_PUBLIC_KEY",
+                "test-assertion-public-key",
+            );
         }
 
         let (tx, rx) = mpsc::channel();
+        let mut envs = vec![("MS_MODULE_ID".into(), "own-id".into())];
+        append_passthrough_env(&mut envs);
         let spec = ModuleSpec {
             slug: "media".into(),
             dir: std::env::temp_dir(),
             bin: PathBuf::from("/usr/bin/env"),
-            envs: vec![("MS_MODULE_ID".into(), "own-id".into())],
+            envs,
             sink: Some(tx),
             watch: false,
             stop: Arc::new(AtomicBool::new(false)),
@@ -1103,12 +1152,33 @@ mod tests {
         }
 
         unsafe {
-            std::env::remove_var("MS_MODULE_ID_OAUTH_CORE");
+            for (key, old_value) in [
+                ("MS_MODULE_ID_OAUTH_CORE", old_module_id),
+                ("MS_DISPATCH_URL", old_dispatch_url),
+                ("MS_PLATFORM_ASSERTION_PUBLIC_KEY", old_assertion_key),
+            ] {
+                match old_value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
         }
 
         assert!(
             lines.iter().any(|l| l == "MS_MODULE_ID=own-id"),
             "expected the child's own plain MS_MODULE_ID in its env: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "MS_DISPATCH_URL=https://api.mirrorstack.ai/dispatch"),
+            "expected MS_DISPATCH_URL to pass through to the child: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "MS_PLATFORM_ASSERTION_PUBLIC_KEY=test-assertion-public-key"),
+            "expected MS_PLATFORM_ASSERTION_PUBLIC_KEY to pass through to the child: {lines:?}"
         );
         assert!(
             !lines.iter().any(|l| l.starts_with("MS_MODULE_ID_")),
