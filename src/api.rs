@@ -631,6 +631,150 @@ pub struct CreatedDeploy {
     pub uploads: Vec<UploadTarget>,
 }
 
+#[derive(Serialize)]
+pub struct DeployGrantInput<'a> {
+    pub token: &'a str,
+    pub app: &'a str,
+    pub env: &'a str,
+}
+
+impl std::fmt::Debug for DeployGrantInput<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeployGrantInput")
+            .field("token", &"<redacted>")
+            .field("app", &self.app)
+            .field("env", &self.env)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+pub struct DeployGrant {
+    pub grant: String,
+    #[allow(dead_code)] // expiry is server-enforced; the CLI diagnoses a rejected grant on 401
+    pub expires_at: String,
+    pub app_id: String,
+    pub env: String,
+}
+
+impl std::fmt::Debug for DeployGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeployGrant(<redacted>)")
+    }
+}
+
+/// Errors from the public OIDC exchange retain the binding payload that
+/// makes an otherwise opaque 403 actionable to a CI operator.
+#[derive(Error)]
+pub enum DeployGrantError {
+    #[error("OIDC deploy-grant request failed: {0}")]
+    Http(#[from] reqwest::Error),
+    #[error("OIDC deploy-grant response could not be read: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("OIDC deploy-grant response was invalid: {0}")]
+    Decode(#[from] serde_json::Error),
+    #[error("{message}")]
+    BindingPending {
+        sub: String,
+        approval_url: String,
+        message: String,
+    },
+    #[error("{message}")]
+    BindingRevoked { message: String },
+    #[error("OIDC deploy-grant exchange failed: {code}: {message}")]
+    Server {
+        status: u16,
+        code: String,
+        message: String,
+    },
+    #[error("OIDC deploy-grant exchange returned HTTP {status}")]
+    Unexpected { status: u16 },
+}
+
+impl std::fmt::Debug for DeployGrantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(_) => f.write_str("DeployGrantError::Http(<redacted>)"),
+            Self::Io(_) => f.write_str("DeployGrantError::Io(<redacted>)"),
+            Self::Decode(_) => f.write_str("DeployGrantError::Decode(<redacted>)"),
+            Self::BindingPending { .. } => {
+                f.write_str("DeployGrantError::BindingPending(<redacted>)")
+            }
+            Self::BindingRevoked { .. } => {
+                f.write_str("DeployGrantError::BindingRevoked(<redacted>)")
+            }
+            Self::Server { status, .. } => f
+                .debug_struct("DeployGrantError::Server")
+                .field("status", status)
+                .field("details", &"<redacted>")
+                .finish(),
+            Self::Unexpected { status } => f
+                .debug_struct("DeployGrantError::Unexpected")
+                .field("status", status)
+                .finish(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DeployGrantErrorBody {
+    code: String,
+    message: String,
+    #[serde(default)]
+    sub: Option<String>,
+    #[serde(default)]
+    approval_url: Option<String>,
+}
+
+/// Exchange a GitHub Actions OIDC JWT for an app+environment-bound deploy
+/// grant. This endpoint is intentionally public; adding bearer auth here
+/// would violate the deploy-grant contract.
+pub fn exchange_deploy_grant(
+    http: &Client,
+    apps_base: &str,
+    input: &DeployGrantInput<'_>,
+) -> Result<DeployGrant, DeployGrantError> {
+    let endpoint = format!("{}/v1/oidc/deploy-grant", apps_base.trim_end_matches('/'));
+    let resp = http
+        .post(&endpoint)
+        .header("Accept", "application/json")
+        .json(input)
+        .send()?;
+    let status = resp.status();
+    let status_u16 = status.as_u16();
+    let body = http::read_capped(resp)?;
+
+    if status.is_success() {
+        return Ok(serde_json::from_slice(&body)?);
+    }
+
+    let Ok(error) = serde_json::from_slice::<DeployGrantErrorBody>(&body) else {
+        return Err(DeployGrantError::Unexpected { status: status_u16 });
+    };
+    match error.code.as_str() {
+        "binding_pending" => match (error.sub, error.approval_url) {
+            (Some(sub), Some(approval_url)) => Err(DeployGrantError::BindingPending {
+                sub,
+                approval_url,
+                message: error.message,
+            }),
+            _ => Err(DeployGrantError::Server {
+                status: status_u16,
+                code: error.code,
+                message: error.message,
+            }),
+        },
+        "binding_revoked" => Err(DeployGrantError::BindingRevoked {
+            message: error.message,
+        }),
+        _ => Err(DeployGrantError::Server {
+            status: status_u16,
+            code: error.code,
+            message: error.message,
+        }),
+    }
+}
+
 /// POST /v1/apps/{appId}/deploys — register a pending deploy and mint one
 /// presigned S3 PUT per manifest file (15-minute expiry). Owner/admin
 /// gated; the platform re-validates the manifest (≤500 files, ≤25MB
@@ -1063,6 +1207,83 @@ mod tests {
             }
             other => panic!("expected Unexpected, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn deploy_grant_exchange_is_public_and_preserves_binding_payload() {
+        let mut server = Server::new();
+        let success = server
+            .mock("POST", "/v1/oidc/deploy-grant")
+            .match_header("authorization", mockito::Matcher::Missing)
+            .match_body(mockito::Matcher::Json(json!({
+                "token": "github-jwt",
+                "app": "company",
+                "env": "prod"
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "grant": "grant-secret",
+                    "expires_at": "2026-07-27T05:30:00Z",
+                    "app_id": "app-1",
+                    "env": "prod"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let grant = exchange_deploy_grant(
+            &test_client(),
+            &server.url(),
+            &DeployGrantInput {
+                token: "github-jwt",
+                app: "company",
+                env: "prod",
+            },
+        )
+        .expect("exchange");
+        assert_eq!(grant.grant, "grant-secret");
+        assert_eq!(grant.app_id, "app-1");
+        assert_eq!(grant.env, "prod");
+        success.assert();
+
+        let pending = server
+            .mock("POST", "/v1/oidc/deploy-grant")
+            .match_header("authorization", mockito::Matcher::Missing)
+            .with_status(403)
+            .with_body(
+                json!({
+                    "code": "binding_pending",
+                    "message": "approval required",
+                    "sub": "repo:org/repo:ref:refs/heads/main",
+                    "approval_url": "https://apps.mirrorstack.ai/apps/app-1/settings/deployment"
+                })
+                .to_string(),
+            )
+            .create();
+        let error = exchange_deploy_grant(
+            &test_client(),
+            &server.url(),
+            &DeployGrantInput {
+                token: "different-jwt",
+                app: "company",
+                env: "prod",
+            },
+        )
+        .expect_err("pending");
+        match error {
+            DeployGrantError::BindingPending {
+                sub, approval_url, ..
+            } => {
+                assert_eq!(sub, "repo:org/repo:ref:refs/heads/main");
+                assert_eq!(
+                    approval_url,
+                    "https://apps.mirrorstack.ai/apps/app-1/settings/deployment"
+                );
+            }
+            other => panic!("expected binding payload, got {other:?}"),
+        }
+        pending.assert();
     }
 
     #[test]

@@ -19,6 +19,7 @@ use super::{
 };
 
 mod deploy;
+mod deploy_auth;
 mod ssr;
 
 #[derive(Args)]

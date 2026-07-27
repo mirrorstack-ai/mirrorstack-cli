@@ -28,6 +28,9 @@ fn with_temp_config_dir() -> tempfile::TempDir {
 /// `serial_test` crate.
 #[test]
 fn credentials_lifecycle() {
+    let _env = TEST_ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _g = with_temp_config_dir();
 
     // load() before save() returns NotFound.
