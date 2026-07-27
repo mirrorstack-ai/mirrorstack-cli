@@ -155,8 +155,27 @@ fn nonempty_env(env_lookup: &mut impl FnMut(&str) -> Option<String>, name: &str)
     env_lookup(name).filter(|value| !value.trim().is_empty())
 }
 
-pub(super) fn resolve_oidc_audience(mut env_lookup: impl FnMut(&str) -> Option<String>) -> String {
-    nonempty_env(&mut env_lookup, ENV_OIDC_AUDIENCE).unwrap_or_else(|| DEFAULT_OIDC_AUDIENCE.into())
+/// The audience is what stops a token minted for someone else being replayed
+/// at the exchange, so an override that erases that separation is refused here
+/// rather than silently requested from GitHub. The two dangerous values are
+/// exactly the ones someone might reach for: GitHub's own default audience
+/// (`https://github.com/<owner>`, which every repo under that owner gets for
+/// free) and the AWS one.
+pub(super) fn resolve_oidc_audience(
+    mut env_lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<String> {
+    let audience = nonempty_env(&mut env_lookup, ENV_OIDC_AUDIENCE)
+        .unwrap_or_else(|| DEFAULT_OIDC_AUDIENCE.into());
+    let lowered = audience.to_ascii_lowercase();
+    if lowered == "sts.amazonaws.com" || lowered.starts_with("https://github.com/") {
+        return Err(anyhow!(
+            "{ENV_OIDC_AUDIENCE}={audience} is not MirrorStack-specific — \
+             GitHub's default audience and sts.amazonaws.com are shared with \
+             other consumers, so a token minted for them could be replayed. \
+             Unset it to use the default `{DEFAULT_OIDC_AUDIENCE}`."
+        ));
+    }
+    Ok(audience)
 }
 
 #[derive(Deserialize)]
@@ -433,7 +452,7 @@ mod tests {
             (Some("custom-aud"), "custom-aud"),
             (None, DEFAULT_OIDC_AUDIENCE),
         ] {
-            let audience = resolve_oidc_audience(|_| configured.map(str::to_owned));
+            let audience = resolve_oidc_audience(|_| configured.map(str::to_owned)).unwrap();
             let mut actions = Server::new();
             let request = actions
                 .mock("GET", "/token")
@@ -456,9 +475,34 @@ mod tests {
 
         for empty in ["", " \t "] {
             assert_eq!(
-                resolve_oidc_audience(|_| Some(empty.into())),
+                resolve_oidc_audience(|_| Some(empty.into())).unwrap(),
                 DEFAULT_OIDC_AUDIENCE
             );
+        }
+    }
+
+    /// An audience shared with other consumers is not domain separation: a
+    /// token minted for GitHub's default audience or for AWS could be replayed
+    /// at the exchange. Refuse before asking GitHub to mint one.
+    #[test]
+    fn oidc_audience_rejects_non_separated_overrides() {
+        for bad in [
+            "sts.amazonaws.com",
+            "https://github.com/mirrorstack-ai",
+            "HTTPS://GitHub.com/acme",
+        ] {
+            let error = resolve_oidc_audience(|_| Some(bad.into()))
+                .expect_err("expected rejection")
+                .to_string();
+            assert!(error.contains(ENV_OIDC_AUDIENCE), "{error}");
+            assert!(error.contains(DEFAULT_OIDC_AUDIENCE), "{error}");
+        }
+        for good in [
+            "mirrorstack",
+            "mirrorstack-staging",
+            "https://api.mirrorstack.ai",
+        ] {
+            assert_eq!(resolve_oidc_audience(|_| Some(good.into())).unwrap(), good);
         }
     }
 

@@ -99,10 +99,14 @@ pub struct DeployArgs {
 }
 
 pub fn run(args: DeployArgs) -> Result<()> {
-    let dir = args
-        .dir
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+    let dir = match args.dir.clone() {
+        Some(dir) => dir,
+        // Not unreachable in CI: a job whose workspace is removed mid-run
+        // leaves the process with no cwd. Panicking there exits 101 with a
+        // backtrace instead of saying what to pass.
+        None => std::env::current_dir()
+            .context("could not read the current directory — pass --dir explicitly")?,
+    };
     if !dir.is_dir() {
         return Err(anyhow!("{} is not a directory", dir.display()));
     }
@@ -114,7 +118,7 @@ pub fn run(args: DeployArgs) -> Result<()> {
     };
 
     let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
-    let oidc_audience = deploy_auth::resolve_oidc_audience(|name| std::env::var(name).ok());
+    let oidc_audience = deploy_auth::resolve_oidc_audience(|name| std::env::var(name).ok())?;
     let client = http::client(Duration::from_secs(15))?;
 
     let selected = deploy_auth::select_deploy_auth(
@@ -613,7 +617,12 @@ fn upload_one(client: &Client, target: &api::UploadTarget, path: &Path) -> Resul
     for (k, v) in &target.headers {
         req = req.header(k.as_str(), v.as_str());
     }
-    let resp = req.send()?;
+    // `reqwest::Error` renders the URL it failed on, and this one carries a
+    // live signature. In a CI log that is a usable write credential until it
+    // expires, so strip the URL before the error can reach stderr.
+    let resp = req
+        .send()
+        .map_err(|e| anyhow!("presigned PUT failed: {}", e.without_url()))?;
     let status = resp.status();
     if !status.is_success() {
         let body = http::read_capped(resp).unwrap_or_default();
