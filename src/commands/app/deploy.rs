@@ -30,13 +30,12 @@ use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 
-use crate::api::{self, ApiError, CreateAppDeployInput, DeployFile};
-use crate::commands::{
-    DEFAULT_APPS_API_BASE, ENV_APPS_API_URL, ok_mark, resolve_base, session_expired,
-};
-use crate::credentials;
+use crate::api::{self, CreateAppDeployInput, DeployFile};
+use crate::commands::{DEFAULT_APPS_API_BASE, ENV_APPS_API_URL, ok_mark, resolve_base};
+use crate::credentials::load_or_login_hint;
 use crate::http;
 
+use super::deploy_auth::{self, DeployAuth, SelectedDeployAuth};
 use super::ssr;
 use super::with_spinner;
 
@@ -94,13 +93,20 @@ pub struct DeployArgs {
     /// this to override the detection.
     #[arg(long, value_enum)]
     runtime: Option<RuntimeArg>,
+    /// Authenticate with the GitHub Actions OIDC identity for this job.
+    #[arg(long)]
+    oidc: bool,
 }
 
 pub fn run(args: DeployArgs) -> Result<()> {
-    let dir = args
-        .dir
-        .clone()
-        .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+    let dir = match args.dir.clone() {
+        Some(dir) => dir,
+        // Not unreachable in CI: a job whose workspace is removed mid-run
+        // leaves the process with no cwd. Panicking there exits 101 with a
+        // backtrace instead of saying what to pass.
+        None => std::env::current_dir()
+            .context("could not read the current directory — pass --dir explicitly")?,
+    };
     if !dir.is_dir() {
         return Err(anyhow!("{} is not a directory", dir.display()));
     }
@@ -111,32 +117,99 @@ pub fn run(args: DeployArgs) -> Result<()> {
         None => ssr::looks_like_standalone(&dir),
     };
 
-    let mut creds = credentials::load_or_login_hint()?;
     let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
+    let oidc_audience = deploy_auth::resolve_oidc_audience(|name| std::env::var(name).ok())?;
     let client = http::client(Duration::from_secs(15))?;
 
-    // Resolve --app (ID or slug) to the app row: the deploy endpoints take
-    // the ID, and the final URL needs the slug. Member-scoped, so this
-    // doubles as an access check before any upload work.
-    let app = match credentials::with_refresh_retry(&mut creds, |tok| {
-        api::get_app(&client, &apps_base, tok, &args.app)
-    }) {
-        Ok(Some(a)) => a,
-        Ok(None) => {
-            return Err(anyhow!(
-                "app '{}' not found (pass an app ID or slug you're a member of)",
-                args.app
-            ));
+    let selected = deploy_auth::select_deploy_auth(
+        args.oidc,
+        |name| std::env::var(name).ok(),
+        load_or_login_hint,
+    )?;
+    let (target, mut auth) = match selected {
+        SelectedDeployAuth::Oidc {
+            request_url,
+            request_token,
+        } => {
+            let exchanged = deploy_auth::exchange_oidc(
+                &client,
+                &apps_base,
+                &request_url,
+                &request_token,
+                &oidc_audience,
+                &args.app,
+                &args.env,
+            )?;
+            oidc_target(exchanged, &args.env)?
         }
-        Err(ApiError::Unauthenticated) => return Err(session_expired()),
-        Err(e) => return Err(e.into()),
+        SelectedDeployAuth::Ready(DeployAuth::Token(token)) => (
+            DeployTarget {
+                id: args.app.clone(),
+                slug: None,
+            },
+            DeployAuth::Token(token),
+        ),
+        SelectedDeployAuth::Ready(mut user @ DeployAuth::User(_)) => {
+            // Only a user principal may resolve a slug/UUID through the
+            // management endpoint. Deploy principals are endpoint-limited.
+            let app = match user.with_retry(|tok| api::get_app(&client, &apps_base, tok, &args.app))
+            {
+                Ok(Some(app)) => app,
+                Ok(None) => {
+                    return Err(anyhow!(
+                        "app '{}' not found (pass an app ID or slug you're a member of)",
+                        args.app
+                    ));
+                }
+                Err(error) => return Err(user.deploy_error(error)),
+            };
+            (
+                DeployTarget {
+                    id: app.id,
+                    slug: Some(app.slug),
+                },
+                user,
+            )
+        }
+        SelectedDeployAuth::Ready(DeployAuth::Grant(_)) => {
+            unreachable!("grants are created only by the OIDC exchange")
+        }
     };
 
     if is_ssr {
-        deploy_ssr(&args, &dir, &app, &mut creds, &apps_base, &client)
+        deploy_ssr(&args, &dir, &target, &mut auth, &apps_base, &client)
     } else {
-        deploy_static(&args, &dir, &app, &mut creds, &apps_base, &client)
+        deploy_static(&args, &dir, &target, &mut auth, &apps_base, &client)
     }
+}
+
+#[derive(Debug)]
+struct DeployTarget {
+    id: String,
+    slug: Option<String>,
+}
+
+impl DeployTarget {
+    fn label<'a>(&'a self, app_ref: &'a str) -> &'a str {
+        self.slug.as_deref().unwrap_or(app_ref)
+    }
+}
+
+fn oidc_target(grant: api::DeployGrant, requested_env: &str) -> Result<(DeployTarget, DeployAuth)> {
+    if grant.env != requested_env {
+        return Err(anyhow!(
+            "OIDC deploy grant was bound to environment '{}' but --env requested '{}'; refusing to deploy",
+            grant.env,
+            requested_env
+        ));
+    }
+    Ok((
+        DeployTarget {
+            id: grant.app_id,
+            slug: None,
+        },
+        DeployAuth::Grant(grant.grant),
+    ))
 }
 
 /// Today's flow, byte-for-byte unchanged: walk `dir` into a static-file
@@ -144,8 +217,8 @@ pub fn run(args: DeployArgs) -> Result<()> {
 fn deploy_static(
     args: &DeployArgs,
     dir: &Path,
-    app: &api::App,
-    creds: &mut credentials::Credentials,
+    app: &DeployTarget,
+    creds: &mut DeployAuth,
     apps_base: &str,
     client: &Client,
 ) -> Result<()> {
@@ -156,7 +229,9 @@ fn deploy_static(
         "  {} {} → {} ({} files, {})",
         style("Deploying:").dim(),
         style(dir.display()).bold(),
-        style(format!("{}@{}", app.slug, args.env)).cyan().bold(),
+        style(format!("{}@{}", app.label(&args.app), args.env))
+            .cyan()
+            .bold(),
         files.len(),
         human_bytes(bytes_total)
     );
@@ -170,7 +245,7 @@ fn deploy_static(
         })
         .collect();
     let created = with_spinner("Creating deploy…", || {
-        credentials::with_refresh_retry(creds, |tok| {
+        creds.with_retry(|tok| {
             api::create_app_deploy(
                 client,
                 apps_base,
@@ -185,7 +260,7 @@ fn deploy_static(
             )
         })
     })
-    .map_err(api_err)?;
+    .map_err(|error| creds.deploy_error(error))?;
 
     // Presigned URLs carry their own auth — a dedicated client without the
     // bearer token and with an upload-sized timeout.
@@ -206,8 +281,8 @@ fn deploy_static(
 fn deploy_ssr(
     args: &DeployArgs,
     dir: &Path,
-    app: &api::App,
-    creds: &mut credentials::Credentials,
+    app: &DeployTarget,
+    creds: &mut DeployAuth,
     apps_base: &str,
     client: &Client,
 ) -> Result<()> {
@@ -225,8 +300,8 @@ fn deploy_ssr(
 fn deploy_ssr_with_cap(
     args: &DeployArgs,
     dir: &Path,
-    app: &api::App,
-    creds: &mut credentials::Credentials,
+    app: &DeployTarget,
+    creds: &mut DeployAuth,
     apps_base: &str,
     client: &Client,
     max_bundle_bytes: u64,
@@ -239,7 +314,9 @@ fn deploy_ssr_with_cap(
         "  {} {} → {} (ssr bundle, {})",
         style("Deploying:").dim(),
         style(dir.display()).bold(),
-        style(format!("{}@{}", app.slug, args.env)).cyan().bold(),
+        style(format!("{}@{}", app.label(&args.app), args.env))
+            .cyan()
+            .bold(),
         human_bytes(size)
     );
 
@@ -263,7 +340,7 @@ fn deploy_ssr_with_cap(
     // Lambda bundle, not a static-file manifest entry — see the PR
     // description for the request-shape assumption this rests on.
     let created = with_spinner("Creating deploy…", || {
-        credentials::with_refresh_retry(creds, |tok| {
+        creds.with_retry(|tok| {
             api::create_app_deploy(
                 client,
                 apps_base,
@@ -278,7 +355,7 @@ fn deploy_ssr_with_cap(
             )
         })
     })
-    .map_err(api_err)?;
+    .map_err(|error| creds.deploy_error(error))?;
 
     let bundle_file = ManifestFile {
         rel_path: "ssr-bundle.zip".to_string(),
@@ -303,24 +380,24 @@ fn deploy_ssr_with_cap(
 /// lines either way.
 fn finish_deploy(
     args: &DeployArgs,
-    app: &api::App,
-    creds: &mut credentials::Credentials,
+    app: &DeployTarget,
+    creds: &mut DeployAuth,
     apps_base: &str,
     client: &Client,
     deploy_id: &str,
 ) -> Result<()> {
     with_spinner("Finalizing…", || {
-        credentials::with_refresh_retry(creds, |tok| {
-            api::finalize_app_deploy(client, apps_base, tok, &app.id, deploy_id)
-        })
+        creds.with_retry(|tok| api::finalize_app_deploy(client, apps_base, tok, &app.id, deploy_id))
     })
-    .map_err(api_err)?;
+    .map_err(|error| creds.deploy_error(error))?;
 
     if args.no_activate {
         eprintln!(
             "{} deployed {} (not activated)",
             ok_mark(),
-            style(format!("{}@{}", app.slug, args.env)).cyan().bold()
+            style(format!("{}@{}", app.label(&args.app), args.env))
+                .cyan()
+                .bold()
         );
         eprintln!("  {} {}", style("deploy:").dim(), deploy_id);
         eprintln!(
@@ -331,36 +408,30 @@ fn finish_deploy(
     }
 
     with_spinner("Activating…", || {
-        credentials::with_refresh_retry(creds, |tok| {
+        creds.with_retry(|tok| {
             api::activate_app_stage(client, apps_base, tok, &app.id, &args.env, deploy_id)
         })
     })
-    .map_err(api_err)?;
+    .map_err(|error| creds.deploy_error(error))?;
 
     eprintln!(
         "{} deployed {}",
         ok_mark(),
-        style(format!("{}@{}", app.slug, args.env)).cyan().bold()
-    );
-    eprintln!("  {} {}", style("deploy:").dim(), deploy_id);
-    eprintln!(
-        "  {} {}",
-        style("url:").dim(),
-        style(format!("https://{}.mirrorstack.app", app.slug))
+        style(format!("{}@{}", app.label(&args.app), args.env))
             .cyan()
             .bold()
     );
-    Ok(())
-}
-
-/// Map the API error vocabulary onto command-level errors, the same shape
-/// the other commands print (`code: message`, login hint on 401).
-fn api_err(e: ApiError) -> anyhow::Error {
-    match e {
-        ApiError::Unauthenticated => session_expired(),
-        ApiError::Server { code, message, .. } => anyhow!("{code}: {message}"),
-        other => other.into(),
+    eprintln!("  {} {}", style("deploy:").dim(), deploy_id);
+    if let Some(slug) = &app.slug {
+        eprintln!(
+            "  {} {}",
+            style("url:").dim(),
+            style(format!("https://{slug}.mirrorstack.app"))
+                .cyan()
+                .bold()
+        );
     }
+    Ok(())
 }
 
 /// One file under the deploy root: its manifest entry plus where to read
@@ -546,7 +617,12 @@ fn upload_one(client: &Client, target: &api::UploadTarget, path: &Path) -> Resul
     for (k, v) in &target.headers {
         req = req.header(k.as_str(), v.as_str());
     }
-    let resp = req.send()?;
+    // `reqwest::Error` renders the URL it failed on, and this one carries a
+    // live signature. In a CI log that is a usable write credential until it
+    // expires, so strip the URL before the error can reach stderr.
+    let resp = req
+        .send()
+        .map_err(|e| anyhow!("presigned PUT failed: {}", e.without_url()))?;
     let status = resp.status();
     if !status.is_success() {
         let body = http::read_capped(resp).unwrap_or_default();
@@ -760,6 +836,8 @@ mod tests {
     use mockito::Server;
     use serde_json::json;
 
+    use crate::credentials;
+
     fn ssr_fixture(dir: &Path) {
         write(dir, ".next/standalone/server.js", "server");
         write(dir, ".next/standalone/node_modules/pkg/index.js", "pkg");
@@ -774,25 +852,23 @@ mod tests {
             note: None,
             no_activate: false,
             runtime: None,
+            oidc: false,
         }
     }
 
-    fn test_app() -> api::App {
-        api::App {
+    fn test_app() -> DeployTarget {
+        DeployTarget {
             id: "a-1".to_string(),
-            name: "Test App".to_string(),
-            slug: "test-app".to_string(),
-            owner_id: None,
-            created_at: None,
+            slug: Some("test-app".to_string()),
         }
     }
 
-    fn test_creds() -> credentials::Credentials {
-        credentials::Credentials {
+    fn test_creds() -> DeployAuth {
+        DeployAuth::User(credentials::Credentials {
             access_token: "AT".to_string(),
             refresh_token: "RT".to_string(),
             expires_at: std::time::SystemTime::now() + Duration::from_secs(3600),
-        }
+        })
     }
 
     /// Accepts exactly one connection, reads a full HTTP request (headers +
@@ -981,5 +1057,85 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("too large"), "{msg}");
         assert!(msg.contains("1 B"), "{msg}");
+    }
+
+    #[test]
+    fn deploy_token_path_needs_no_stored_credentials_or_app_lookup() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "index.html", "hello");
+
+        let loader_called = std::cell::Cell::new(false);
+        let selected = deploy_auth::select_deploy_auth(
+            false,
+            |name| (name == deploy_auth::ENV_DEPLOY_TOKEN).then(|| "token-secret".to_string()),
+            || {
+                loader_called.set(true);
+                Err(anyhow!("no credentials file"))
+            },
+        )
+        .expect("deploy token selected");
+        assert!(!loader_called.get(), "stored credentials were loaded");
+        let SelectedDeployAuth::Ready(mut auth @ DeployAuth::Token(_)) = selected else {
+            panic!("expected deploy token");
+        };
+
+        let mut server = Server::new();
+        let no_lookup = server.mock("GET", "/v1/apps/company").expect(0).create();
+        let create = server
+            .mock("POST", "/v1/apps/company/deploys")
+            .match_header("authorization", "Bearer token-secret")
+            .with_status(201)
+            .with_body(json!({"deploy_id": "d-1", "uploads": []}).to_string())
+            .create();
+        let finalize = server
+            .mock("POST", "/v1/apps/company/deploys/d-1/finalize")
+            .match_header("authorization", "Bearer token-secret")
+            .with_status(200)
+            .with_body(json!({"status": "ready"}).to_string())
+            .create();
+        let activate = server
+            .mock("POST", "/v1/apps/company/stages/prod/activate")
+            .match_header("authorization", "Bearer token-secret")
+            .with_status(200)
+            .with_body(json!({"active_deploy_id": "d-1"}).to_string())
+            .create();
+        let target = DeployTarget {
+            id: "company".into(),
+            slug: None,
+        };
+        let args = test_args();
+        let client = http::client(Duration::from_secs(15)).unwrap();
+
+        deploy_static(
+            &args,
+            dir.path(),
+            &target,
+            &mut auth,
+            &server.url(),
+            &client,
+        )
+        .expect("deploy token works");
+        no_lookup.assert();
+        create.assert();
+        finalize.assert();
+        activate.assert();
+    }
+
+    #[test]
+    fn oidc_target_rejects_an_environment_substitution() {
+        let error = oidc_target(
+            api::DeployGrant {
+                grant: "grant-secret".into(),
+                expires_at: "2026-07-27T05:30:00Z".into(),
+                app_id: "app-1".into(),
+                env: "staging".into(),
+            },
+            "prod",
+        )
+        .expect_err("environment mismatch");
+        let message = error.to_string();
+        assert!(message.contains("staging"), "{message}");
+        assert!(message.contains("prod"), "{message}");
+        assert!(!message.contains("grant-secret"), "{message}");
     }
 }

@@ -18,6 +18,11 @@ use crate::api::{self, ApiError};
 use crate::commands::{DEFAULT_API_BASE, ENV_API_URL, resolve_base, warn_prefix};
 use crate::http;
 
+/// Process environment is global, so tests redirecting the config path or
+/// API base share one lock across modules.
+#[cfg(test)]
+pub(crate) static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Local access-token lifetime re-derived on every refresh. The platform's
 /// `TokenConfig` mints 15-minute access tokens; the refresh response's
 /// `expires_at` is informational only, so we recompute the TTL locally to

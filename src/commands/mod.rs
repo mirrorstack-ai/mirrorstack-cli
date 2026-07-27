@@ -34,10 +34,16 @@ pub(crate) const DEFAULT_WEB_BASE: &str = "https://account.mirrorstack.ai";
 /// Override with `MIRRORSTACK_DISPATCH_URL`.
 pub(crate) const DEFAULT_DISPATCH_BASE: &str = "https://api.mirrorstack.ai/dispatch";
 
+/// Default GitHub Actions OIDC audience. Override with
+/// `MIRRORSTACK_OIDC_AUDIENCE`.
+pub(crate) const DEFAULT_OIDC_AUDIENCE: &str = "mirrorstack";
+
 pub(crate) const ENV_API_URL: &str = "MIRRORSTACK_API_URL";
 pub(crate) const ENV_APPS_API_URL: &str = "MIRRORSTACK_APPS_API_URL";
 pub(crate) const ENV_WEB_URL: &str = "MIRRORSTACK_WEB_URL";
 pub(crate) const ENV_DISPATCH_URL: &str = "MIRRORSTACK_DISPATCH_URL";
+/// GitHub Actions OIDC audience used for app deploy-grant exchange.
+pub(crate) const ENV_OIDC_AUDIENCE: &str = "MIRRORSTACK_OIDC_AUDIENCE";
 
 /// Look up a base URL from `env_var`, falling back to `default` when unset.
 pub(crate) fn resolve_base(env_var: &str, default: &str) -> String {
