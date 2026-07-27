@@ -23,6 +23,18 @@ mirrorstack --help             # Show help
 mirrorstack --version          # Show CLI version
 ```
 
+## Deploy tokens
+
+Create a token in the app's deployment settings on the platform. Its value is
+shown exactly once and does not expire.
+
+```bash
+export MIRRORSTACK_TOKEN=...
+mirrorstack apps web deploy --app <slug> --dir out
+```
+
+Revoke the token when it is no longer needed.
+
 ## Local development
 
 Build:

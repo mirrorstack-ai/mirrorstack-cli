@@ -9,7 +9,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::api::{self, ApiError, DeployGrantError, DeployGrantInput};
-use crate::commands::session_expired;
+use crate::commands::{DEFAULT_OIDC_AUDIENCE, ENV_OIDC_AUDIENCE, session_expired};
 use crate::credentials::{self, Credentials};
 use crate::http;
 
@@ -155,6 +155,10 @@ fn nonempty_env(env_lookup: &mut impl FnMut(&str) -> Option<String>, name: &str)
     env_lookup(name).filter(|value| !value.trim().is_empty())
 }
 
+pub(super) fn resolve_oidc_audience(mut env_lookup: impl FnMut(&str) -> Option<String>) -> String {
+    nonempty_env(&mut env_lookup, ENV_OIDC_AUDIENCE).unwrap_or_else(|| DEFAULT_OIDC_AUDIENCE.into())
+}
+
 #[derive(Deserialize)]
 struct ActionsIdToken {
     value: String,
@@ -164,9 +168,10 @@ pub(super) fn request_actions_id_token(
     client: &Client,
     request_url: &str,
     request_token: &str,
+    audience: &str,
 ) -> Result<String> {
     let mut url = Url::parse(request_url).context("invalid ACTIONS_ID_TOKEN_REQUEST_URL")?;
-    url.query_pairs_mut().append_pair("audience", "mirrorstack");
+    url.query_pairs_mut().append_pair("audience", audience);
 
     let resp = client
         .get(url)
@@ -197,10 +202,11 @@ pub(super) fn exchange_oidc(
     apps_base: &str,
     request_url: &str,
     request_token: &str,
+    audience: &str,
     app: &str,
     env: &str,
 ) -> Result<api::DeployGrant> {
-    let jwt = request_actions_id_token(client, request_url, request_token)?;
+    let jwt = request_actions_id_token(client, request_url, request_token, audience)?;
     api::exchange_deploy_grant(
         client,
         apps_base,
@@ -224,6 +230,12 @@ fn exchange_error(app: &str, jwt: &str, error: DeployGrantError) -> anyhow::Erro
         ),
         DeployGrantError::BindingRevoked { .. } => anyhow!(
             "The deploy binding for `{app}` was revoked and must be re-approved in the app's deployment settings."
+        ),
+        DeployGrantError::Server { code, message, .. } if code == "invalid_token" => anyhow!(
+            "OIDC deploy-grant exchange failed: {}: {}. Set {} to match the server's configured audience.",
+            redact(&code, jwt),
+            redact(&message, jwt),
+            ENV_OIDC_AUDIENCE
         ),
         DeployGrantError::Server { code, message, .. } => anyhow!(
             "OIDC deploy-grant exchange failed: {}: {}",
@@ -416,6 +428,60 @@ mod tests {
     }
 
     #[test]
+    fn oidc_audience_override_and_default_are_requested() {
+        for (configured, expected) in [
+            (Some("custom-aud"), "custom-aud"),
+            (None, DEFAULT_OIDC_AUDIENCE),
+        ] {
+            let audience = resolve_oidc_audience(|_| configured.map(str::to_owned));
+            let mut actions = Server::new();
+            let request = actions
+                .mock("GET", "/token")
+                .match_query(Matcher::UrlEncoded("audience".into(), expected.into()))
+                .match_header("authorization", "Bearer runtime-bearer")
+                .with_status(200)
+                .with_body(json!({"value": "github-jwt"}).to_string())
+                .create();
+
+            let jwt = request_actions_id_token(
+                &http::client(Duration::from_secs(15)).unwrap(),
+                &format!("{}/token", actions.url()),
+                "runtime-bearer",
+                &audience,
+            )
+            .expect("Actions ID token");
+            assert_eq!(jwt, "github-jwt");
+            request.assert();
+        }
+
+        for empty in ["", " \t "] {
+            assert_eq!(
+                resolve_oidc_audience(|_| Some(empty.into())),
+                DEFAULT_OIDC_AUDIENCE
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_token_diagnostic_names_audience_override() {
+        let message = exchange_error(
+            "company",
+            "github-jwt",
+            DeployGrantError::Server {
+                status: 401,
+                code: "invalid_token".into(),
+                message: "audience mismatch".into(),
+            },
+        )
+        .to_string();
+        assert!(
+            message.contains("invalid_token: audience mismatch"),
+            "{message}"
+        );
+        assert!(message.contains(ENV_OIDC_AUDIENCE), "{message}");
+    }
+
+    #[test]
     fn oidc_requests_and_binding_diagnostic_match_contract_without_fallback() {
         let mut actions = Server::new();
         let actions_request = actions
@@ -487,6 +553,7 @@ mod tests {
             &apps.url(),
             &request_url,
             &request_token,
+            DEFAULT_OIDC_AUDIENCE,
             "company",
             "prod",
         )
@@ -617,6 +684,7 @@ mod tests {
             &apps.url(),
             &request_url,
             "runtime-bearer",
+            DEFAULT_OIDC_AUDIENCE,
             "company",
             "prod",
         )
@@ -636,6 +704,7 @@ mod tests {
             &apps.url(),
             &request_url,
             "runtime-bearer",
+            DEFAULT_OIDC_AUDIENCE,
             "company",
             "prod",
         )

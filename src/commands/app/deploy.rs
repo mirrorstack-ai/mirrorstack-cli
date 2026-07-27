@@ -114,6 +114,7 @@ pub fn run(args: DeployArgs) -> Result<()> {
     };
 
     let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
+    let oidc_audience = deploy_auth::resolve_oidc_audience(|name| std::env::var(name).ok());
     let client = http::client(Duration::from_secs(15))?;
 
     let selected = deploy_auth::select_deploy_auth(
@@ -131,6 +132,7 @@ pub fn run(args: DeployArgs) -> Result<()> {
                 &apps_base,
                 &request_url,
                 &request_token,
+                &oidc_audience,
                 &args.app,
                 &args.env,
             )?;
