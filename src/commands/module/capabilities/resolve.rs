@@ -52,6 +52,17 @@ pub(crate) fn manifest_urls(internal_port: u16, slug: &str) -> [String; 3] {
 
 pub(crate) const MANIFEST_PATH: &str = "/__mirrorstack/platform/manifest";
 
+fn serving_tier(verdict: &str) -> Result<Option<Tier>, String> {
+    match verdict {
+        "tunnel" => Ok(Some(Tier::L)),
+        "deployed" => Ok(Some(Tier::D)),
+        "none" => Ok(None),
+        verdict => Err(format!(
+            "the platform returned unsupported serving verdict {verdict:?}"
+        )),
+    }
+}
+
 /// Walk `go.work` and pair each module `dev` would actually start with the
 /// internal port it would bind. Port assignment must mirror `dev::run_inner`
 /// exactly — only modules carrying a platform ID are started, and they take
@@ -176,6 +187,20 @@ pub(crate) fn tier_app(app_ref: &str) -> Result<(Vec<Resolved>, Vec<Unreachable>
         } else {
             install.slug.clone()
         };
+        let tier = match serving_tier(&install.serving) {
+            Ok(Some(tier)) => tier,
+            Ok(None) => {
+                unreachable.push(Unreachable {
+                    slug: name,
+                    reason: "the platform reports that this install has no serving tunnel or deployed version".into(),
+                });
+                continue;
+            }
+            Err(reason) => {
+                unreachable.push(Unreachable { slug: name, reason });
+                continue;
+            }
+        };
         let Some(value) = install.manifest else {
             unreachable.push(Unreachable {
                 slug: name,
@@ -200,7 +225,7 @@ pub(crate) fn tier_app(app_ref: &str) -> Result<(Vec<Resolved>, Vec<Unreachable>
                 manifest.id.clone()
             },
             version: install.installed_version,
-            tier: Tier::D,
+            tier,
             manifest,
         });
     }
@@ -242,6 +267,14 @@ mod tests {
             urls[2],
             "http://127.0.0.1:8080/_m/oauth-core/__mirrorstack/platform/manifest"
         );
+    }
+
+    #[test]
+    fn platform_serving_verdict_selects_the_runtime_tier() {
+        assert_eq!(serving_tier("tunnel"), Ok(Some(Tier::L)));
+        assert_eq!(serving_tier("deployed"), Ok(Some(Tier::D)));
+        assert_eq!(serving_tier("none"), Ok(None));
+        assert!(serving_tier("").unwrap_err().contains("unsupported"));
     }
 
     /// The internal port is positional, so a module in go.work that `dev` skips

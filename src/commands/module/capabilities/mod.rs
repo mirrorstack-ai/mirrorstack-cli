@@ -151,6 +151,7 @@ fn print_human(source: &str, report: &Report) {
         for d in &report.diagnostics {
             let prefix = match d.severity {
                 Severity::Error => style("error:").red().bold(),
+                Severity::Warning => style("warning:").yellow().bold(),
                 Severity::Info => style("info: ").dim().bold(),
             };
             eprintln!(

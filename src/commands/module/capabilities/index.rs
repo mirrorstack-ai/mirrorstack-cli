@@ -112,6 +112,7 @@ pub(crate) struct Diagnostic {
 #[serde(rename_all = "lowercase")]
 pub(crate) enum Severity {
     Error,
+    Warning,
     Info,
 }
 
@@ -241,8 +242,12 @@ pub(crate) fn classify(resolved: &[Resolved]) -> Report {
             if let (Some(schema), Some(payload)) = (&host_slot.payload, &contribution.payload)
                 && let Err(reason) = schema::validate(schema, payload)
             {
+                // Reflector-required fields are stricter than the host's
+                // Provide[T] decoder, which is the real registration boundary.
+                // Keep obvious payload drift visible without making offline
+                // inference reject a contribution the runtime accepts.
                 report.diagnostics.push(diagnostic(
-                    Severity::Error,
+                    Severity::Warning,
                     "payload_mismatch",
                     contributor,
                     format!(
@@ -399,21 +404,31 @@ mod tests {
         }
     }
 
-    /// Modeled on the real oauth-core: one slot carrying a payload schema, one
-    /// exposed table, one emitted event.
+    /// The payload schemas come from a captured SDK manifest so tests exercise
+    /// the `$ref`/`$defs` wire shape modules actually serve.
     fn oauth_core() -> Resolved {
+        let captured: Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/sdk-capabilities-manifest.json"
+        ))
+        .expect("captured SDK manifest");
+        let provides: Vec<_> = captured["provides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|provide| {
+                matches!(
+                    provide["key"].as_str(),
+                    Some("auth-provider" | "user-detail-blocks")
+                )
+            })
+            .cloned()
+            .collect();
         module(
             "oauth-core",
             "0.1.0",
             json!({
                 "slug": "oauth-core",
-                "provides": [
-                    {"key": "auth-provider", "payload": {
-                        "type": "object", "required": ["slug"],
-                        "properties": {"slug": {"type": "string"}, "name": {"type": "string"}}
-                    }},
-                    {"key": "user-detail-blocks"}
-                ],
+                "provides": provides,
                 "exposes": {"tables": ["users"]},
                 "permissions": [{"name": "users.read"}],
                 "events": {"emits": ["user.created"]}
@@ -520,14 +535,56 @@ mod tests {
         let report = classify(&[
             oauth_core(),
             contributor(
-                "oauth-google",
+                "users-profile",
                 json!({"contributesTo": [
-                    {"host": "oauth-core", "slot": "auth-provider", "payload": {"slug": 7}}
+                    {"host": "oauth-core", "slot": "user-detail-blocks",
+                     "payload": {"totally": "wrong", "nope": [1, 2, 3]}}
                 ]}),
             ),
         ]);
         let detail = only(&report, "payload_mismatch");
-        assert!(detail.contains("expected string"), "{detail}");
+        assert!(detail.contains("required property is missing"), "{detail}");
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .find(|d| d.code == "payload_mismatch")
+                .unwrap()
+                .severity,
+            Severity::Warning
+        );
+    }
+
+    #[test]
+    fn a_scalar_payload_against_a_real_object_schema_is_payload_mismatch() {
+        let captured: Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/sdk-capabilities-manifest.json"
+        ))
+        .unwrap();
+        let table_slot = captured["provides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provide| provide["key"] == "users-table-columns")
+            .unwrap()
+            .clone();
+        let host = module(
+            "oauth-core",
+            "0.1.0",
+            json!({"slug": "oauth-core", "provides": [table_slot]}),
+        );
+        let report = classify(&[
+            host,
+            contributor(
+                "users-profile",
+                json!({"contributesTo": [
+                    {"host": "oauth-core", "slot": "users-table-columns",
+                     "payload": "i am not even an object"}
+                ]}),
+            ),
+        ]);
+        let detail = only(&report, "payload_mismatch");
+        assert!(detail.contains("expected object"), "{detail}");
     }
 
     #[test]

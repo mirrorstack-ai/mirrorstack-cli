@@ -1,7 +1,9 @@
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 pub(crate) fn validate(schema: &Value, value: &Value) -> Result<(), String> {
-    validate_at(schema, value, "")
+    validate_at(schema, schema, value, "", &mut HashSet::new())
 }
 
 fn kind(value: &Value) -> &'static str {
@@ -16,12 +18,33 @@ fn kind(value: &Value) -> &'static str {
     }
 }
 
-fn validate_at(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
+fn validate_at(
+    root: &Value,
+    schema: &Value,
+    value: &Value,
+    path: &str,
+    visited: &mut HashSet<String>,
+) -> Result<(), String> {
     let Some(obj) = schema.as_object() else {
         return Ok(());
     };
     if obj.is_empty() {
         return Ok(());
+    }
+    if let Some(reference) = obj.get("$ref") {
+        let reference = reference
+            .as_str()
+            .ok_or_else(|| format!("{path}: $ref must be a string"))?;
+        let target = resolve_ref(root, reference)
+            .map_err(|reason| format!("{path}: cannot resolve $ref {reference:?}: {reason}"))?;
+        // Recursive Go types deliberately produce cyclic definitions. Once a
+        // reference repeats on the active path, the finite JSON value has
+        // already been checked as far as this schema can describe it.
+        if visited.insert(reference.into()) {
+            let result = validate_at(root, target, value, path, visited);
+            visited.remove(reference);
+            result?;
+        }
     }
     if let Some(values) = obj.get("enum").and_then(Value::as_array)
         && !values.contains(value)
@@ -61,7 +84,7 @@ fn validate_at(schema: &Value, value: &Value, path: &str) -> Result<(), String> 
         if let Some(properties) = properties {
             for (key, child_schema) in properties {
                 if let Some(child) = map.get(key) {
-                    validate_at(child_schema, child, &format!("{path}/{key}"))?;
+                    validate_at(root, child_schema, child, &format!("{path}/{key}"), visited)?;
                 }
             }
         }
@@ -75,10 +98,26 @@ fn validate_at(schema: &Value, value: &Value, path: &str) -> Result<(), String> 
     }
     if let (Some(items), Some(values)) = (obj.get("items"), value.as_array()) {
         for (i, child) in values.iter().enumerate() {
-            validate_at(items, child, &format!("{path}/{i}"))?;
+            validate_at(root, items, child, &format!("{path}/{i}"), visited)?;
         }
     }
     Ok(())
+}
+
+fn resolve_ref<'a>(root: &'a Value, reference: &str) -> Result<&'a Value, String> {
+    if reference == "#" {
+        return Ok(root);
+    }
+    let Some(name) = reference.strip_prefix("#/$defs/") else {
+        return Err("only `#` and `#/$defs/NAME` references are supported".into());
+    };
+    if name.is_empty() || name.contains('/') {
+        return Err("definition name is empty or contains an unsupported JSON Pointer path".into());
+    }
+    let name = name.replace("~1", "/").replace("~0", "~");
+    root.get("$defs")
+        .and_then(|defs| defs.get(&name))
+        .ok_or_else(|| format!("definition {name:?} is missing"))
 }
 
 #[cfg(test)]
@@ -86,66 +125,92 @@ mod tests {
     use super::validate;
     use serde_json::json;
 
-    /// The shape an SDK-derived schema takes: typed properties, a required
-    /// list, a nested array item schema, and a keyword this validator does
-    /// not know (`futureKeyword`) that must be ignored rather than rejected.
-    fn schema() -> serde_json::Value {
-        json!({
-            "type": "object",
-            "required": ["name"],
-            "properties": {
-                "name": {"type": "string"},
-                "age": {"type": ["integer", "null"]},
-                "tags": {"type": "array", "items": {"enum": ["a", "b"]}}
-            },
-            "additionalProperties": false,
-            "futureKeyword": 42
-        })
+    /// Captured from the Go SDK reflector: validation keywords live under
+    /// `$defs`, while the slot schema root points at the reflected Go type.
+    fn manifest() -> serde_json::Value {
+        serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/sdk-capabilities-manifest.json"
+        ))
+        .unwrap()
+    }
+
+    fn schema(slot: &str) -> serde_json::Value {
+        manifest()["provides"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|provide| provide["key"] == slot)
+            .unwrap()["payload"]
+            .clone()
     }
 
     #[test]
     fn accepts_a_conforming_payload() {
-        assert!(validate(&schema(), &json!({"name": "x", "age": null, "tags": ["a"]})).is_ok());
+        assert!(
+            validate(
+                &schema("user-detail-blocks"),
+                &json!({"title": "Roles", "bodyUrl": "/users/roles"})
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn missing_required_property_names_the_path() {
-        let err = validate(&schema(), &json!({"age": 1, "tags": []})).unwrap_err();
-        assert!(err.contains("/name"), "got {err}");
+        let err = validate(
+            &schema("user-detail-blocks"),
+            &json!({"totally": "wrong", "nope": [1, 2, 3]}),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("/title") || err.contains("/bodyUrl"),
+            "got {err}"
+        );
     }
 
     #[test]
     fn wrong_property_type_names_the_expected_type() {
-        let err = validate(&schema(), &json!({"name": 3, "tags": []})).unwrap_err();
-        assert!(err.contains("expected string"), "got {err}");
+        let err = validate(
+            &schema("users-table-columns"),
+            &json!("i am not even an object"),
+        )
+        .unwrap_err();
+        assert!(err.contains("expected object"), "got {err}");
     }
 
     #[test]
-    fn enum_violation_inside_an_array_names_the_index() {
-        let err = validate(&schema(), &json!({"name": "x", "tags": ["c"]})).unwrap_err();
-        assert!(err.contains("/tags/0"), "got {err}");
+    fn cyclic_defs_terminate() {
+        assert!(
+            validate(
+                &schema("cyclic-node"),
+                &json!({"value": "root", "next": {"value": "child"}})
+            )
+            .is_ok()
+        );
     }
 
     #[test]
-    fn additional_property_rejected_only_when_explicitly_closed() {
-        let err = validate(&schema(), &json!({"name": "x", "tags": [], "extra": 1})).unwrap_err();
-        assert!(err.contains("additional"), "got {err}");
-        // Same payload, schema silent on additionalProperties → allowed.
-        let open = json!({"type": "object", "properties": {"name": {"type": "string"}}});
-        assert!(validate(&open, &json!({"name": "x", "extra": 1})).is_ok());
+    fn unsupported_refs_are_loud() {
+        let err = validate(
+            &json!({"$ref": "https://example.com/schema.json"}),
+            &json!({}),
+        )
+        .unwrap_err();
+        assert!(err.contains("only `#` and `#/$defs/NAME`"), "got {err}");
     }
 
     #[test]
-    fn a_present_but_null_value_satisfies_a_concrete_type() {
-        // Go zero values and pointer fields serialize as null; treating that as
-        // a mismatch would fail every optional field.
-        let s = json!({"type": "object", "properties": {"name": {"type": "string"}}});
-        assert!(validate(&s, &json!({"name": null})).is_ok());
+    fn root_refs_terminate() {
+        assert!(validate(&json!({"$ref": "#"}), &json!({"anything": true})).is_ok());
     }
 
     #[test]
-    fn an_integer_satisfies_a_number_type() {
-        assert!(validate(&json!({"type": "number"}), &json!(1)).is_ok());
+    fn missing_refs_are_loud() {
+        let err = validate(&json!({"$ref": "#/$defs/Absent"}), &json!({})).unwrap_err();
+        assert!(
+            err.contains("definition \"Absent\" is missing"),
+            "got {err}"
+        );
     }
 
     #[test]

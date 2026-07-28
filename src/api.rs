@@ -609,6 +609,8 @@ pub struct AppInstall {
     pub installed_version: String,
     #[serde(default)]
     pub manifest: Option<serde_json::Value>,
+    #[serde(default)]
+    pub serving: String,
 }
 
 #[derive(Deserialize)]
@@ -1251,13 +1253,14 @@ mod tests {
         let _m = server.mock("GET", "/v1/apps/app-id/installs")
             .match_header("authorization", "Bearer AT")
             .with_status(200)
-            .with_body(r#"{"installs":[{"moduleId":"m1","slug":"core","installedVersion":"1.2.3","manifest":{"provides":[{"key":"x"}]}}]}"#)
+            .with_body(r#"{"installs":[{"moduleId":"m1","slug":"core","installedVersion":"1.2.3","serving":"tunnel","manifest":{"provides":[{"key":"x"}]}}]}"#)
             .create();
         let installs = list_app_installs(&test_client(), &server.url(), "AT", "app-id").unwrap();
         assert_eq!(
             installs[0].manifest.as_ref().unwrap()["provides"][0]["key"],
             "x"
         );
+        assert_eq!(installs[0].serving, "tunnel");
     }
 
     #[test]
