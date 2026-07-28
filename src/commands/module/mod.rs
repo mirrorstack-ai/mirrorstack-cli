@@ -21,6 +21,7 @@ use crate::commands::dev::module_meta::{self, ModuleMeta};
 use crate::credentials;
 use crate::http;
 
+pub(crate) mod capabilities;
 mod changelog;
 mod readme;
 mod scaffold;
@@ -39,6 +40,8 @@ pub struct ModuleArgs {
 
 #[derive(Subcommand)]
 enum ModuleCommand {
+    /// Report the joined capability index for co-located or installed modules.
+    Capabilities(capabilities::CapabilitiesArgs),
     /// Create a new module on the platform and scaffold locally.
     /// Interactive by default; pass --yes for non-interactive use.
     Init(InitArgs),
@@ -111,6 +114,7 @@ pub struct DeployArgs {
 
 pub fn run(args: ModuleArgs) -> Result<()> {
     match args.command {
+        ModuleCommand::Capabilities(c) => capabilities::run(c),
         ModuleCommand::Init(i) => init(i),
         ModuleCommand::Register(r) => register(r),
         ModuleCommand::Deploy(d) => deploy(d),

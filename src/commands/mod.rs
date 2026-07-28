@@ -90,6 +90,8 @@ enum Command {
     /// Manage applications on the platform.
     #[command(visible_alias = "app")]
     Apps(app::AppArgs),
+    /// Manage developer modules and inspect their capability surface.
+    Module(module::ModuleArgs),
     /// Run modules locally with supporting services. Scans go.work for
     /// monorepo mode; falls back to single-module if only main.go exists.
     Dev(dev::DevArgs),
@@ -103,6 +105,7 @@ impl Cli {
             Command::Logout(args) => logout::run(args),
             Command::Whoami(args) => whoami::run(args),
             Command::Apps(args) => app::run(args),
+            Command::Module(args) => module::run(args),
             Command::Dev(args) => dev::run(args),
         }
     }

@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 
 /// A module entry discovered from `go.work`.
 #[derive(Debug, Clone)]
-pub(super) struct WorkspaceModule {
+pub(crate) struct WorkspaceModule {
     /// Relative directory from the go.work root (e.g. `./oauth-core` → `oauth-core`).
     pub dir: PathBuf,
     /// Absolute path to the module directory.
@@ -17,7 +17,7 @@ pub(super) struct WorkspaceModule {
 /// Parse `go.work` in `root` and return the list of `use` directives as
 /// module entries. Fails if `go.work` is missing or contains no `use`
 /// directives.
-pub(super) fn discover_modules(root: &Path) -> Result<Vec<WorkspaceModule>> {
+pub(crate) fn discover_modules(root: &Path) -> Result<Vec<WorkspaceModule>> {
     let go_work = root.join("go.work");
     let body =
         fs::read_to_string(&go_work).with_context(|| format!("dev: read {}", go_work.display()))?;

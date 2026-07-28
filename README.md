@@ -19,6 +19,9 @@ mirrorstack logout             # Revoke the current session and wipe local crede
 mirrorstack whoami             # Print the currently signed-in user
 mirrorstack app module init    # Register a new module on the platform
 mirrorstack app web deploy     # Deploy a static build directory to app hosting
+mirrorstack module capabilities         # Which host slots exist, who fills them, what is broken
+mirrorstack module capabilities --json  # …the same index, machine-readable
+mirrorstack module capabilities --app @me/my-app  # …resolved against the app's installed versions
 mirrorstack --help             # Show help
 mirrorstack --version          # Show CLI version
 ```

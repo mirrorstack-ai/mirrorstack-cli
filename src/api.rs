@@ -592,6 +592,60 @@ pub fn get_app(
     Err(unexpected_body_error(resp))
 }
 
+/// One module installed into an app. `manifest` is the manifest FROZEN at the
+/// installed version — the same document the runtime authorizes against — so
+/// it is what capability resolution must read rather than local source.
+/// Absent for a dev-mount install (no pinned version) and for a pinned version
+/// the platform recorded without one.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppInstall {
+    pub module_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub installed_version: String,
+    #[serde(default)]
+    pub manifest: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct AppInstallList {
+    installs: Vec<AppInstall>,
+}
+
+/// GET /v1/apps/{appId}/installs — every module installed into the app, with
+/// the manifest frozen at its installed version. `app_id` must be the app
+/// UUID: the handler resolves the per-app tenant schema from it, so a slug
+/// 404s — resolve one with [`get_app`] first. Member-scoped.
+pub fn list_app_installs(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    app_id: &str,
+) -> Result<Vec<AppInstall>, ApiError> {
+    let endpoint = format!(
+        "{}/v1/apps/{}/installs",
+        apps_base.trim_end_matches('/'),
+        app_id
+    );
+    let resp = http
+        .get(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<AppInstallList>()?.installs);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(unexpected_body_error(resp))
+}
+
 /// One file of an app deploy's manifest, as POSTed to the platform.
 #[derive(Debug, Serialize)]
 pub struct DeployFile<'a> {
@@ -1190,6 +1244,34 @@ mod tests {
 
     use mockito::Server;
     use serde_json::json;
+
+    #[test]
+    fn list_app_installs_preserves_manifest() {
+        let mut server = Server::new();
+        let _m = server.mock("GET", "/v1/apps/app-id/installs")
+            .match_header("authorization", "Bearer AT")
+            .with_status(200)
+            .with_body(r#"{"installs":[{"moduleId":"m1","slug":"core","installedVersion":"1.2.3","manifest":{"provides":[{"key":"x"}]}}]}"#)
+            .create();
+        let installs = list_app_installs(&test_client(), &server.url(), "AT", "app-id").unwrap();
+        assert_eq!(
+            installs[0].manifest.as_ref().unwrap()["provides"][0]["key"],
+            "x"
+        );
+    }
+
+    #[test]
+    fn list_app_installs_401_is_unauthenticated() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/apps/app-id/installs")
+            .with_status(401)
+            .create();
+        assert!(matches!(
+            list_app_installs(&test_client(), &server.url(), "bad", "app-id"),
+            Err(ApiError::Unauthenticated)
+        ));
+    }
 
     fn test_client() -> Client {
         http::client(Duration::from_secs(15)).expect("client")
