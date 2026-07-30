@@ -140,24 +140,39 @@ fn find<'a>(resolved: &'a [Resolved], reference: &str) -> Option<&'a Resolved> {
 
 /// Cross-check every resolved module's declared surface against every other.
 pub(crate) fn classify(resolved: &[Resolved]) -> Report {
-    let validators: std::collections::HashMap<_, _> = resolved
-        .iter()
-        .flat_map(|module| {
-            module.manifest.provides.iter().filter_map(|slot| {
-                slot.payload.as_ref().map(|payload| {
-                    (
-                        (module.id.clone(), slot.key.clone()),
-                        schema::Validator::compile(payload),
-                    )
-                })
-            })
-        })
-        .collect();
     let mut report = Report {
         resolved: Vec::new(),
         slots: Vec::new(),
         diagnostics: Vec::new(),
     };
+    let validators: Vec<Vec<_>> = resolved
+        .iter()
+        .map(|module| {
+            module
+                .manifest
+                .provides
+                .iter()
+                .map(|slot| {
+                    slot.payload.as_ref().map(|payload| {
+                        schema::Validator::compile(payload).map_err(|reason| {
+                            report.diagnostics.push(diagnostic(
+                                Severity::Error,
+                                "schema_invalid",
+                                module,
+                                format!(
+                                    "schema for slot {}/{} could not be compiled: {reason}",
+                                    module.name(),
+                                    slot.key
+                                ),
+                                Some(module.name().into()),
+                            ));
+                            reason
+                        })
+                    })
+                })
+                .collect()
+        })
+        .collect();
     for module in resolved {
         report.resolved.push(ResolvedEntry {
             module: module.name().into(),
@@ -201,7 +216,11 @@ pub(crate) fn classify(resolved: &[Resolved]) -> Report {
         for contribution in &contributor.manifest.contributes_to {
             let (host_slug, embedded) = parse_ref(&contribution.host);
             let constraint = contribution.constraint.as_ref().or(embedded.as_ref());
-            let Some(host) = find(resolved, &host_slug) else {
+            let Some((host_idx, host)) = resolved
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.slug == host_slug || r.id == host_slug)
+            else {
                 report.diagnostics.push(diagnostic(Severity::Error, "host_unresolvable", contributor,
                     format!("contributes to {}/{slot}; no resolvable module provides host \"{host_slug}\"", contribution.host, slot = contribution.slot),
                     Some(host_slug)));
@@ -218,11 +237,12 @@ pub(crate) fn classify(resolved: &[Resolved]) -> Report {
                     format!("contributes to {host_name}/{slot} pinned {constraint}, but the resolved host is {host_name}@{} (tier {})", host.version, host.tier, slot = contribution.slot),
                     Some(host_name.into())));
             }
-            let Some(host_slot) = host
+            let Some((slot_idx, _)) = host
                 .manifest
                 .provides
                 .iter()
-                .find(|s| s.key == contribution.slot)
+                .enumerate()
+                .find(|(_, s)| s.key == contribution.slot)
             else {
                 let mut declared: Vec<_> = host
                     .manifest
@@ -253,11 +273,8 @@ pub(crate) fn classify(resolved: &[Resolved]) -> Report {
                 });
             }
             if let Some(payload) = &contribution.payload
-                && let Some(validator) = validators.get(&(host.id.clone(), host_slot.key.clone()))
-                && let Err(reason) = match validator {
-                    Ok(validator) => validator.validate(payload),
-                    Err(reason) => Err(reason.clone()),
-                }
+                && let Some(Ok(validator)) = &validators[host_idx][slot_idx]
+                && let Err(reason) = validator.validate(payload)
             {
                 // Reflector-required fields are stricter than the host's
                 // Provide[T] decoder, which is the real registration boundary.
@@ -602,6 +619,59 @@ mod tests {
         ]);
         let detail = only(&report, "payload_mismatch");
         assert!(detail.contains("object"), "{detail}");
+    }
+
+    #[test]
+    fn duplicate_slot_keys_validate_against_the_selected_first_slot() {
+        let report = classify(&[
+            module(
+                "host",
+                "0.1.0",
+                json!({"provides": [
+                    {"key": "duplicate", "payload": {"type": "string"}},
+                    {"key": "duplicate", "payload": {"type": "number"}}
+                ]}),
+            ),
+            contributor(
+                "contributor",
+                json!({"contributesTo": [
+                    {"host": "host", "slot": "duplicate", "payload": "valid for first"}
+                ]}),
+            ),
+        ]);
+
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != "payload_mismatch"),
+            "{:?}",
+            codes(&report)
+        );
+    }
+
+    #[test]
+    fn an_invalid_schema_is_reported_even_when_the_slot_is_unfilled() {
+        let report = classify(&[module(
+            "host",
+            "0.1.0",
+            json!({"provides": [
+                {"key": "broken", "payload": {"type": "not-a-json-schema-type"}}
+            ]}),
+        )]);
+
+        let detail = only(&report, "schema_invalid");
+        assert!(detail.contains("host/broken"), "{detail}");
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.code == "schema_invalid")
+                .unwrap()
+                .severity,
+            Severity::Error
+        );
+        assert!(codes(&report).contains(&"slot_unfilled"));
     }
 
     #[test]
