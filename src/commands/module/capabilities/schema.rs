@@ -1,140 +1,56 @@
-use std::collections::HashSet;
-
 use serde_json::Value;
 
-pub(crate) fn validate(schema: &Value, value: &Value) -> Result<(), String> {
-    validate_at(schema, schema, value, "", &mut HashSet::new())
-}
+pub(crate) struct Validator(jsonschema::Validator);
 
-fn kind(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
+impl Validator {
+    pub(crate) fn compile(schema: &Value) -> Result<Self, String> {
+        jsonschema::draft202012::options()
+            .build(schema)
+            .map(Self)
+            .map_err(|error| format!("invalid schema: {error}"))
     }
-}
 
-fn validate_at(
-    root: &Value,
-    schema: &Value,
-    value: &Value,
-    path: &str,
-    visited: &mut HashSet<(String, String)>,
-) -> Result<(), String> {
-    let Some(obj) = schema.as_object() else {
-        return Ok(());
-    };
-    if obj.is_empty() {
-        return Ok(());
-    }
-    if let Some(reference) = obj.get("$ref") {
-        let reference = reference
-            .as_str()
-            .ok_or_else(|| format!("{path}: $ref must be a string"))?;
-        let target = resolve_ref(root, reference)
-            .map_err(|reason| format!("{path}: cannot resolve $ref {reference:?}: {reason}"))?;
-        // Recursive values make progress by descending to a new JSON path.
-        // Only a repeated reference at the same position is a schema-only loop.
-        let progress = (reference.into(), path.into());
-        if visited.insert(progress.clone()) {
-            let result = validate_at(root, target, value, path, visited);
-            visited.remove(&progress);
-            result?;
-        }
-    }
-    if let Some(values) = obj.get("enum").and_then(Value::as_array)
-        && !values.contains(value)
-    {
-        return Err(format!("{path}: value is not in enum"));
-    }
-    // Go zero values and pointer fields commonly serialize as null, so null is
-    // accepted even when a generated SDK schema names a concrete type.
-    if !value.is_null()
-        && let Some(types) = obj.get("type")
-    {
-        let allowed: Vec<&str> = match types {
-            Value::String(s) => vec![s],
-            Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
-            _ => Vec::new(),
-        };
-        let actual = kind(value);
-        let matches = allowed
-            .iter()
-            .any(|t| *t == actual || (*t == "number" && actual == "integer"));
-        if !allowed.is_empty() && !matches {
-            return Err(format!(
-                "{path}: expected {}, got {actual}",
-                allowed.join(" or ")
-            ));
-        }
-    }
-    if let Some(map) = value.as_object() {
-        let properties = obj.get("properties").and_then(Value::as_object);
-        if let Some(required) = obj.get("required").and_then(Value::as_array) {
-            for name in required.iter().filter_map(Value::as_str) {
-                if !map.contains_key(name) {
-                    return Err(format!("{path}/{name}: required property is missing"));
+    pub(crate) fn validate(&self, value: &Value) -> Result<(), String> {
+        self.0.validate(value).map_err(|error| {
+            let mut path = error.instance_path().to_string();
+            match error.kind() {
+                jsonschema::error::ValidationErrorKind::AdditionalProperties { unexpected } => {
+                    if let Some(property) = unexpected.first() {
+                        push_pointer_segment(&mut path, property);
+                    }
                 }
-            }
-        }
-        if let Some(properties) = properties {
-            for (key, child_schema) in properties {
-                if let Some(child) = map.get(key) {
-                    validate_at(root, child_schema, child, &format!("{path}/{key}"), visited)?;
+                jsonschema::error::ValidationErrorKind::Required { property } => {
+                    if let Some(property) = property.as_str() {
+                        push_pointer_segment(&mut path, property);
+                    }
                 }
+                _ => {}
             }
-        }
-        if obj.get("additionalProperties") == Some(&Value::Bool(false))
-            && let Some(key) = map
-                .keys()
-                .find(|key| properties.is_none_or(|p| !p.contains_key(*key)))
-        {
-            return Err(format!("{path}/{key}: additional property is not allowed"));
-        }
+            format!("{path}: {error}")
+        })
     }
-    if let (Some(items), Some(values)) = (obj.get("items"), value.as_array()) {
-        for (i, child) in values.iter().enumerate() {
-            validate_at(root, items, child, &format!("{path}/{i}"), visited)?;
-        }
-    }
-    Ok(())
 }
 
-fn resolve_ref<'a>(root: &'a Value, reference: &str) -> Result<&'a Value, String> {
-    if reference == "#" {
-        return Ok(root);
-    }
-    let Some(name) = reference.strip_prefix("#/$defs/") else {
-        return Err("only `#` and `#/$defs/NAME` references are supported".into());
-    };
-    if name.is_empty() || name.contains('/') {
-        return Err("definition name is empty or contains an unsupported JSON Pointer path".into());
-    }
-    let name = name.replace("~1", "/").replace("~0", "~");
-    root.get("$defs")
-        .and_then(|defs| defs.get(&name))
-        .ok_or_else(|| format!("definition {name:?} is missing"))
+fn push_pointer_segment(pointer: &mut String, segment: &str) {
+    pointer.push('/');
+    pointer.push_str(&segment.replace('~', "~0").replace('/', "~1"));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::validate;
-    use serde_json::json;
+    use super::Validator;
+    use serde_json::{Value, json};
 
     /// Captured from the Go SDK reflector: validation keywords live under
     /// `$defs`, while the slot schema root points at the reflected Go type.
-    fn manifest() -> serde_json::Value {
+    fn manifest() -> Value {
         serde_json::from_str(include_str!(
             "../../../../tests/fixtures/sdk-capabilities-manifest.json"
         ))
         .unwrap()
     }
 
-    fn schema(slot: &str) -> serde_json::Value {
+    fn schema(slot: &str) -> Value {
         manifest()["provides"]
             .as_array()
             .unwrap()
@@ -142,6 +58,10 @@ mod tests {
             .find(|provide| provide["key"] == slot)
             .unwrap()["payload"]
             .clone()
+    }
+
+    fn validate(schema: &Value, value: &Value) -> Result<(), String> {
+        Validator::compile(schema)?.validate(value)
     }
 
     #[test]
@@ -175,7 +95,7 @@ mod tests {
             &json!("i am not even an object"),
         )
         .unwrap_err();
-        assert!(err.contains("expected object"), "got {err}");
+        assert!(err.contains("object"), "got {err}");
     }
 
     #[test]
@@ -203,7 +123,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("/next/next/value"), "got {err}");
-        assert!(err.contains("expected string"), "got {err}");
+        assert!(err.contains("string"), "got {err}");
     }
 
     #[test]
@@ -234,32 +154,59 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_refs_are_loud() {
-        let err = validate(
-            &json!({"$ref": "https://example.com/schema.json"}),
-            &json!({}),
-        )
-        .unwrap_err();
-        assert!(err.contains("only `#` and `#/$defs/NAME`"), "got {err}");
+    fn schema_valued_additional_properties_validate_map_values() {
+        let map_schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$ref": "#/$defs/StringMap",
+            "$defs": {
+                "StringMap": {
+                    "type": "object",
+                    "additionalProperties": {"$ref": "#/$defs/Entry"}
+                },
+                "Entry": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                    "additionalProperties": false
+                }
+            }
+        });
+
+        let err = validate(&map_schema, &json!({"first": {"value": 42}})).unwrap_err();
+        assert!(err.contains("/first/value"), "got {err}");
+        assert!(err.contains("string"), "got {err}");
     }
 
     #[test]
-    fn root_refs_terminate() {
-        assert!(validate(&json!({"$ref": "#"}), &json!({"anything": true})).is_ok());
+    fn additional_properties_false_rejects_unknown_keys() {
+        let err = validate(
+            &schema("auth-provider"),
+            &json!({"slug": "google", "unknown": true}),
+        )
+        .unwrap_err();
+        assert!(err.contains("/unknown"), "got {err}");
+        assert!(err.contains("Additional properties"), "got {err}");
+    }
+
+    #[test]
+    fn unsupported_refs_are_loud() {
+        let err = Validator::compile(&json!({"$ref": "https://example.com/schema.json"}))
+            .err()
+            .unwrap();
+        assert!(err.contains("invalid schema"), "got {err}");
     }
 
     #[test]
     fn missing_refs_are_loud() {
-        let err = validate(&json!({"$ref": "#/$defs/Absent"}), &json!({})).unwrap_err();
-        assert!(
-            err.contains("definition \"Absent\" is missing"),
-            "got {err}"
-        );
+        let err = Validator::compile(&json!({"$ref": "#/$defs/Absent"}))
+            .err()
+            .unwrap();
+        assert!(err.contains("invalid schema"), "got {err}");
+        assert!(err.contains("Absent"), "got {err}");
     }
 
     #[test]
-    fn an_empty_or_non_object_schema_validates_anything() {
+    fn an_empty_schema_validates_anything() {
         assert!(validate(&json!({}), &json!("anything")).is_ok());
-        assert!(validate(&json!("not schema"), &json!(1)).is_ok());
     }
 }

@@ -140,6 +140,19 @@ fn find<'a>(resolved: &'a [Resolved], reference: &str) -> Option<&'a Resolved> {
 
 /// Cross-check every resolved module's declared surface against every other.
 pub(crate) fn classify(resolved: &[Resolved]) -> Report {
+    let validators: std::collections::HashMap<_, _> = resolved
+        .iter()
+        .flat_map(|module| {
+            module.manifest.provides.iter().filter_map(|slot| {
+                slot.payload.as_ref().map(|payload| {
+                    (
+                        (module.id.clone(), slot.key.clone()),
+                        schema::Validator::compile(payload),
+                    )
+                })
+            })
+        })
+        .collect();
     let mut report = Report {
         resolved: Vec::new(),
         slots: Vec::new(),
@@ -239,8 +252,12 @@ pub(crate) fn classify(resolved: &[Resolved]) -> Report {
                     tier: contributor.tier,
                 });
             }
-            if let (Some(schema), Some(payload)) = (&host_slot.payload, &contribution.payload)
-                && let Err(reason) = schema::validate(schema, payload)
+            if let Some(payload) = &contribution.payload
+                && let Some(validator) = validators.get(&(host.id.clone(), host_slot.key.clone()))
+                && let Err(reason) = match validator {
+                    Ok(validator) => validator.validate(payload),
+                    Err(reason) => Err(reason.clone()),
+                }
             {
                 // Reflector-required fields are stricter than the host's
                 // Provide[T] decoder, which is the real registration boundary.
@@ -543,7 +560,7 @@ mod tests {
             ),
         ]);
         let detail = only(&report, "payload_mismatch");
-        assert!(detail.contains("required property is missing"), "{detail}");
+        assert!(detail.contains("required"), "{detail}");
         assert_eq!(
             report
                 .diagnostics
@@ -584,7 +601,7 @@ mod tests {
             ),
         ]);
         let detail = only(&report, "payload_mismatch");
-        assert!(detail.contains("expected object"), "{detail}");
+        assert!(detail.contains("object"), "{detail}");
     }
 
     #[test]
