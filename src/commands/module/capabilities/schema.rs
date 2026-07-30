@@ -23,7 +23,7 @@ fn validate_at(
     schema: &Value,
     value: &Value,
     path: &str,
-    visited: &mut HashSet<String>,
+    visited: &mut HashSet<(String, String)>,
 ) -> Result<(), String> {
     let Some(obj) = schema.as_object() else {
         return Ok(());
@@ -37,12 +37,12 @@ fn validate_at(
             .ok_or_else(|| format!("{path}: $ref must be a string"))?;
         let target = resolve_ref(root, reference)
             .map_err(|reason| format!("{path}: cannot resolve $ref {reference:?}: {reason}"))?;
-        // Recursive Go types deliberately produce cyclic definitions. Once a
-        // reference repeats on the active path, the finite JSON value has
-        // already been checked as far as this schema can describe it.
-        if visited.insert(reference.into()) {
+        // Recursive values make progress by descending to a new JSON path.
+        // Only a repeated reference at the same position is a schema-only loop.
+        let progress = (reference.into(), path.into());
+        if visited.insert(progress.clone()) {
             let result = validate_at(root, target, value, path, visited);
-            visited.remove(reference);
+            visited.remove(&progress);
             result?;
         }
     }
@@ -184,6 +184,50 @@ mod tests {
             validate(
                 &schema("cyclic-node"),
                 &json!({"value": "root", "next": {"value": "child"}})
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn recursive_defs_reject_invalid_nested_values_at_their_path() {
+        let err = validate(
+            &schema("cyclic-node"),
+            &json!({
+                "value": "root",
+                "next": {
+                    "value": "child",
+                    "next": {"value": 42}
+                }
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("/next/next/value"), "got {err}");
+        assert!(err.contains("expected string"), "got {err}");
+    }
+
+    #[test]
+    fn recursive_defs_accept_deeply_nested_valid_values() {
+        assert!(
+            validate(
+                &schema("cyclic-node"),
+                &json!({"value": "root", "next": {"value": 42}})
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                &schema("cyclic-node"),
+                &json!({
+                    "value": "root",
+                    "next": {
+                        "value": "child",
+                        "next": {
+                            "value": "grandchild",
+                            "next": {"value": "great-grandchild"}
+                        }
+                    }
+                })
             )
             .is_ok()
         );
