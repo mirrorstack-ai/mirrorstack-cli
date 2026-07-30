@@ -58,7 +58,7 @@ mod proxy;
 mod reload;
 mod share;
 mod tunnel;
-mod workspace;
+pub(crate) mod workspace;
 
 const PASSTHROUGH_ENV: [&str; 10] = [
     "MS_INTERNAL_SECRET",
@@ -108,32 +108,39 @@ pub struct DevArgs {
         action = clap::ArgAction::Set
     )]
     watch: bool,
+    /// Skip the co-located contribution/slot cross-check at boot. Also honored via MS_SKIP_CAPABILITY_CHECK=1.
+    #[arg(long)]
+    skip_capability_check: bool,
 }
 
 const DEFAULT_LOCAL_URL: &str = "http://localhost";
-const DEFAULT_MODULE_PORT: u16 = 9080;
+pub(crate) const DEFAULT_MODULE_PORT: u16 = 9080;
 
 // Inner-runner port layout, matching the retired dev-runner.sh: modules
 // bind sequentially from 18080 in go.work order, esbuild livereload
 // servers from 8089 (per web-enabled module), and the dev-proxy
 // multiplexes them on 8080 (host-published as 9080/9089).
-const INTERNAL_PORT_BASE: u16 = 18080;
+pub(crate) const INTERNAL_PORT_BASE: u16 = 18080;
 const LR_PORT_BASE: u16 = 8089;
-const PROXY_PORT_DEFAULT: u16 = 8080;
+pub(crate) const PROXY_PORT_DEFAULT: u16 = 8080;
 
 /// Route prefix multiplexing modules on one port. The proxy parses it off
 /// incoming targets and tunnel registration embeds it in each module's
 /// local_url — dispatch forwards to exactly what was registered, so the
 /// two must agree.
-const MODULE_ROUTE_PREFIX: &str = "/_m/";
+pub(crate) const MODULE_ROUTE_PREFIX: &str = "/_m/";
 
 /// Per-module platform-token file. The name is a host↔container contract:
 /// the outer run writes it into `.secret/` next to go.work, and the inner
 /// runner points each module's MS_PLATFORM_TOKEN_FILE at it through the
 /// `.:/modules` bind mount.
-fn platform_token_file(root: &Path, slug: &str) -> PathBuf {
+pub(crate) fn platform_token_file(root: &Path, slug: &str) -> PathBuf {
     root.join(".secret")
         .join(format!("ms-platform-token-{slug}"))
+}
+
+fn capability_skip_file(root: &Path) -> PathBuf {
+    root.join(".secret").join("ms-skip-capability-check")
 }
 
 /// How often the supervisor polls module sources for changes — matches the
@@ -268,6 +275,17 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         None
     };
 
+    // Compose files in existing module workspaces predate this flag and do
+    // not forward arbitrary host env. A bind-mounted marker crosses the same
+    // host→runner boundary as platform tokens without rewriting user compose.
+    let skip_file = capability_skip_file(root);
+    if args.skip_capability_check {
+        std::fs::create_dir_all(root.join(".secret"))
+            .context("dev: create .secret directory for capability-check marker")?;
+        std::fs::write(&skip_file, b"1")
+            .context("dev: write capability-check marker for inner runner")?;
+    }
+
     // With --share on a live tunnel, spin up the host-side bundle watcher.
     // It's the only process holding the user access token (credentials.json,
     // never mounted into the runner) AND able to read each module's built
@@ -308,6 +326,9 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     if let Some(secret) = &internal_secret {
         compose.env("MS_INTERNAL_SECRET", secret);
     }
+    if args.skip_capability_check {
+        compose.env("MS_SKIP_CAPABILITY_CHECK", "1");
+    }
 
     let compose_status = compose.status().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => {
@@ -325,6 +346,9 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     // Cleanup per-module token files.
     for f in &token_files {
         let _ = std::fs::remove_file(f);
+    }
+    if args.skip_capability_check {
+        let _ = std::fs::remove_file(skip_file);
     }
 
     if let Some((handles, runtime)) = tunnel_state {
@@ -472,8 +496,12 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
         // the module's own os.Getenv("MS_MODULE_ID") at runtime resolves.
         // The <SLUG> suffix is a root-.env bookkeeping detail; it never
         // reaches the child process.
-        let mut envs: Vec<(String, String)> =
-            module_process_envs(&db_url, port, module_id, &token_file);
+        let mut envs: Vec<(String, String)> = module_process_envs(
+            &db_url,
+            port,
+            module_id,
+            token_file.is_file().then_some(token_file.as_path()),
+        );
         // Pass through env vars from compose (MS_INTERNAL_SECRET is the
         // per-session secret minted by the outer run; the rest configure
         // infrastructure and the platform plane).
@@ -516,6 +544,7 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(PROXY_PORT_DEFAULT);
     let route_count = routes.len();
+    let check_routes = routes.clone();
     let proxy_port = proxy::spawn(proxy_port, routes)?;
     eprintln!(
         "{} dev-proxy listening on :{} ({} routes)",
@@ -524,21 +553,30 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
         route_count
     );
 
-    // Wait for Ctrl-C, or for every supervisor to finish (a supervisor
-    // only returns on its own in one-shot mode, after its module exits).
+    // Installed BEFORE the contribution check so a Ctrl-C during its readiness
+    // wait is buffered on the channel and breaks the loop immediately below,
+    // instead of killing the process with the module children still running.
     let (tx, rx) = mpsc::channel::<()>();
     ctrlc::set_handler(move || {
         let _ = tx.send(());
     })
     .context("dev: install ctrl-c handler")?;
 
-    loop {
-        if supervisors.iter().all(|h| h.is_finished()) {
-            break;
-        }
-        match rx.recv_timeout(SUPERVISE_TICK) {
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+    // A failed check falls straight through to the shared teardown below and
+    // its error becomes this function's — dev must not keep serving a
+    // workspace whose contributions cannot land.
+    let contribution_result = check_contributions(root, &check_routes, args, &rx);
+    if matches!(contribution_result, Ok(CheckOutcome::Complete)) {
+        // Wait for Ctrl-C, or for every supervisor to finish (a supervisor
+        // only returns on its own in one-shot mode, after its module exits).
+        loop {
+            if supervisors.iter().all(|h| h.is_finished()) {
+                break;
+            }
+            match rx.recv_timeout(SUPERVISE_TICK) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            }
         }
     }
 
@@ -557,7 +595,217 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
     // final batch before the process exits.
     thread::sleep(Duration::from_millis(300));
 
-    Ok(())
+    contribution_result.map(|_| ())
+}
+
+fn capability_check_skipped(flag: bool, env: Option<&str>) -> bool {
+    flag || env.is_some_and(|value| {
+        let value = value.trim();
+        !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+    })
+}
+
+/// How long boot waits for every module to serve its manifest. Generous enough
+/// to cover the first cold `go build` of a workspace, short enough that a
+/// module that will never answer (auth failing closed, a crash loop) does not
+/// stall dev indefinitely.
+const CONTRIBUTION_CHECK_BUDGET: Duration = Duration::from_secs(20);
+
+/// Cross-check every co-located module's declared `ContributesTo` against the
+/// hosts' declared `Provide` slots, and fail boot when a contribution targets a
+/// slot its resolvable host does not declare. Until this existed the failure
+/// mode was silence: the host's reader returns an empty list for "typo'd slot"
+/// exactly as it does for "not installed".
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckOutcome {
+    Complete,
+    Interrupted,
+}
+
+fn check_contributions(
+    root: &Path,
+    routes: &HashMap<String, u16>,
+    args: &DevArgs,
+    rx: &mpsc::Receiver<()>,
+) -> Result<CheckOutcome> {
+    use crate::commands::module::capabilities::index::{self, Resolved, Tier};
+    use crate::commands::module::capabilities::{resolve, wire::Manifest};
+
+    let skip_env = std::env::var("MS_SKIP_CAPABILITY_CHECK").ok();
+    if capability_check_skipped(args.skip_capability_check, skip_env.as_deref())
+        || capability_skip_file(root).is_file()
+    {
+        return Ok(CheckOutcome::Complete);
+    }
+    // A token file is written only by outer tunnel setup. Without one the
+    // SDK cannot authenticate this internal route, so polling merely spends
+    // the entire boot budget on a state that cannot become ready.
+    if !routes
+        .keys()
+        .any(|slug| platform_token_file(root, slug).is_file())
+    {
+        eprintln!(
+            "{} contribution check skipped (no dev tunnel platform token)",
+            warn_prefix()
+        );
+        return Ok(CheckOutcome::Complete);
+    }
+    let client = http::client(Duration::from_secs(2))?;
+    let deadline = Instant::now() + CONTRIBUTION_CHECK_BUDGET;
+    let mut pending = routes.clone();
+    let mut resolved = Vec::new();
+    let mut last_reason: HashMap<String, String> = HashMap::new();
+    while !pending.is_empty() && Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                return Ok(CheckOutcome::Interrupted);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        let probes: Vec<_> = pending
+            .iter()
+            .map(|(slug, port)| (slug.clone(), *port))
+            .collect();
+        for (slug, port) in probes {
+            let url = format!("http://127.0.0.1:{port}{}", resolve::MANIFEST_PATH);
+            let Ok(response) = resolve::request_headers(client.get(url), root, &slug).send() else {
+                continue;
+            };
+            if !response.status().is_success() {
+                // 503 here is the SDK failing closed on an unreadable
+                // MS_PLATFORM_TOKEN_FILE — a plain (non-tunnel) `dev` leaves
+                // modules in exactly that state, so record it for the warning.
+                last_reason.insert(
+                    slug,
+                    format!("HTTP {} on :{port}", response.status().as_u16()),
+                );
+                continue;
+            }
+            match response.json::<Manifest>() {
+                Ok(manifest) => {
+                    let keys: Vec<_> = manifest.versions.keys().cloned().collect();
+                    let version =
+                        module_meta::latest_version(&keys).unwrap_or_else(|| "unknown".into());
+                    resolved.push(Resolved {
+                        slug: if manifest.slug.is_empty() {
+                            slug.clone()
+                        } else {
+                            manifest.slug.clone()
+                        },
+                        id: manifest.id.clone(),
+                        version: version.trim_start_matches('v').into(),
+                        tier: Tier::L,
+                        manifest,
+                    });
+                    pending.remove(&slug);
+                }
+                Err(error) => {
+                    last_reason.insert(slug, format!("manifest did not parse: {error}"));
+                }
+            }
+        }
+        if !pending.is_empty() {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Ok(CheckOutcome::Interrupted);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+
+    // An unreachable module is never fatal: it may still be compiling, and a
+    // capability check must not be the thing that stops a dev session.
+    for slug in pending.keys() {
+        let reason = last_reason
+            .get(slug)
+            .cloned()
+            .unwrap_or_else(|| "no response".into());
+        eprintln!(
+            "{} contribution check skipped {slug} ({reason})",
+            warn_prefix()
+        );
+    }
+    if resolved.is_empty() {
+        return Ok(CheckOutcome::Complete);
+    }
+
+    let report = index::classify(&resolved);
+    // A contribution into a host outside this workspace is legal in dev — the
+    // install-time gate is what checks those.
+    for diagnostic in report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "host_unresolvable")
+    {
+        eprintln!("{} {}", warn_prefix(), diagnostic.detail);
+    }
+    for diagnostic in report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "payload_mismatch")
+    {
+        eprintln!(
+            "{} {} {}",
+            warn_prefix(),
+            style(&diagnostic.module).cyan().bold(),
+            diagnostic.detail
+        );
+    }
+
+    let failures: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == index::Severity::Error && d.code == "slot_unknown")
+        .collect();
+    if !failures.is_empty() {
+        eprintln!();
+        for diagnostic in &failures {
+            eprintln!(
+                "{} {} {}",
+                style("error:").red().bold(),
+                style(&diagnostic.module).cyan().bold(),
+                diagnostic.detail
+            );
+        }
+        eprintln!(
+            "  {}",
+            style(
+                "fix the slot name (or declare it on the host with ms.Provide); \
+                 pass --skip-capability-check to boot anyway"
+            )
+            .dim()
+        );
+        eprintln!();
+        return Err(anyhow!(
+            "contribution check failed: {} contribution(s) target a slot their host does not declare",
+            failures.len()
+        ));
+    }
+
+    let unfilled: Vec<_> = report
+        .slots
+        .iter()
+        .filter(|slot| slot.filled_by.is_empty())
+        .collect();
+    eprintln!(
+        "{} contributions checked — {} of {} host slots filled",
+        ok_mark(),
+        report.slots.len() - unfilled.len(),
+        report.slots.len()
+    );
+    // The coverage report: unfilled slots are legal, but they had been
+    // invisible, so name them.
+    for slot in unfilled {
+        eprintln!(
+            "  {} {}/{} {}",
+            style("○").yellow(),
+            slot.host,
+            slot.key,
+            style("unfilled").dim()
+        );
+    }
+    Ok(CheckOutcome::Complete)
 }
 
 /// Own one module's build → run → watch → restart loop.
@@ -650,17 +898,20 @@ fn module_process_envs(
     db_url: &str,
     port: u16,
     module_id: &str,
-    token_file: &Path,
+    token_file: Option<&Path>,
 ) -> Vec<(String, String)> {
-    vec![
+    let mut envs = vec![
         ("MS_LOCAL_DB_URL".into(), db_url.to_string()),
         ("PORT".into(), port.to_string()),
         ("MS_MODULE_ID".into(), module_id.to_string()),
-        (
+    ];
+    if let Some(token_file) = token_file {
+        envs.push((
             "MS_PLATFORM_TOKEN_FILE".into(),
             token_file.display().to_string(),
-        ),
-    ]
+        ));
+    }
+    envs
 }
 
 fn append_passthrough_env(envs: &mut Vec<(String, String)>) {
@@ -1039,12 +1290,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn capability_skip_flag_parsing() {
+        assert!(capability_check_skipped(true, None));
+        assert!(capability_check_skipped(false, Some("1")));
+        assert!(capability_check_skipped(false, Some("yes")));
+        assert!(!capability_check_skipped(false, None));
+        assert!(!capability_check_skipped(false, Some("")));
+        assert!(!capability_check_skipped(false, Some("0")));
+        assert!(!capability_check_skipped(false, Some("false")));
+        assert!(!capability_check_skipped(false, Some("FALSE")));
+    }
+
+    #[test]
     fn module_process_envs_includes_ms_module_id() {
         let envs = module_process_envs(
             "postgres://x/y",
             18080,
             "mbb8a3f8b123456789abcdef012345678",
-            Path::new("/tmp/.ms-platform-token-media"),
+            Some(Path::new("/tmp/.ms-platform-token-media")),
         );
         assert!(envs.contains(&(
             "MS_MODULE_ID".to_string(),
@@ -1067,7 +1330,7 @@ mod tests {
             "postgres://x/y",
             18080,
             "moauthcoreid",
-            Path::new("/tmp/.ms-platform-token-oauth-core"),
+            Some(Path::new("/tmp/.ms-platform-token-oauth-core")),
         );
         assert!(
             envs.iter().any(|(k, _)| k == "MS_MODULE_ID"),
@@ -1076,6 +1339,15 @@ mod tests {
         assert!(
             !envs.iter().any(|(k, _)| k.starts_with("MS_MODULE_ID_")),
             "child env must not carry a suffixed MS_MODULE_ID_* key: {envs:?}"
+        );
+    }
+
+    #[test]
+    fn module_process_envs_does_not_configure_auth_without_a_token() {
+        let envs = module_process_envs("postgres://x/y", 18080, "module-id", None);
+        assert!(
+            !envs.iter().any(|(key, _)| key == "MS_PLATFORM_TOKEN_FILE"),
+            "an absent token must not put the SDK into fail-closed configured mode"
         );
     }
 

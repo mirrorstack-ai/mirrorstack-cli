@@ -213,6 +213,15 @@ pub(crate) struct SemVer {
     pre: Vec<PreId>,
 }
 
+/// Build a release SemVer from a core triple — bound construction for
+/// version-constraint matching (see commands::module::capabilities::version).
+pub(crate) fn semver_from_core(major: u64, minor: u64, patch: u64) -> SemVer {
+    SemVer {
+        core: (major, minor, patch),
+        pre: Vec::new(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum PreId {
     // Variant order is load-bearing: derived Ord gives Num < Alpha, which

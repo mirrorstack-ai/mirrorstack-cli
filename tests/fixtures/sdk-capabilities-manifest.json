@@ -1,0 +1,77 @@
+{
+  "slug": "oauth-core",
+  "provides": [
+    {
+      "key": "auth-provider",
+      "payload": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/$defs/AuthProvider",
+        "$defs": {
+          "AuthProvider": {
+            "type": "object",
+            "properties": {
+              "slug": { "type": "string" },
+              "name": { "type": "string" }
+            },
+            "required": ["slug"],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "key": "user-detail-blocks",
+      "payload": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/$defs/UserDetailBlock",
+        "$defs": {
+          "UserDetailBlock": {
+            "type": "object",
+            "properties": {
+              "title": { "type": "string" },
+              "bodyUrl": { "type": "string" }
+            },
+            "required": ["title", "bodyUrl"],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "key": "users-table-columns",
+      "payload": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/$defs/UserTableColumn",
+        "$defs": {
+          "UserTableColumn": {
+            "type": "object",
+            "properties": {
+              "key": { "type": "string" },
+              "label": { "type": "string" }
+            },
+            "required": ["key", "label"],
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "key": "cyclic-node",
+      "payload": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/$defs/Node",
+        "$defs": {
+          "Node": {
+            "type": "object",
+            "properties": {
+              "value": { "type": "string" },
+              "next": { "$ref": "#/$defs/Node" }
+            },
+            "required": ["value"],
+            "additionalProperties": false
+          }
+        }
+      }
+    }
+  ]
+}
