@@ -877,8 +877,14 @@ fn record_error_hint(code: &str) -> &'static str {
 
 fn deploy_error_hint(code: &str) -> &'static str {
     match code {
+        // Three routes collapse onto this one code, and api-platform#440
+        // gives each its own message ("module not found", "version not found
+        // for this module", "artifact upload not found"), so the hint must
+        // not name a cause the message hasn't. It only carries the remedy,
+        // which is the same for all three except when the module itself is
+        // the missing record.
         "not_found" => {
-            " (the version record vanished mid-deploy — re-run `mirrorstack app module deploy`)"
+            " (the message says which record the platform couldn't find — re-run `mirrorstack app module deploy` to re-create the version record and its upload; if the module is what's missing, `mirrorstack app module register` it first)"
         }
         // The platform derives invoke_target from the module's own slug and
         // only sanity-checks that derivation — this can't be triggered by
@@ -1239,7 +1245,18 @@ mod tests {
 
     #[test]
     fn deploy_error_hint_for_known_codes() {
-        assert!(deploy_error_hint("not_found").contains("mirrorstack app module deploy"));
+        // `not_found` has three emitters on these routes, so the hint may
+        // carry only the remedy — naming one of the three would be wrong for
+        // the other two.
+        let not_found = deploy_error_hint("not_found");
+        assert!(
+            not_found.contains("mirrorstack app module deploy"),
+            "{not_found}"
+        );
+        assert!(
+            not_found.contains("mirrorstack app module register"),
+            "{not_found}"
+        );
         assert!(deploy_error_hint("invoke_target_invalid").contains("platform"));
         assert!(deploy_error_hint("status_invalid").contains("--status"));
         assert!(deploy_error_hint("artifact_missing").contains("module deploy"));
