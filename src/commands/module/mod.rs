@@ -21,6 +21,7 @@ use crate::commands::dev::module_meta::{self, ModuleMeta};
 use crate::credentials;
 use crate::http;
 
+mod artifact;
 pub(crate) mod capabilities;
 mod changelog;
 mod readme;
@@ -51,10 +52,13 @@ enum ModuleCommand {
     /// writes the assigned ID back under that module's key in .env.
     Register(RegisterArgs),
     /// Deploy the version your code declares (the newest Config.Versions
-    /// key in ./main.go). Records the version with its CHANGELOG.md section
-    /// first when it isn't recorded yet — records are immutable, bump the
-    /// key to ship a new entry. The prod transport target is derived by the
-    /// platform from the module's own identity, never supplied by the caller.
+    /// key in ./main.go). Cross-compiles the module for Linux/arm64 and
+    /// packages it as a Lambda `bootstrap` zip, records the version with its
+    /// CHANGELOG.md section when it isn't recorded yet — records are
+    /// immutable, bump the key to ship a new entry — then uploads the
+    /// artifact and points the deploy at it. The prod transport target is
+    /// derived by the platform from the module's own identity, never
+    /// supplied by the caller.
     Deploy(DeployArgs),
 }
 
@@ -489,6 +493,23 @@ fn deploy(args: DeployArgs) -> Result<()> {
         }
     }
 
+    // Build, package and size-check before anything irreversible happens: a
+    // compile error or an oversize bundle must not first freeze an immutable
+    // version record. Same posture as `app web deploy`, which packages and
+    // checks the SSR bundle before it creates the deploy.
+    let (_artifact_dir, bootstrap) =
+        with_spinner("Building module…", || artifact::build_bootstrap(&dir))?;
+    let zip_path = artifact::zip_bootstrap(&bootstrap)?;
+    let artifact_size = artifact::packaged_size(&zip_path)?;
+
+    eprintln!(
+        "  {} {} → {} (arm64 bundle, {})",
+        style("Deploying:").dim(),
+        style(dir.display()).bold(),
+        style(format!("{slug}@{version}")).cyan().bold(),
+        artifact::human_bytes(artifact_size)
+    );
+
     ensure_version_recorded(
         &client,
         &apps_base,
@@ -499,6 +520,25 @@ fn deploy(args: DeployArgs) -> Result<()> {
         &version,
         &dir,
     )?;
+
+    // Version-scoped, so it can only run once the record above exists.
+    // `_artifact_dir` (the temp dir backing `zip_path`) stays alive across
+    // this call by still being in scope — dropping it earlier would delete
+    // the archive out from under the upload.
+    artifact::ship_artifact(
+        &client,
+        &apps_base,
+        &creds.access_token,
+        &module.id,
+        &version,
+        &zip_path,
+    )?;
+    eprintln!(
+        "{} uploaded {} ({})",
+        ok_mark(),
+        style(format!("{slug}@{version}")).cyan().bold(),
+        artifact::human_bytes(artifact_size)
+    );
 
     let result = with_spinner("Deploying…", || {
         api::set_module_deploy(
@@ -798,6 +838,15 @@ fn deploy_error_hint(code: &str) -> &'static str {
             " (the platform couldn't derive a valid deploy target from this module's slug — this is a platform-side issue, not something to fix locally)"
         }
         "status_invalid" => " (--status must be one of: active, draining, disabled)",
+        "artifact_missing" => {
+            " (the upload didn't land in object storage — re-run `mirrorstack module deploy`)"
+        }
+        "artifact_invalid" => {
+            " (the platform rejected the uploaded zip — it must contain an executable `bootstrap` at the archive root and stay under 250.0 MB)"
+        }
+        "artifact_storage_unconfigured" => {
+            " (module artifact storage is not configured on the platform — this is a platform-side issue, not something to fix locally)"
+        }
         _ => "",
     }
 }
@@ -1116,6 +1165,9 @@ mod tests {
         assert!(deploy_error_hint("not_found").contains("mirrorstack app module deploy"));
         assert!(deploy_error_hint("invoke_target_invalid").contains("platform"));
         assert!(deploy_error_hint("status_invalid").contains("--status"));
+        assert!(deploy_error_hint("artifact_missing").contains("module deploy"));
+        assert!(deploy_error_hint("artifact_invalid").contains("bootstrap"));
+        assert!(deploy_error_hint("artifact_storage_unconfigured").contains("platform"));
         assert_eq!(deploy_error_hint("something_else"), "");
     }
 

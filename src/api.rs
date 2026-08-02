@@ -497,6 +497,121 @@ pub fn set_module_deploy(
     })
 }
 
+/// One-time PUT instruction for a version's Lambda artifact, returned by
+/// [`create_module_artifact_upload`]. The platform owns the key outright —
+/// the CLI never proposes one, and nothing is echoed back at finalize.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // version_id / module_id / expires_at are part of the API surface
+pub struct ModuleArtifactUpload {
+    pub url: String,
+    pub key: String,
+    /// Headers the presigned URL expects — sent verbatim on the PUT, exactly
+    /// like an app deploy's `UploadTarget`.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub version_id: String,
+    #[serde(default)]
+    pub module_id: String,
+    /// RFC3339 presign expiry — informational only (the PUT follows
+    /// immediately, so the CLI never acts on it).
+    #[serde(default)]
+    pub expires_at: String,
+}
+
+/// POST /v1/modules/{moduleId}/versions/{versionRef}/artifact — record a
+/// pending artifact for the version and mint its presigned PUT. Takes no
+/// body: size and digest are read off object storage at finalize, never
+/// declared by the caller. `version_ref` is the version UUID or the
+/// canonical SemVer string — path-safe verbatim ([0-9A-Za-z.+-] only), same
+/// as [`set_module_deploy`]. Owner-scoped; a module the caller doesn't own
+/// collapses to 404.
+pub fn create_module_artifact_upload(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+    version_ref: &str,
+) -> Result<ModuleArtifactUpload, ApiError> {
+    let resp = http
+        .post(artifact_endpoint(apps_base, module_id, version_ref, ""))
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<ModuleArtifactUpload>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
+/// The persisted verification state of one version's immutable Lambda zip.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // the whole row is the API surface; deploy only needs success
+pub struct ModuleArtifact {
+    pub key: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub version_id: String,
+    #[serde(default)]
+    pub module_id: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+/// POST /v1/modules/{moduleId}/versions/{versionRef}/artifact/finalize —
+/// HEAD-verify the uploaded object and mark it deployable. Also takes no
+/// body: the pending row from [`create_module_artifact_upload`] already
+/// holds the key, so there is nothing for the caller to supply (and nothing
+/// to spoof). `artifact_missing` / `artifact_invalid` /
+/// `artifact_storage_unconfigured` come back as `ApiError::Server`.
+pub fn finalize_module_artifact(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+    version_ref: &str,
+) -> Result<ModuleArtifact, ApiError> {
+    let resp = http
+        .post(artifact_endpoint(
+            apps_base,
+            module_id,
+            version_ref,
+            "/finalize",
+        ))
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<ModuleArtifact>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
+fn artifact_endpoint(apps_base: &str, module_id: &str, version_ref: &str, tail: &str) -> String {
+    format!(
+        "{}/v1/modules/{}/versions/{}/artifact{}",
+        apps_base.trim_end_matches('/'),
+        module_id,
+        version_ref,
+        tail
+    )
+}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct App {
