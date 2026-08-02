@@ -27,8 +27,14 @@ use crate::commands::{
 };
 
 /// The platform's placeholder for an install with no version pin (a module
-/// mounted straight off a dev tunnel). Such an install has nothing to
-/// compare a target against, so the downgrade gate can't apply to it.
+/// mounted straight off a dev tunnel). There is no installed version string,
+/// so the platform's SemVer comparison is skipped for these installs — but
+/// its downgrade gate is NOT. It then judges direction on the app-migration
+/// counters alone, and a target declaring FEWER app migrations than the
+/// install has already applied is refused with `downgrade_not_supported`
+/// unless the request opted in (api-platform#442,
+/// `service.ErrInstallMigrationRollback`). The CLI is never told those
+/// counters, which is why [`is_backwards`] leaves this case to the platform.
 const DEV_INSTALL: &str = "dev";
 
 /// The move runs the module's app-scope migrations server-side before the
@@ -489,8 +495,15 @@ mod tests {
         // Equal is version_unchanged on the platform, not a downgrade —
         // --allow-downgrade would not make it succeed, so don't demand it.
         assert!(!is_backwards("0.2.0", "0.2.0"));
-        // A dev-mount install has no pin to compare against, so any published
-        // target is a forward move — the same rule the platform applies.
+        // NOT because a dev-mount move is always forward — under
+        // api-platform#442 the counter gate applies to exactly these installs
+        // and can refuse one with `downgrade_not_supported`. It is because the
+        // CLI cannot tell: direction there is decided by the target's
+        // app-migration count against the install's watermark, and neither
+        // number is on `AppInstall`. Returning true would demand
+        // --allow-downgrade for every dev-mount move including the forward
+        // ones; false costs one round trip in the rare backward case, and the
+        // platform's refusal already names the flag.
         assert!(!is_backwards(DEV_INSTALL, "0.1.0"));
         // Unparseable either side: defer to the platform rather than block.
         assert!(!is_backwards("not-semver", "0.1.0"));

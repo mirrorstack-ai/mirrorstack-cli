@@ -3043,7 +3043,12 @@ mod tests {
             .mock("POST", "/v1/apps/app-1/modules/mod-uuid/update")
             .with_status(422)
             .with_body(
-                r#"{"error":{"code":"downgrade_not_supported","message":"target version must be newer than the installed version"}}"#,
+                // Verbatim from api-platform#442's handler for the
+                // semver-backward refusal, which is what a request that did
+                // NOT opt in gets back. The retired "target version must be
+                // newer than the installed version" no longer exists there:
+                // #442 made backward moves opt-in rather than impossible.
+                r#"{"error":{"code":"downgrade_not_supported","message":"target version is older than the installed version; re-send with \"allowDowngrade\": true to accept the app-scope migration rollback and the data it destroys"}}"#,
             )
             .create();
 
@@ -3055,7 +3060,7 @@ mod tests {
             "mod-uuid",
             &UpdateInstallInput {
                 version: "0.1.0",
-                allow_downgrade: true,
+                allow_downgrade: false,
             },
         )
         .unwrap_err();
