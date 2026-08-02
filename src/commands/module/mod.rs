@@ -541,8 +541,16 @@ fn deploy(args: DeployArgs) -> Result<()> {
     //      strands that row: the version exists, nothing is deployed, and a
     //      re-run just 409-skips the record and fails the same way.
     //
+    // A 404 with no error envelope — the artifact routes not existing at all —
+    // is a WARN for the same two reasons, plus a third: a platform that
+    // predates those routes also predates #440's deploy gate, so the
+    // `set_module_deploy` below still succeeds and the deploy ends up exactly
+    // where it did before this CLI learned to upload. Failing instead would
+    // turn "your platform is a version behind" into "you cannot deploy at
+    // all", with no flag to opt out of the upload.
+    //
     // Every other artifact error stays fatal — `ship_artifact` only collapses
-    // this one code.
+    // these two shapes.
     let shipped = artifact::ship_artifact(
         &client,
         &apps_base,
@@ -566,6 +574,17 @@ fn deploy(args: DeployArgs) -> Result<()> {
             );
             eprintln!(
                 "  {} the version was recorded and the deploy continues, but it is not artifact-backed — the module runs from whatever transport this environment already resolves (local prod-sim, or an existing production function).",
+                style("note:").dim(),
+            );
+        }
+        artifact::ShipOutcome::EndpointsMissing => {
+            eprintln!(
+                "{} no artifact was uploaded for {}: this platform build has no module-artifact endpoints (the upload route answered 404).",
+                warn_prefix(),
+                style(format!("{slug}@{version}")).cyan().bold(),
+            );
+            eprintln!(
+                "  {} upgrade the platform to a build that serves them. Until then the deploy continues without an artifact — the version is recorded and the module runs from whatever transport this environment already resolves.",
                 style("note:").dim(),
             );
         }
@@ -887,10 +906,23 @@ fn deploy_error_hint(code: &str) -> &'static str {
         "artifact_storage_unconfigured" => {
             " (module artifact storage is not configured on the platform — expected for local prod-sim and bucket-less environments, not something to fix locally)"
         }
+        // 409 from finalize only. A second `module deploy` of this same
+        // version presigned a fresh upload while this one was verifying, so
+        // the platform refuses to certify a readiness verdict for bytes that
+        // are no longer the ones behind the key.
+        "artifact_superseded" => {
+            " (another deploy of this version started a new upload — let that one finish, or re-run `mirrorstack module deploy` to upload and finalize again)"
+        }
         // What `httputil.Conflict` emits when a deploy is attempted for a
         // version whose artifact never finalized.
         "conflict" => {
             " (the artifact for this version isn't finalized — re-run `mirrorstack module deploy` so the upload completes before the deploy)"
+        }
+        // The platform's catch-all 500. Nothing local produced it — a presign
+        // failure or a database error behind the artifact row would both land
+        // here — so rebuilding and re-uploading changes nothing.
+        "internal_error" => {
+            " (the platform failed on its side — retry; if it persists it is a platform issue, not something to fix locally)"
         }
         _ => "",
     }
@@ -1218,7 +1250,31 @@ mod tests {
         assert!(!invalid.contains("bootstrap"), "{invalid}");
         assert!(deploy_error_hint("artifact_storage_unconfigured").contains("platform"));
         assert!(deploy_error_hint("conflict").contains("finalized"));
+        assert!(deploy_error_hint("artifact_superseded").contains("another deploy"));
+        assert!(deploy_error_hint("internal_error").contains("platform"));
         assert_eq!(deploy_error_hint("something_else"), "");
+    }
+
+    /// Every error code api-platform#440 can emit on the three platform
+    /// routes `module deploy` calls — create-upload, finalize and deploy —
+    /// must carry a hint. A bare `code: message` line with no explanation is
+    /// exactly what this table exists to prevent, so the coverage is asserted
+    /// rather than left to review.
+    #[test]
+    fn deploy_error_hint_covers_every_platform_code() {
+        for code in [
+            "not_found",                     // 404 — module, version, or pending artifact row
+            "artifact_missing",              // 422 — finalize, object absent
+            "artifact_invalid",              // 422 — finalize, empty/oversize/non-ZIP
+            "artifact_superseded",           // 409 — finalize lost the compare-and-set
+            "artifact_storage_unconfigured", // 503 — both artifact legs, no store wired
+            "invoke_target_invalid",         // 422 — deploy
+            "status_invalid",                // 422 — deploy
+            "conflict",                      // 409 — deploy, artifact not ready
+            "internal_error",                // 500 — all three
+        ] {
+            assert!(!deploy_error_hint(code).is_empty(), "no hint for `{code}`");
+        }
     }
 
     #[test]

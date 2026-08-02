@@ -124,6 +124,18 @@ pub(crate) enum ShipOutcome {
     /// artifact store wired, so there is nothing to upload to. Not an error —
     /// see the caller in `module::deploy` for why this stays non-fatal.
     StorageUnconfigured,
+    /// The route itself is absent — a 404 carrying no platform error
+    /// envelope. api-platform#440 is what mounts
+    /// `/v1/modules/{id}/versions/{ref}/artifact[/finalize]`; a platform build
+    /// that predates it has no such pattern at all, so chi's default handler
+    /// answers `404 page not found` as text/plain instead of the
+    /// `{"error":{"code":…}}` every real handler writes.
+    ///
+    /// Non-fatal for the same two reasons `StorageUnconfigured` is, plus a
+    /// third: such a platform also has no artifact gate on the deploy call
+    /// (#440 adds that too), so the deploy that follows still succeeds and
+    /// behaves exactly as it did before the CLI learned to upload.
+    EndpointsMissing,
 }
 
 /// Create the upload → PUT → finalize the packaged artifact against the
@@ -176,8 +188,14 @@ fn ship_artifact_with_cap(
     guard_size(size, max_artifact_bytes)?;
 
     // Both legs can answer `artifact_storage_unconfigured` (the platform's
-    // handler maps store absence to it on create-upload *and* finalize), so
-    // both are checked for it; every other code stays fatal.
+    // handler maps store absence to it on create-upload *and* finalize) and
+    // both are mounted by the same PR, so both are checked for both
+    // non-fatal shapes; every other code stays fatal.
+    //
+    // Checking the finalize leg for a missing route is not redundant with
+    // checking the create leg: the two calls are separate requests and can
+    // land on different platform builds mid-rollout, so create can succeed
+    // against a new build while finalize hits an old one.
     let outcome = with_spinner("Uploading artifact…", || -> Result<ShipOutcome> {
         let upload = match api::create_module_artifact_upload(
             api_client,
@@ -190,6 +208,9 @@ fn ship_artifact_with_cap(
             Err(error) if storage_unconfigured(&error) => {
                 return Ok(ShipOutcome::StorageUnconfigured);
             }
+            Err(error) if endpoints_missing(&error) => {
+                return Ok(ShipOutcome::EndpointsMissing);
+            }
             Err(error) => return Err(api_error(error)),
         };
         // Presigned URLs carry their own auth, so this PUT goes out on a
@@ -198,7 +219,7 @@ fn ship_artifact_with_cap(
         upload_one(&upload_client, &upload, zip_path)?;
         Ok(ShipOutcome::Shipped)
     })?;
-    if outcome == ShipOutcome::StorageUnconfigured {
+    if outcome != ShipOutcome::Shipped {
         return Ok(outcome);
     }
 
@@ -207,12 +228,32 @@ fn ship_artifact_with_cap(
     }) {
         Ok(_) => Ok(ShipOutcome::Shipped),
         Err(error) if storage_unconfigured(&error) => Ok(ShipOutcome::StorageUnconfigured),
+        Err(error) if endpoints_missing(&error) => Ok(ShipOutcome::EndpointsMissing),
         Err(error) => Err(api_error(error)),
     }
 }
 
 fn storage_unconfigured(error: &ApiError) -> bool {
     matches!(error, ApiError::Server { code, .. } if code == CODE_STORAGE_UNCONFIGURED)
+}
+
+/// A 404 that did **not** carry the platform's `{"error":{…}}` envelope —
+/// nothing routed the request at all.
+///
+/// That absence is the whole discriminator, and it is reliable: `httputil`
+/// writes the envelope on every response it produces, so the artifact routes'
+/// own 404s (module / version / pending-row not found) always arrive as
+/// `ApiError::Server { code: "not_found", .. }`. Only an unrouted path falls
+/// through to chi's default `404 page not found`, which fails to parse as an
+/// envelope and lands in `ApiError::Unexpected`.
+///
+/// Reading this as "the platform predates the artifact endpoints" rather than
+/// "the base URL is wrong" is safe because `module deploy` has already made
+/// authenticated calls to other `/v1/modules` routes on this same base (the
+/// module lookup and the version record) before it ever ships an artifact — a
+/// bad base URL fails long before here.
+fn endpoints_missing(error: &ApiError) -> bool {
+    matches!(error, ApiError::Unexpected { status, .. } if *status == 404)
 }
 
 fn guard_size(size: u64, max_artifact_bytes: u64) -> Result<()> {
@@ -520,7 +561,11 @@ mod tests {
         assert_eq!(archive.by_index(0).expect("entry").name(), "bootstrap");
     }
 
-    fn ship_against_create_upload_error(status: usize, code: &str) -> Result<ShipOutcome> {
+    /// Drive the whole ship flow against a create-upload leg that answers
+    /// `status` with `body` verbatim — the body shape is the point, since a
+    /// platform error envelope and an unrouted 404 are told apart by nothing
+    /// else.
+    fn ship_against_create_upload_body(status: usize, body: &str) -> Result<ShipOutcome> {
         let dir = TempDir::new().expect("temp dir");
         let bootstrap = dir.path().join("bootstrap");
         fs::write(&bootstrap, b"lambda bootstrap").expect("write bootstrap");
@@ -529,7 +574,7 @@ mod tests {
         let create = server
             .mock("POST", "/v1/modules/module-id/versions/1.2.3/artifact")
             .with_status(status)
-            .with_body(json!({"error": {"code": code, "message": "nope"}}).to_string())
+            .with_body(body)
             .create();
         let client = http::client(Duration::from_secs(15)).expect("client");
         let result = ship_artifact(
@@ -544,6 +589,13 @@ mod tests {
         result
     }
 
+    fn ship_against_create_upload_error(status: usize, code: &str) -> Result<ShipOutcome> {
+        ship_against_create_upload_body(
+            status,
+            &json!({"error": {"code": code, "message": "nope"}}).to_string(),
+        )
+    }
+
     /// A platform with no artifact store (local prod-sim, bucket-less prod)
     /// must not fail a deploy whose version record is already frozen.
     #[test]
@@ -553,11 +605,83 @@ mod tests {
         assert_eq!(outcome, ShipOutcome::StorageUnconfigured);
     }
 
+    /// A platform build that predates the artifact routes doesn't answer
+    /// `artifact_storage_unconfigured` — it doesn't route the request at all,
+    /// and chi's default handler writes this exact plain-text body. Reported,
+    /// and distinctly from the 503, but not fatal: that platform has no
+    /// artifact gate on the deploy call either, so the deploy still lands.
+    #[test]
+    fn missing_artifact_routes_are_reported_not_fatal() {
+        let outcome = ship_against_create_upload_body(404, "404 page not found\n")
+            .expect("a platform without the routes is not an error");
+        assert_eq!(outcome, ShipOutcome::EndpointsMissing);
+    }
+
+    /// …and the enveloped 404 the routes themselves emit (module, version or
+    /// pending row not found) must NOT be mistaken for the routes being
+    /// absent. Same status, opposite verdict — the envelope is the only
+    /// discriminator, so it is asserted directly.
+    #[test]
+    fn enveloped_not_found_stays_fatal() {
+        let error = ship_against_create_upload_error(404, "not_found")
+            .expect_err("a real not_found still fails the deploy");
+        assert!(error.to_string().contains("not_found"), "{error}");
+    }
+
     #[test]
     fn other_artifact_errors_stay_fatal() {
         let error = ship_against_create_upload_error(422, "artifact_invalid")
             .expect_err("every other code still fails the deploy");
         assert!(error.to_string().contains("artifact_invalid"), "{error}");
+    }
+
+    /// Create can succeed against a new platform build while finalize lands
+    /// on an old one mid-rollout, so the finalize leg carries the same arm.
+    #[test]
+    fn missing_finalize_route_is_reported_not_fatal() {
+        let dir = TempDir::new().expect("temp dir");
+        let bootstrap = dir.path().join("bootstrap");
+        fs::write(&bootstrap, b"lambda bootstrap").expect("write bootstrap");
+        let zip_path = zip_bootstrap(&bootstrap).expect("zip bootstrap");
+        let (upload_url, _captured) = spawn_upload_capture();
+
+        let mut server = Server::new();
+        let create = server
+            .mock("POST", "/v1/modules/module-id/versions/1.2.3/artifact")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "version_id": "v-1",
+                    "module_id": "module-id",
+                    "key": "modules/module-id/versions/v-1/artifact.zip",
+                    "url": upload_url,
+                    "headers": {"Content-Type": "application/zip"},
+                    "expires_at": "2026-08-02T00:00:00Z"
+                })
+                .to_string(),
+            )
+            .create();
+        let finalize = server
+            .mock(
+                "POST",
+                "/v1/modules/module-id/versions/1.2.3/artifact/finalize",
+            )
+            .with_status(404)
+            .with_body("404 page not found\n")
+            .create();
+        let client = http::client(Duration::from_secs(15)).expect("client");
+        let outcome = ship_artifact(
+            &client,
+            &server.url(),
+            "AT",
+            "module-id",
+            "1.2.3",
+            &zip_path,
+        )
+        .expect("a platform without the finalize route is not an error");
+        create.assert();
+        finalize.assert();
+        assert_eq!(outcome, ShipOutcome::EndpointsMissing);
     }
 
     #[test]
