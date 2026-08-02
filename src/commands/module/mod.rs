@@ -25,6 +25,7 @@ pub(crate) mod capabilities;
 mod changelog;
 mod readme;
 mod scaffold;
+mod version_move;
 
 use super::{
     DEFAULT_API_BASE, DEFAULT_APPS_API_BASE, DEFAULT_DISPATCH_BASE, DEFAULT_WEB_BASE, ENV_API_URL,
@@ -56,6 +57,10 @@ enum ModuleCommand {
     /// key to ship a new entry. The prod transport target is derived by the
     /// platform from the module's own identity, never supplied by the caller.
     Deploy(DeployArgs),
+    /// Move one app's installed module onto another published version of
+    /// that module. Forward by default; moving backwards needs an explicit
+    /// --allow-downgrade. Omit --to to pick from the published versions.
+    Move(version_move::MoveArgs),
 }
 
 #[derive(Args)]
@@ -118,6 +123,7 @@ pub fn run(args: ModuleArgs) -> Result<()> {
         ModuleCommand::Init(i) => init(i),
         ModuleCommand::Register(r) => register(r),
         ModuleCommand::Deploy(d) => deploy(d),
+        ModuleCommand::Move(m) => version_move::run(m),
     }
 }
 

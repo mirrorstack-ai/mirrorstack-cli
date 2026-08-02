@@ -648,6 +648,177 @@ pub fn list_app_installs(
     Err(unexpected_body_error(resp))
 }
 
+/// One published version of a module, as returned by
+/// `GET /v1/modules/{moduleId}/version-history`. The changelog map the
+/// platform also returns is deliberately not modelled — the CLI lists
+/// versions to pick from, it doesn't render release notes.
+#[derive(Debug, Deserialize)]
+pub struct PublishedVersion {
+    pub version: String,
+    #[serde(default)]
+    pub published_at: String,
+}
+
+#[derive(Deserialize)]
+struct PublishedVersionList {
+    versions: Vec<PublishedVersion>,
+}
+
+/// GET /v1/modules/{moduleId}/version-history — every published (non-yanked)
+/// version of a module, newest first.
+///
+/// This is the any-authenticated-user sibling of [`list_module_versions`]:
+/// that one is OWNER-scoped (404 for an app admin who merely installed the
+/// module), this one deliberately is not, so an operator can enumerate the
+/// versions of somebody else's module before moving an install onto one.
+/// A module with no published versions yields an empty list, not a 404.
+pub fn list_module_version_history(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+) -> Result<Vec<PublishedVersion>, ApiError> {
+    let endpoint = format!(
+        "{}/v1/modules/{}/version-history",
+        apps_base.trim_end_matches('/'),
+        module_id
+    );
+
+    let resp = http
+        .get(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<PublishedVersionList>()?.versions);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(unexpected_body_error(resp))
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateInstallInput<'a> {
+    /// Canonical SemVer of the target published version, no `v` prefix.
+    pub version: &'a str,
+    /// Explicit opt-in to moving BACKWARDS to an older version. Skipped
+    /// entirely when false so a platform that predates the field receives
+    /// byte-for-byte the body it has always received. camelCase to match the
+    /// install family's request bodies (`moduleId`, `routeLocal`).
+    #[serde(rename = "allowDowngrade", skip_serializing_if = "is_false")]
+    pub allow_downgrade: bool,
+}
+
+/// `skip_serializing_if` predicate for [`UpdateInstallInput::allow_downgrade`].
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// One peer install whose pinned dependency constraint rejects the target
+/// version, carried on the 409 `update_held` envelope.
+#[derive(Debug, Deserialize)]
+pub struct UpdateBlocker {
+    /// The peer module's slug.
+    pub module: String,
+    /// The peer's published version constraint on the module being moved.
+    pub constraint: String,
+}
+
+/// The two outcomes of a version move that are both *answers*, not failures.
+/// `update_held` is modelled as a value rather than an [`ApiError`] for the
+/// same reason [`get_module`] returns `Option`: the platform is telling the
+/// caller something specific about their request, and the blocker list has
+/// to survive the trip. Keeping the error type as `ApiError` also lets the
+/// call sit inside `credentials::with_refresh_retry` unchanged.
+#[derive(Debug)]
+pub enum UpdateOutcome {
+    Updated(Box<AppInstall>),
+    Held(Vec<UpdateBlocker>),
+}
+
+/// Error envelope for the update endpoint. A superset of [`ErrorEnvelope`]:
+/// `update_held` adds the blocker list alongside code/message.
+#[derive(Deserialize)]
+struct UpdateErrorEnvelope {
+    error: UpdateErrorBody,
+}
+#[derive(Deserialize)]
+struct UpdateErrorBody {
+    code: String,
+    message: String,
+    #[serde(default)]
+    blockers: Vec<UpdateBlocker>,
+}
+
+/// POST /v1/apps/{appRef}/modules/{moduleId}/update — move an installed
+/// module's version pin to another published version of that module.
+/// `app_ref` is an app id or slug (the platform resolves either);
+/// `module_id` is the raw platform UUID, not the sanitized `m<hex>` form.
+///
+/// Owner/admin gated and membership-scoped: a non-member sees the same 404
+/// as a missing app. The platform re-checks every peer install's dependency
+/// constraint authoritatively and runs the module's app-scope migrations
+/// before repinning, so this call can take a while and a failure leaves the
+/// install on its old version.
+pub fn update_install_version(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    app_ref: &str,
+    module_id: &str,
+    input: &UpdateInstallInput,
+) -> Result<UpdateOutcome, ApiError> {
+    let endpoint = format!(
+        "{}/v1/apps/{}/modules/{}/update",
+        apps_base.trim_end_matches('/'),
+        app_ref,
+        module_id
+    );
+
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .json(input)
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(UpdateOutcome::Updated(Box::new(resp.json::<AppInstall>()?)));
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+
+    let status_u16 = status.as_u16();
+    let body = match http::read_capped(resp) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(ApiError::Unexpected {
+                status: status_u16,
+                body: format!("(read body failed: {e})"),
+            });
+        }
+    };
+    if let Ok(env) = serde_json::from_slice::<UpdateErrorEnvelope>(&body) {
+        if env.error.code == "update_held" {
+            return Ok(UpdateOutcome::Held(env.error.blockers));
+        }
+        return Err(ApiError::Server {
+            status: status_u16,
+            code: env.error.code,
+            message: env.error.message,
+        });
+    }
+    Err(ApiError::Unexpected {
+        status: status_u16,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
+}
+
 /// One file of an app deploy's manifest, as POSTed to the platform.
 #[derive(Debug, Serialize)]
 pub struct DeployFile<'a> {
@@ -2720,5 +2891,205 @@ mod tests {
             }
             other => panic!("expected Unexpected, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn list_module_version_history_returns_versions_newest_first() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/modules/mod-uuid/version-history")
+            .match_header("authorization", "Bearer AT")
+            .with_status(200)
+            .with_body(
+                json!({"versions": [
+                    {"version": "0.2.0", "changelog": {"default": "notes"}, "published_at": "2026-07-30T00:00:00Z"},
+                    {"version": "0.1.0", "changelog": {}, "published_at": "2026-07-01T00:00:00Z"}
+                ]})
+                .to_string(),
+            )
+            .create();
+
+        let versions =
+            list_module_version_history(&test_client(), &server.url(), "AT", "mod-uuid").unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].version, "0.2.0");
+        assert_eq!(versions[0].published_at, "2026-07-30T00:00:00Z");
+    }
+
+    #[test]
+    fn list_module_version_history_empty_for_versionless_module() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/modules/mod-uuid/version-history")
+            .with_status(200)
+            .with_body(r#"{"versions":[]}"#)
+            .create();
+
+        let versions =
+            list_module_version_history(&test_client(), &server.url(), "AT", "mod-uuid").unwrap();
+        assert!(versions.is_empty());
+    }
+
+    #[test]
+    fn update_install_version_omits_allow_downgrade_when_false() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/app-1/modules/mod-uuid/update")
+            .match_header("authorization", "Bearer AT")
+            // A platform that predates opt-in downgrades must see exactly the
+            // body it has always seen.
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"version":"0.2.0"}"#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                json!({"moduleId": "mod-uuid", "slug": "media", "installedVersion": "0.2.0"})
+                    .to_string(),
+            )
+            .create();
+
+        let outcome = update_install_version(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "app-1",
+            "mod-uuid",
+            &UpdateInstallInput {
+                version: "0.2.0",
+                allow_downgrade: false,
+            },
+        )
+        .expect("ok");
+        match outcome {
+            UpdateOutcome::Updated(install) => {
+                assert_eq!(install.installed_version, "0.2.0");
+                assert_eq!(install.slug, "media");
+            }
+            other => panic!("expected Updated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_install_version_sends_allow_downgrade_when_set() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/app-1/modules/mod-uuid/update")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"version":"0.1.0","allowDowngrade":true}"#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                json!({"moduleId": "mod-uuid", "slug": "media", "installedVersion": "0.1.0"})
+                    .to_string(),
+            )
+            .create();
+
+        update_install_version(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "app-1",
+            "mod-uuid",
+            &UpdateInstallInput {
+                version: "0.1.0",
+                allow_downgrade: true,
+            },
+        )
+        .expect("ok");
+    }
+
+    #[test]
+    fn update_install_version_409_held_carries_blockers() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/app-1/modules/mod-uuid/update")
+            .with_status(409)
+            .with_body(
+                json!({"error": {
+                    "code": "update_held",
+                    "message": "update held by installed peer dependency constraints",
+                    "blockers": [{"module": "oauth-google", "constraint": "^0.1"}]
+                }})
+                .to_string(),
+            )
+            .create();
+
+        let outcome = update_install_version(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "app-1",
+            "mod-uuid",
+            &UpdateInstallInput {
+                version: "0.2.0",
+                allow_downgrade: false,
+            },
+        )
+        .expect("held is an outcome, not an error");
+        match outcome {
+            UpdateOutcome::Held(blockers) => {
+                assert_eq!(blockers.len(), 1);
+                assert_eq!(blockers[0].module, "oauth-google");
+                assert_eq!(blockers[0].constraint, "^0.1");
+            }
+            other => panic!("expected Held, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_install_version_422_surfaces_downgrade_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/app-1/modules/mod-uuid/update")
+            .with_status(422)
+            .with_body(
+                r#"{"error":{"code":"downgrade_not_supported","message":"target version must be newer than the installed version"}}"#,
+            )
+            .create();
+
+        let err = update_install_version(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "app-1",
+            "mod-uuid",
+            &UpdateInstallInput {
+                version: "0.1.0",
+                allow_downgrade: true,
+            },
+        )
+        .unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 422);
+                assert_eq!(code, "downgrade_not_supported");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_install_version_401_is_unauthenticated() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/app-1/modules/mod-uuid/update")
+            .with_status(401)
+            .with_body(r#"{"error":{"code":"token_expired","message":"expired"}}"#)
+            .create();
+
+        assert!(matches!(
+            update_install_version(
+                &test_client(),
+                &server.url(),
+                "bad",
+                "app-1",
+                "mod-uuid",
+                &UpdateInstallInput {
+                    version: "0.2.0",
+                    allow_downgrade: false,
+                },
+            ),
+            Err(ApiError::Unauthenticated)
+        ));
     }
 }

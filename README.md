@@ -22,6 +22,8 @@ mirrorstack app web deploy     # Deploy a static build directory to app hosting
 mirrorstack module capabilities         # Which host slots exist, who fills them, what is broken
 mirrorstack module capabilities --json  # …the same index, machine-readable
 mirrorstack module capabilities --app @me/my-app  # …resolved against the app's installed versions
+mirrorstack module move --app my-app --module media             # Pick a published version to move that install onto
+mirrorstack module move --app my-app --module media --to 0.2.0  # …or name it outright
 mirrorstack --help             # Show help
 mirrorstack --version          # Show CLI version
 ```
