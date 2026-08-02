@@ -50,9 +50,11 @@ pub struct MoveArgs {
     /// omitted, the module's published versions are listed to pick from.
     #[arg(long)]
     to: Option<String>,
-    /// Move BACKWARDS to a version that is not newer than the installed one.
-    /// Off by default: module migrations are forward-only, so an older
-    /// version may not understand data the newer one already wrote.
+    /// Move BACKWARDS to an older version. Off by default because the move
+    /// runs the module's app-scope migrations in REVERSE: a down-migration
+    /// routinely drops the columns and tables its up-migration added, which
+    /// destroys every row this app wrote through them. Nothing snapshots
+    /// them first, so there is no undo.
     #[arg(long)]
     allow_downgrade: bool,
     /// Skip the confirmation prompt.
@@ -128,7 +130,7 @@ pub(super) fn run(args: MoveArgs) -> Result<()> {
     let backwards = is_backwards(&install.installed_version, &target);
     if backwards && !args.allow_downgrade {
         return Err(anyhow!(
-            "{} is installed at {} in {}; {} is not newer. Pass --allow-downgrade to move backwards — module migrations are forward-only, so an older version may not understand data the newer one already wrote.",
+            "{} is installed at {} in {}; {} is older. Pass --allow-downgrade to move backwards — it reverts the module's app-scope migrations, and a reverted migration drops what it created, destroying the rows in it. There is no undo.",
             install.slug,
             install.installed_version,
             app.slug,
@@ -152,10 +154,10 @@ pub(super) fn run(args: MoveArgs) -> Result<()> {
         );
         if backwards {
             eprintln!(
-                "{} this is a DOWNGRADE. The module's app migrations only run forward, so {} may not be able to read data {} wrote.",
+                "{} this is a DOWNGRADE. Moving {} → {} reverts the module's app-scope migrations; whatever they created is dropped, and the rows in it are destroyed with no undo.",
                 warn_prefix(),
-                target,
-                install.installed_version
+                install.installed_version,
+                target
             );
         }
         let confirmed = Confirm::with_theme(&ColorfulTheme::default())
@@ -310,8 +312,11 @@ fn version_label(v: &PublishedVersion, installed: &str) -> String {
     label
 }
 
-/// Whether `target` is NOT strictly newer than `installed` — the condition
-/// `--allow-downgrade` exists for. A dev-mount install (no pin) and any
+/// Whether `target` is strictly OLDER than `installed` — the condition
+/// `--allow-downgrade` exists for. Equal is deliberately NOT backwards: the
+/// platform answers an equal target with its own `version_unchanged`, for
+/// which the flag would do nothing, so claiming a downgrade here would
+/// demand a flag that cannot help. A dev-mount install (no pin) and any
 /// version either side can't parse as SemVer are left to the platform,
 /// which is the authority; guessing here would block a legal move.
 fn is_backwards(installed: &str, target: &str) -> bool {
@@ -322,7 +327,7 @@ fn is_backwards(installed: &str, target: &str) -> bool {
         module_meta::parse_semver(installed),
         module_meta::parse_semver(target),
     ) {
-        (Some(from), Some(to)) => to <= from,
+        (Some(from), Some(to)) => to < from,
         _ => false,
     }
 }
@@ -343,21 +348,46 @@ fn held_error(slug: &str, target: &str, blockers: &[api::UpdateBlocker]) -> anyh
 /// `update_held` never reaches here — its 409 carries a blocker list and is
 /// surfaced by [`held_error`] instead.
 ///
-/// `downgrade_not_supported` is the version-skew case: a platform that
-/// predates opt-in downgrades ignores the `allowDowngrade` field (its
-/// decoder drops unknown keys) and still refuses, so a caller who DID pass
-/// the flag is told the server is old rather than being told to pass a flag
-/// they already passed.
+/// Every hint is printed AFTER the platform's own `message`, so a hint may
+/// only add what the CLI knows and the platform does not: which flag to
+/// re-run with, which command lists the alternatives. None of them may
+/// restate WHY the platform refused. That rule is not style — the platform
+/// deliberately sends more than one distinct message under a single code,
+/// and a hint that names one of the causes is wrong for the others:
+///
+/// * `downgrade_not_supported` covers a backward SemVer move AND a target
+///   whose app-migration counter is lower than the install's watermark. The
+///   second reaches a dev-mount install with no pinned version at all, and a
+///   target that is SemVer-*newer*. The old hint here said "the target is not
+///   newer than the installed version", which is a flat contradiction of the
+///   message it was appended to in that case.
+/// * `downgrade_failed` means the module answered the revert with an error,
+///   and the platform quotes that error verbatim precisely because it cannot
+///   classify it (the SDK's downgrade response carries no machine-readable
+///   cause). A CLI sentence guessing at "it publishes no rollback for one of
+///   these migrations" would put back the exact assertion the platform
+///   removed.
+///
+/// The one case that IS the CLI's to explain is version skew: a platform
+/// predating opt-in downgrades drops the unknown `allowDowngrade` key and
+/// refuses anyway, so a caller who already passed the flag is told the
+/// server is old instead of being told to pass a flag they just passed.
 fn move_error_hint(code: &str, allow_downgrade: bool) -> &'static str {
     match code {
         "version_not_found" => {
             " (that version isn't published for this module any more — re-run without --to to list what is)"
         }
+        "version_unchanged" => {
+            " (nothing moved — re-run without --to to list the other published versions)"
+        }
         "downgrade_not_supported" if allow_downgrade => {
-            " (this platform still refuses downgrades outright — it ignored --allow-downgrade. Update the platform, or pick a version newer than the installed one.)"
+            " (this platform refuses backward moves outright — it ignored --allow-downgrade. Update the platform, or pick a version it will accept.)"
         }
         "downgrade_not_supported" => {
-            " (the target is not newer than the installed version — pass --allow-downgrade to move backwards)"
+            " (re-run with --allow-downgrade to accept it — reverting a migration drops what it created and destroys the rows in it, with no undo)"
+        }
+        "downgrade_failed" => {
+            " (the version pin was NOT moved. The platform does not diagnose this — the text it quotes is the module's own report; take it to the module's author, then re-run.)"
         }
         "not_found" => " (no such app, the module isn't installed in it, or you are not a member)",
         "forbidden" => " (moving an install's version needs the app owner or an admin)",
@@ -448,15 +478,17 @@ mod tests {
     }
 
     #[test]
-    fn is_backwards_detects_older_and_equal() {
+    fn is_backwards_detects_older() {
         assert!(is_backwards("0.2.0", "0.1.0"));
-        assert!(is_backwards("0.2.0", "0.2.0"));
         assert!(is_backwards("1.0.0", "1.0.0-beta.1"));
     }
 
     #[test]
     fn is_backwards_false_for_forward_and_dev() {
         assert!(!is_backwards("0.1.0", "0.2.0"));
+        // Equal is version_unchanged on the platform, not a downgrade —
+        // --allow-downgrade would not make it succeed, so don't demand it.
+        assert!(!is_backwards("0.2.0", "0.2.0"));
         // A dev-mount install has no pin to compare against, so any published
         // target is a forward move — the same rule the platform applies.
         assert!(!is_backwards(DEV_INSTALL, "0.1.0"));
@@ -493,7 +525,8 @@ mod tests {
     #[test]
     fn move_error_hint_splits_on_the_downgrade_flag() {
         assert!(
-            move_error_hint("downgrade_not_supported", false).contains("pass --allow-downgrade")
+            move_error_hint("downgrade_not_supported", false)
+                .contains("--allow-downgrade to accept")
         );
         let old_server = move_error_hint("downgrade_not_supported", true);
         assert!(
@@ -502,12 +535,44 @@ mod tests {
         );
     }
 
+    /// `downgrade_not_supported` carries two different platform messages —
+    /// a backward SemVer move, and a target with fewer app migrations than
+    /// the install has applied (which can be SemVer-FORWARD, or hit a
+    /// dev-mount install with no pin at all). The hint may only name the
+    /// remedy both share; asserting the SemVer cause would contradict the
+    /// message it is appended to in the second case.
+    #[test]
+    fn downgrade_hint_names_the_remedy_not_a_cause() {
+        let hint = move_error_hint("downgrade_not_supported", false);
+        assert!(!hint.contains("not newer"), "{hint}");
+        assert!(!hint.contains("older than"), "{hint}");
+        assert!(hint.contains("--allow-downgrade"), "{hint}");
+    }
+
+    /// The platform quotes the module's own error for `downgrade_failed`
+    /// because it cannot classify the cause. The hint must not supply one —
+    /// no talk of missing down-files or unsupported rollbacks.
+    #[test]
+    fn downgrade_failed_hint_defers_to_the_module_report() {
+        let hint = move_error_hint("downgrade_failed", false);
+        assert!(hint.contains("module's own report"), "{hint}");
+        assert!(hint.contains("pin was NOT moved"), "{hint}");
+        assert!(!hint.contains("down.sql"), "{hint}");
+        assert!(!hint.contains("rollback for"), "{hint}");
+        // Same hint whether or not the flag was passed — reaching this code
+        // means the flag WAS accepted and the revert then failed.
+        assert_eq!(hint, move_error_hint("downgrade_failed", true));
+    }
+
     #[test]
     fn move_error_hint_for_other_known_codes() {
         assert!(move_error_hint("version_not_found", false).contains("--to"));
+        assert!(move_error_hint("version_unchanged", false).contains("--to"));
         assert!(move_error_hint("forbidden", false).contains("admin"));
         assert!(move_error_hint("not_found", false).contains("member"));
         assert!(move_error_hint("validation_error", false).contains("SemVer"));
+        assert!(move_error_hint("bad_request", false).contains("SemVer"));
+        assert_eq!(move_error_hint("internal_error", false), "");
         assert_eq!(move_error_hint("something_else", false), "");
     }
 }
