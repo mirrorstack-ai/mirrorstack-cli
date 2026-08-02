@@ -525,7 +525,25 @@ fn deploy(args: DeployArgs) -> Result<()> {
     // `_artifact_dir` (the temp dir backing `zip_path`) stays alive across
     // this call by still being in scope — dropping it earlier would delete
     // the archive out from under the upload.
-    artifact::ship_artifact(
+    //
+    // `artifact_storage_unconfigured` is a WARN, not a failure. Two reasons:
+    //
+    //   1. It describes environments the platform deliberately keeps working.
+    //      api-platform#440's own deploy gate is conditional, and its comment
+    //      says so: "Local prod-sim and today's bucket-less production still
+    //      deploy without an upload, so an unconditional gate would brick
+    //      both." Local prod-sim has no bucket BY DESIGN — this is permanent
+    //      there, not a rollout-ordering artifact that disappears once prod
+    //      gets its bucket. Failing here would make `module deploy`
+    //      unusable locally.
+    //   2. `ensure_version_recorded` above has ALREADY frozen an immutable
+    //      module_versions row by the time the upload runs. Aborting here
+    //      strands that row: the version exists, nothing is deployed, and a
+    //      re-run just 409-skips the record and fails the same way.
+    //
+    // Every other artifact error stays fatal — `ship_artifact` only collapses
+    // this one code.
+    let shipped = artifact::ship_artifact(
         &client,
         &apps_base,
         &creds.access_token,
@@ -533,12 +551,25 @@ fn deploy(args: DeployArgs) -> Result<()> {
         &version,
         &zip_path,
     )?;
-    eprintln!(
-        "{} uploaded {} ({})",
-        ok_mark(),
-        style(format!("{slug}@{version}")).cyan().bold(),
-        artifact::human_bytes(artifact_size)
-    );
+    match shipped {
+        artifact::ShipOutcome::Shipped => eprintln!(
+            "{} uploaded {} ({})",
+            ok_mark(),
+            style(format!("{slug}@{version}")).cyan().bold(),
+            artifact::human_bytes(artifact_size)
+        ),
+        artifact::ShipOutcome::StorageUnconfigured => {
+            eprintln!(
+                "{} no artifact was uploaded for {}: this platform is not configured for module artifact storage.",
+                warn_prefix(),
+                style(format!("{slug}@{version}")).cyan().bold(),
+            );
+            eprintln!(
+                "  {} the version was recorded and the deploy continues, but it is not artifact-backed — the module runs from whatever transport this environment already resolves (local prod-sim, or an existing production function).",
+                style("note:").dim(),
+            );
+        }
+    }
 
     let result = with_spinner("Deploying…", || {
         api::set_module_deploy(
@@ -841,11 +872,25 @@ fn deploy_error_hint(code: &str) -> &'static str {
         "artifact_missing" => {
             " (the upload didn't land in object storage — re-run `mirrorstack module deploy`)"
         }
+        // The platform's finalize check is a non-empty object under its size
+        // ceiling whose first four bytes are the ZIP local-file magic — it
+        // does NOT open the archive, so don't claim it verified a `bootstrap`
+        // entry. (The CLI is what guarantees the executable root entry, in
+        // `artifact::zip_bootstrap`.)
         "artifact_invalid" => {
-            " (the platform rejected the uploaded zip — it must contain an executable `bootstrap` at the archive root and stay under 250.0 MB)"
+            " (the platform rejected the uploaded object — it must be a non-empty ZIP under 250.0 MB)"
         }
+        // Not reachable from the deploy call itself: the deploy gate is
+        // conditional on the platform having an artifact store, and the
+        // upload step already downgrades this code to a warning. Kept so the
+        // code never surfaces bare if another leg starts returning it.
         "artifact_storage_unconfigured" => {
-            " (module artifact storage is not configured on the platform — this is a platform-side issue, not something to fix locally)"
+            " (module artifact storage is not configured on the platform — expected for local prod-sim and bucket-less environments, not something to fix locally)"
+        }
+        // What `httputil.Conflict` emits when a deploy is attempted for a
+        // version whose artifact never finalized.
+        "conflict" => {
+            " (the artifact for this version isn't finalized — re-run `mirrorstack module deploy` so the upload completes before the deploy)"
         }
         _ => "",
     }
@@ -1166,8 +1211,13 @@ mod tests {
         assert!(deploy_error_hint("invoke_target_invalid").contains("platform"));
         assert!(deploy_error_hint("status_invalid").contains("--status"));
         assert!(deploy_error_hint("artifact_missing").contains("module deploy"));
-        assert!(deploy_error_hint("artifact_invalid").contains("bootstrap"));
+        // The platform only checks the ZIP magic and the size, so the hint
+        // must not claim it inspected the archive for a `bootstrap` entry.
+        let invalid = deploy_error_hint("artifact_invalid");
+        assert!(invalid.contains("ZIP"), "{invalid}");
+        assert!(!invalid.contains("bootstrap"), "{invalid}");
         assert!(deploy_error_hint("artifact_storage_unconfigured").contains("platform"));
+        assert!(deploy_error_hint("conflict").contains("finalized"));
         assert_eq!(deploy_error_hint("something_else"), "");
     }
 

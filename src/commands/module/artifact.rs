@@ -22,9 +22,19 @@ use crate::http;
 
 use super::{deploy_error_hint, session_expired, with_spinner};
 
-/// AWS Lambda's ceiling for an S3-sourced deployment package, mirrored
-/// client-side so an oversize artifact fails locally before any bytes move.
+/// Client-side sanity cap on the packaged (compressed) zip, mirroring the
+/// platform's own finalize-time ceiling on the uploaded object so an oversize
+/// artifact fails locally before any bytes move.
+///
+/// Deliberately NOT described as an AWS limit: Lambda's 250 MB quota applies
+/// to the *unzipped* package, so a zip under this cap can still be rejected by
+/// Lambda, and one over it is not necessarily over Lambda's. This is our
+/// ceiling, not theirs.
 const MAX_ARTIFACT_BYTES: u64 = 250 * 1024 * 1024; // 250 MB
+
+/// The one artifact-flow error code that is not a failure: the platform in
+/// front of us has no artifact object store wired at all.
+const CODE_STORAGE_UNCONFIGURED: &str = "artifact_storage_unconfigured";
 
 /// A Lambda package can be large enough to need substantially longer than
 /// the JSON API client's timeout on a slow uplink.
@@ -39,11 +49,16 @@ const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// does) still produces a Graviton binary — the platform's native-binary
 /// guards assert `aarch64` and a host-arch build would only fail at cold
 /// start, in prod.
+///
+/// `-trimpath` because this binary leaves the developer's machine: without it
+/// the compiled paths and DWARF carry the absolute source tree (`/Users/…`,
+/// `/home/…`, module cache paths) into an artifact stored on the platform.
 pub(crate) fn build_bootstrap(dir: &Path) -> Result<(TempDir, PathBuf)> {
     let tmp = TempDir::new().context("create temp module build directory")?;
     let bootstrap = tmp.path().join("bootstrap");
     let output = Command::new("go")
         .arg("build")
+        .arg("-trimpath")
         .arg("-o")
         .arg(&bootstrap)
         .arg(".")
@@ -100,6 +115,17 @@ pub(crate) fn zip_bootstrap(bootstrap_path: &Path) -> Result<PathBuf> {
     Ok(zip_path)
 }
 
+/// Whether the artifact actually reached the platform's object store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShipOutcome {
+    /// Uploaded and finalized — the version is artifact-backed.
+    Shipped,
+    /// The platform answered `artifact_storage_unconfigured`: it has no
+    /// artifact store wired, so there is nothing to upload to. Not an error —
+    /// see the caller in `module::deploy` for why this stays non-fatal.
+    StorageUnconfigured,
+}
+
 /// Create the upload → PUT → finalize the packaged artifact against the
 /// real ceiling.
 ///
@@ -114,7 +140,7 @@ pub(crate) fn ship_artifact(
     module_id: &str,
     version_ref: &str,
     zip_path: &Path,
-) -> Result<()> {
+) -> Result<ShipOutcome> {
     ship_artifact_with_cap(
         api_client,
         apps_base,
@@ -145,36 +171,54 @@ fn ship_artifact_with_cap(
     version_ref: &str,
     zip_path: &Path,
     max_artifact_bytes: u64,
-) -> Result<()> {
+) -> Result<ShipOutcome> {
     let size = file_size(zip_path)?;
     guard_size(size, max_artifact_bytes)?;
 
-    with_spinner("Uploading artifact…", || {
-        let upload = api::create_module_artifact_upload(
+    // Both legs can answer `artifact_storage_unconfigured` (the platform's
+    // handler maps store absence to it on create-upload *and* finalize), so
+    // both are checked for it; every other code stays fatal.
+    let outcome = with_spinner("Uploading artifact…", || -> Result<ShipOutcome> {
+        let upload = match api::create_module_artifact_upload(
             api_client,
             apps_base,
             access_token,
             module_id,
             version_ref,
-        )
-        .map_err(api_error)?;
+        ) {
+            Ok(upload) => upload,
+            Err(error) if storage_unconfigured(&error) => {
+                return Ok(ShipOutcome::StorageUnconfigured);
+            }
+            Err(error) => return Err(api_error(error)),
+        };
         // Presigned URLs carry their own auth, so this PUT goes out on a
         // client with no bearer token and an upload-sized timeout.
         let upload_client = http::client(UPLOAD_TIMEOUT)?;
-        upload_one(&upload_client, &upload, zip_path)
+        upload_one(&upload_client, &upload, zip_path)?;
+        Ok(ShipOutcome::Shipped)
     })?;
+    if outcome == ShipOutcome::StorageUnconfigured {
+        return Ok(outcome);
+    }
 
-    with_spinner("Finalizing artifact…", || {
+    match with_spinner("Finalizing artifact…", || {
         api::finalize_module_artifact(api_client, apps_base, access_token, module_id, version_ref)
-            .map_err(api_error)
-    })?;
-    Ok(())
+    }) {
+        Ok(_) => Ok(ShipOutcome::Shipped),
+        Err(error) if storage_unconfigured(&error) => Ok(ShipOutcome::StorageUnconfigured),
+        Err(error) => Err(api_error(error)),
+    }
+}
+
+fn storage_unconfigured(error: &ApiError) -> bool {
+    matches!(error, ApiError::Server { code, .. } if code == CODE_STORAGE_UNCONFIGURED)
 }
 
 fn guard_size(size: u64, max_artifact_bytes: u64) -> Result<()> {
     if size > max_artifact_bytes {
         return Err(anyhow!(
-            "module artifact too large: {} (capped at {}, the same ceiling AWS Lambda enforces for an S3-sourced deployment package) — trim unused dependencies from the module",
+            "module artifact too large: {} (the packaged zip is capped at {}, matching the ceiling the platform enforces on the uploaded object) — trim unused dependencies from the module",
             human_bytes(size),
             human_bytes(max_artifact_bytes)
         ));
@@ -474,6 +518,46 @@ mod tests {
         let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("uploaded zip");
         assert_eq!(archive.len(), 1);
         assert_eq!(archive.by_index(0).expect("entry").name(), "bootstrap");
+    }
+
+    fn ship_against_create_upload_error(status: usize, code: &str) -> Result<ShipOutcome> {
+        let dir = TempDir::new().expect("temp dir");
+        let bootstrap = dir.path().join("bootstrap");
+        fs::write(&bootstrap, b"lambda bootstrap").expect("write bootstrap");
+        let zip_path = zip_bootstrap(&bootstrap).expect("zip bootstrap");
+        let mut server = Server::new();
+        let create = server
+            .mock("POST", "/v1/modules/module-id/versions/1.2.3/artifact")
+            .with_status(status)
+            .with_body(json!({"error": {"code": code, "message": "nope"}}).to_string())
+            .create();
+        let client = http::client(Duration::from_secs(15)).expect("client");
+        let result = ship_artifact(
+            &client,
+            &server.url(),
+            "AT",
+            "module-id",
+            "1.2.3",
+            &zip_path,
+        );
+        create.assert();
+        result
+    }
+
+    /// A platform with no artifact store (local prod-sim, bucket-less prod)
+    /// must not fail a deploy whose version record is already frozen.
+    #[test]
+    fn storage_unconfigured_is_reported_not_fatal() {
+        let outcome = ship_against_create_upload_error(503, "artifact_storage_unconfigured")
+            .expect("storage-unconfigured is not an error");
+        assert_eq!(outcome, ShipOutcome::StorageUnconfigured);
+    }
+
+    #[test]
+    fn other_artifact_errors_stay_fatal() {
+        let error = ship_against_create_upload_error(422, "artifact_invalid")
+            .expect_err("every other code still fails the deploy");
+        assert!(error.to_string().contains("artifact_invalid"), "{error}");
     }
 
     #[test]
