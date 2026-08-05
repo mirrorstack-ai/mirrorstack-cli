@@ -325,6 +325,27 @@ impl TunnelHandle {
     pub(super) fn shutdown(&self) {
         self.shutdown.notify_one();
     }
+
+    /// A handle with no socket behind it, plus the `Notify` its
+    /// [`shutdown`](Self::shutdown) fires.
+    ///
+    /// The supervisor's teardown-vs-reconnect race is pure bookkeeping —
+    /// which handle ends up installed and which one gets closed — so its
+    /// tests need a handle they can watch, not a live WebSocket. The
+    /// `shutdown` field is private to this module, hence the constructor
+    /// living here.
+    #[cfg(test)]
+    pub(super) fn detached(session_id: &str, service_token: &str) -> (Self, Arc<Notify>) {
+        let shutdown = Arc::new(Notify::new());
+        (
+            TunnelHandle {
+                session_id: session_id.to_string(),
+                service_token: service_token.to_string(),
+                shutdown: shutdown.clone(),
+            },
+            shutdown,
+        )
+    }
 }
 
 /// Why the background tunnel loop stopped.

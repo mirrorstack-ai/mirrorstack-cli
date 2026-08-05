@@ -291,6 +291,10 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
                 // Reused verbatim, never re-minted: every already-running
                 // module process holds this exact value from the compose env.
                 internal_secret: secret.to_string(),
+                // One copy for every supervisor: the platform rotates the
+                // refresh token, so parallel refreshes would invalidate each
+                // other's.
+                creds: supervisor::SharedCredentials::new(opened.creds),
                 share: share_invalidator.clone(),
             },
         ))
@@ -1160,6 +1164,11 @@ struct OpenedTunnels {
     /// than re-resolved so the first register and every re-register can never
     /// end up pointed at different dispatch deployments.
     dispatch_base: String,
+    /// The credentials that just minted every tunnel token, handed on to the
+    /// supervisors rather than re-loaded per thread. Loading once means a
+    /// supervisor has no credential step that can fail — one that failed used
+    /// to disable supervision for that module in silence.
+    creds: credentials::Credentials,
 }
 
 /// Open one WSS tunnel per ready module.
@@ -1284,6 +1293,7 @@ fn open_tunnels(
         targets,
         runtime,
         dispatch_base,
+        creds,
     })
 }
 
