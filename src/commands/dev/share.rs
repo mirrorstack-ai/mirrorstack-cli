@@ -40,6 +40,7 @@ use console::style;
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 
+use super::supervisor::ShareInvalidator;
 use super::{ok_mark, warn_prefix};
 use crate::api::{self, ApiError, DevBundlePresignInput};
 use crate::credentials::{self, Credentials};
@@ -206,15 +207,28 @@ struct TargetState {
 /// until `stop` is set. Returns the join handle so `run_outer` can join it on
 /// teardown. Never returns an error to the caller: a setup failure disables
 /// sharing with a warning rather than failing the whole `dev` session.
+///
+/// `invalidator` carries slugs whose tunnel reconnected. The platform stores
+/// the dev-bundle CDN pointer per SESSION and deletes it with the session, so
+/// after a reconnect the shared bundle is silently gone — and the hash gate
+/// below would never re-upload it, because the bytes on disk are unchanged.
+/// Draining the invalidator each scan clears that target's gate so the very
+/// next pass re-confirms the pointer.
 pub(super) fn spawn_watcher(
     apps_base: String,
     targets: Vec<ShareTarget>,
     stop: Arc<AtomicBool>,
+    invalidator: Arc<ShareInvalidator>,
 ) -> thread::JoinHandle<()> {
-    thread::spawn(move || run_watcher(&apps_base, &targets, &stop))
+    thread::spawn(move || run_watcher(&apps_base, &targets, &stop, &invalidator))
 }
 
-fn run_watcher(apps_base: &str, targets: &[ShareTarget], stop: &AtomicBool) {
+fn run_watcher(
+    apps_base: &str,
+    targets: &[ShareTarget],
+    stop: &AtomicBool,
+    invalidator: &ShareInvalidator,
+) {
     if targets.is_empty() {
         return;
     }
@@ -277,6 +291,18 @@ fn run_watcher(apps_base: &str, targets: &[ShareTarget], stop: &AtomicBool) {
     while !stop.load(Ordering::SeqCst) {
         if last_scan.elapsed() >= SCAN_INTERVAL {
             last_scan = Instant::now();
+            let reconnected = invalidator.drain();
+            if !reconnected.is_empty() {
+                for (target, state) in targets.iter().zip(states.iter_mut()) {
+                    if reconnected.contains(&target.slug) {
+                        // Forget both gates: the pointer needs re-confirming,
+                        // and a warning about the old session's failure no
+                        // longer applies.
+                        state.last_uploaded = None;
+                        state.last_warned = None;
+                    }
+                }
+            }
             for (target, state) in targets.iter().zip(states.iter_mut()) {
                 share_once(
                     &api_client,
@@ -352,6 +378,17 @@ fn share_once(
             );
         }
         Err(e) => {
+            // "will retry" below is a promise this thread cannot keep once its
+            // cached pair has been rotated out from under it: a tunnel
+            // supervisor's reconnect, or any authenticated CLI command in
+            // another terminal, refreshes through the same credentials.json,
+            // and the platform revokes the pair it rotated away from. Every
+            // later upload then 401s for the rest of the session, once per
+            // distinct content hash. Re-reading the file is what makes the
+            // promise true.
+            if matches!(e, ApiError::Unauthenticated) {
+                adopt_rotated_credentials(creds);
+            }
             // Best-effort: keep the tunnel serving. Suppress a repeat warning
             // for the same still-failing bytes; leaving `last_uploaded`
             // unchanged means the next tick retries (recovers from a
@@ -365,6 +402,24 @@ fn share_once(
                 state.last_warned = Some(hash);
             }
         }
+    }
+}
+
+/// Adopt the on-disk pair when ours has been rotated away by someone else.
+/// Returns whether it found one.
+///
+/// Only called after a 401, and only adopts a pair whose refresh token differs
+/// from the one we hold — an identical pair means the session really is gone
+/// and re-reading it every tick would be pointless churn. A missing or corrupt
+/// file leaves the watcher exactly where it was: sharing is best-effort and
+/// must never take the dev session down with it.
+fn adopt_rotated_credentials(creds: &mut Credentials) -> bool {
+    match credentials::load() {
+        Ok(disk) if disk.refresh_token != creds.refresh_token => {
+            *creds = disk;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -600,5 +655,44 @@ mod tests {
         );
         assert_eq!(state.last_warned.as_deref(), Some("__oversize__"));
         assert!(state.last_uploaded.is_none());
+    }
+
+    #[test]
+    fn a_rotation_by_someone_else_is_adopted_from_disk() {
+        // The watcher loads credentials once and refreshes its own copy per
+        // upload. A tunnel supervisor's reconnect — or `mirrorstack whoami` in
+        // another terminal — rotates the same file, and the platform revokes
+        // the pair it rotated away from, so this copy 401s for the rest of the
+        // session and "will retry" becomes a promise the watcher cannot keep.
+        let _env = credentials::TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = tempfile::tempdir().expect("config tempdir");
+        let _restore = credentials::redirect_config_dir(config.path());
+
+        let mut mine = Credentials {
+            access_token: "AT_stale".into(),
+            refresh_token: "RT_spent".into(),
+            expires_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+        };
+
+        // Nothing on disk yet → nothing to adopt, and no panic.
+        assert!(!adopt_rotated_credentials(&mut mine));
+        assert_eq!(mine.refresh_token, "RT_spent");
+
+        credentials::save(&Credentials {
+            access_token: "AT_live".into(),
+            refresh_token: "RT_rotated".into(),
+            expires_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+        })
+        .expect("seed credentials.json");
+
+        assert!(adopt_rotated_credentials(&mut mine));
+        assert_eq!(mine.access_token, "AT_live");
+        assert_eq!(mine.refresh_token, "RT_rotated");
+
+        // Already current → no adoption, so a genuinely dead session does not
+        // re-read the file on every failing tick.
+        assert!(!adopt_rotated_credentials(&mut mine));
     }
 }

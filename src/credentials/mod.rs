@@ -23,6 +23,41 @@ use crate::http;
 #[cfg(test)]
 pub(crate) static TEST_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Restores the config-dir env var when dropped, so a test that redirected
+/// [`path`] cannot leak a dangling temp dir into whatever runs next.
+#[cfg(test)]
+pub(crate) struct TestConfigDir {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+#[cfg(test)]
+impl Drop for TestConfigDir {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(v) => unsafe { std::env::set_var(self.name, v) },
+            None => unsafe { std::env::remove_var(self.name) },
+        }
+    }
+}
+
+/// Point `dirs::config_dir()` — and therefore [`path`] — at `dir` for as long
+/// as the returned guard lives. Lives here beside [`TEST_ENV_MUTEX`] because
+/// every caller needs both, and for the same reason: the variable it sets is
+/// process-global, so holders must serialize on that lock.
+#[cfg(test)]
+pub(crate) fn redirect_config_dir(dir: &std::path::Path) -> TestConfigDir {
+    #[cfg(target_os = "macos")]
+    let name = "HOME";
+    #[cfg(target_os = "windows")]
+    let name = "APPDATA";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let name = "XDG_CONFIG_HOME";
+    let previous = std::env::var_os(name);
+    unsafe { std::env::set_var(name, dir) };
+    TestConfigDir { name, previous }
+}
+
 /// Local access-token lifetime re-derived on every refresh. The platform's
 /// `TokenConfig` mints 15-minute access tokens; the refresh response's
 /// `expires_at` is informational only, so we recompute the TTL locally to

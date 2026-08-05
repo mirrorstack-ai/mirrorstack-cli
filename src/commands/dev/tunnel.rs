@@ -5,6 +5,12 @@
 //!   - `connect` — open the WSS, send `register`, await `register_ack`, hold the
 //!     connection and ping every 30s until the host process tells us to stop
 //!
+//! This module OWNS one connection and never reopens it. When the connection
+//! ends it reports why on [`TunnelSession::exit`]; re-establishing the session
+//! is `dev::supervisor`'s job, because a reconnect needs the credentials, the
+//! blocking token mint and the per-module token file that live on the host
+//! side and are deliberately not reachable from here.
+//!
 //! Phase 1 shipped the connect + register half. Phase 2 (this module) adds
 //! the `rpc.req` handler: the server relays an HTTP request over the WSS
 //! connection when dispatch can't reach the local module directly (real
@@ -25,7 +31,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -82,6 +88,25 @@ const MANIFEST_FETCH_TIMEOUT: Duration = Duration::from_millis(500);
 /// the CLI proactively sends `rpc.err` instead of dispatch always hitting a
 /// blind timeout waiting on the relay correlation list.
 const RELAY_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Application-level heartbeat period. This is the ONLY thing that keeps a
+/// session addressable: dispatch refreshes the session's Redis TTL (20 min)
+/// solely on receiving a `{"type":"ping"}` JSON frame, and API Gateway
+/// recycles a WSS connection that has been idle for ~10 minutes. 30s is an
+/// order of magnitude inside both windows, so the reconnect work deliberately
+/// leaves the cadence alone — the observed outage was never an idle timeout.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How many consecutive heartbeats may pass with NO inbound frame at all
+/// before the socket is declared half-open and the tunnel is handed to the
+/// supervisor for a reconnect. A TCP connection that has silently gone away
+/// (NAT/idle reaper on the path, sleeping laptop) accepts writes forever, so
+/// the send-error paths below never fire and the CLI would otherwise hold a
+/// socket that reaches nobody. Deliberately generous — ~90-120s of total
+/// silence — and only ARMED once a pong has actually been seen (see
+/// `pong_seen` in [`tunnel_loop`]), so a dispatch build that never answers
+/// pings can never trip it into a reconnect flap.
+const MAX_SILENT_BEATS: u32 = 3;
 
 mod uuid_lite {
     //! Tiny v4 UUID generator. We don't pull `uuid` for one call site — the
@@ -300,17 +325,65 @@ impl TunnelHandle {
     pub(super) fn shutdown(&self) {
         self.shutdown.notify_one();
     }
+
+    /// A handle with no socket behind it, plus the `Notify` its
+    /// [`shutdown`](Self::shutdown) fires.
+    ///
+    /// The supervisor's teardown-vs-reconnect race is pure bookkeeping —
+    /// which handle ends up installed and which one gets closed — so its
+    /// tests need a handle they can watch, not a live WebSocket. The
+    /// `shutdown` field is private to this module, hence the constructor
+    /// living here.
+    #[cfg(test)]
+    pub(super) fn detached(session_id: &str, service_token: &str) -> (Self, Arc<Notify>) {
+        let shutdown = Arc::new(Notify::new());
+        (
+            TunnelHandle {
+                session_id: session_id.to_string(),
+                service_token: service_token.to_string(),
+                shutdown: shutdown.clone(),
+            },
+            shutdown,
+        )
+    }
+}
+
+/// Why the background tunnel loop stopped.
+///
+/// `Shutdown` is the operator tearing the dev session down — expected, and the
+/// supervisor exits silently on it. `Lost` is EVERY other terminal condition
+/// (server close frame, read error, stream end, ping-send failure, half-open
+/// socket) and carries the reason so the supervisor can log one scoped line
+/// and reconnect. Before this existed each of those paths just `return`ed from
+/// a detached task nobody observed, which is what left the CLI process alive
+/// and healthy-looking while dispatch 503'd every call to the module.
+#[derive(Debug)]
+pub(super) enum TunnelExit {
+    Shutdown,
+    Lost(String),
+}
+
+/// A live tunnel: the [`TunnelHandle`] callers keep for identity/shutdown,
+/// plus the one-shot the background loop signals when it stops.
+///
+/// The receiver is split OUT of the handle rather than stored in it because
+/// awaiting it consumes it: the per-module supervisor owns the receiver while
+/// `run_outer` keeps the handle for teardown.
+pub(super) struct TunnelSession {
+    pub handle: TunnelHandle,
+    pub exit: oneshot::Receiver<TunnelExit>,
 }
 
 /// Connect to `wss_url?token=ttok`, send `register`, await `register_ack`,
-/// then hand the connection off to a background task that pings every 30s
-/// and replies to inbound pings. Returns when the handshake completes; the
-/// connection itself lives until [`TunnelHandle::shutdown`] is called.
+/// then hand the connection off to a background task that pings every
+/// [`PING_INTERVAL`] and replies to inbound pings. Returns when the handshake
+/// completes; the connection itself lives until [`TunnelHandle::shutdown`] is
+/// called or the loop signals [`TunnelSession::exit`].
 pub(super) async fn open(
     wss_url: &str,
     ttok: &str,
     register: RegisterPayload<'_>,
-) -> RegisterResult<TunnelHandle> {
+) -> RegisterResult<TunnelSession> {
     let url = with_token_param(wss_url, ttok)?;
     let config = WebSocketConfig {
         max_message_size: Some(MAX_INBOUND_FRAME_BYTES),
@@ -353,12 +426,23 @@ pub(super) async fn open(
         service_token: ack.service_token.clone(),
         internal_secret: register.internal_secret.map(str::to_string),
     });
-    tokio::spawn(run_tunnel_loop(sink, stream, shutdown.clone(), http, ctx));
+    let (exit_tx, exit_rx) = oneshot::channel();
+    tokio::spawn(run_tunnel_loop(
+        sink,
+        stream,
+        shutdown.clone(),
+        http,
+        ctx,
+        exit_tx,
+    ));
 
-    Ok(TunnelHandle {
-        session_id: ack.session_id,
-        service_token: ack.service_token,
-        shutdown,
+    Ok(TunnelSession {
+        handle: TunnelHandle {
+            session_id: ack.session_id,
+            service_token: ack.service_token,
+            shutdown,
+        },
+        exit: exit_rx,
     })
 }
 
@@ -454,24 +538,51 @@ struct RelayReply {
     msg: Message,
 }
 
-/// Long-running tunnel loop: ping every 30s, respond to server pings,
-/// shut down on signal. Surfaces transport failures via `warn_prefix()`
-/// so a silently-dying tunnel doesn't leave the user wondering why
-/// inbound calls stop arriving. (See issue #29 for upgrading this to a
-/// liveness signal callers can poll.)
+/// Drive the tunnel until it ends, then report WHY on `exit_tx`.
+///
+/// The reason is a value rather than an `eprintln!` because the loop has no
+/// idea which module it belongs to — the per-module supervisor that owns the
+/// receiver does, and it prints one scoped line and reconnects. A dropped
+/// sender (task panic, runtime teardown) surfaces to the receiver as a
+/// `RecvError`, which the supervisor treats identically to `Lost`.
 async fn run_tunnel_loop(
+    sink: WsSink,
+    stream: WsReader,
+    shutdown: Arc<Notify>,
+    http: reqwest::Client,
+    ctx: Arc<RelayCtx>,
+    exit_tx: oneshot::Sender<TunnelExit>,
+) {
+    let exit = tunnel_loop(sink, stream, shutdown, http, ctx).await;
+    let _ = exit_tx.send(exit);
+}
+
+/// Long-running tunnel loop: ping every [`PING_INTERVAL`], respond to server
+/// pings, relay `rpc.req`, and stop on shutdown or any transport failure.
+/// Returns the [`TunnelExit`] describing which of those happened; the caller
+/// forwards it to the supervisor, which is what turns a dead socket into a
+/// reconnect instead of a silently idle process.
+async fn tunnel_loop(
     mut sink: WsSink,
     mut stream: WsReader,
     shutdown: Arc<Notify>,
     http: reqwest::Client,
     ctx: Arc<RelayCtx>,
-) {
-    let mut interval = tokio::time::interval(Duration::from_secs(30));
+) -> TunnelExit {
+    let mut interval = tokio::time::interval(PING_INTERVAL);
     // The first tick fires immediately — consume it so the first ping is at
     // t=30s, not t=0. Delay the missed-tick behavior so a paused runtime
     // (e.g. laptop sleep) doesn't burst-ping on resume.
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     interval.tick().await;
+    // Half-open-socket watchdog. `pong_seen` arms it (a server that never
+    // answers a ping must never be able to trip it), `silent_beats` counts
+    // consecutive heartbeats that saw no inbound frame of any kind — a busy
+    // tunnel proves itself alive through `rpc.req` traffic just as well as
+    // through pongs.
+    let mut pong_seen = false;
+    let mut inbound_since_ping = false;
+    let mut silent_beats: u32 = 0;
     // Relay replies (`rpc.resp`/`rpc.err`) funnel back through this channel
     // rather than being sent directly from the spawned relay task: a
     // `SplitSink` can't be shared/sent across concurrent tasks, and `sink`
@@ -485,9 +596,26 @@ async fn run_tunnel_loop(
                     let _ = sink.send(Message::Text(body)).await;
                 }
                 let _ = sink.close().await;
-                return;
+                return TunnelExit::Shutdown;
             }
             _ = interval.tick() => {
+                // Watchdog first: a beat that follows a completely silent
+                // interval (no pong, no relayed request) is evidence the
+                // socket is half-open. Only counted once the server has
+                // proven it answers pings at all.
+                if pong_seen {
+                    if inbound_since_ping {
+                        silent_beats = 0;
+                    } else {
+                        silent_beats += 1;
+                        if silent_beats >= MAX_SILENT_BEATS {
+                            return TunnelExit::Lost(format!(
+                                "no response to {silent_beats} consecutive heartbeats — socket is half-open"
+                            ));
+                        }
+                    }
+                }
+                inbound_since_ping = false;
                 // Read the module's current manifest hash off its local
                 // endpoint, timeout-guarded so a wedged module can never stall
                 // the beat. A successful read sends the SDK's hash verbatim; any
@@ -504,8 +632,7 @@ async fn run_tunnel_loop(
                 let ping = Frame::new(FrameType::Ping, ping_payload(hash.as_deref()));
                 if let Ok(body) = serde_json::to_string(&ping) {
                     if let Err(e) = sink.send(Message::Text(body)).await {
-                        eprintln!("{} tunnel: ping send failed ({e}); closing tunnel", warn_prefix());
-                        return;
+                        return TunnelExit::Lost(format!("heartbeat ping send failed: {e}"));
                     }
                 }
             }
@@ -539,6 +666,12 @@ async fn run_tunnel_loop(
                 }
             }
             msg = stream.next() => {
+                // ANY inbound frame proves the socket still reaches the
+                // server, which is exactly what the watchdog above wants to
+                // know — set this before matching on the variant.
+                if matches!(msg, Some(Ok(_))) {
+                    inbound_since_ping = true;
+                }
                 match msg {
                     // Text and Binary both just carry a JSON frame — extract
                     // the string once (borrowed where possible; only Binary's
@@ -553,23 +686,27 @@ async fn run_tunnel_loop(
                             Message::Binary(b) => String::from_utf8_lossy(b),
                             _ => unreachable!(),
                         };
-                        spawn_rpc_relay_if_req(&text, &tx, &http, &ctx);
+                        // The server answers our JSON heartbeat with a JSON
+                        // `pong` frame (dispatch's handlePing), so the pong
+                        // arrives here as Text — not as a protocol-level
+                        // Message::Pong. Seeing one is what arms the
+                        // half-open watchdog.
+                        if spawn_rpc_relay_if_req(&text, &tx, &http, &ctx) == Some(FrameType::Pong) {
+                            pong_seen = true;
+                        }
                     }
                     Some(Ok(Message::Ping(p))) => {
                         let _ = sink.send(Message::Pong(p)).await;
                     }
                     Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Close(reason))) => {
-                        eprintln!("{} tunnel closed by server: {reason:?}", warn_prefix());
-                        return;
+                        return TunnelExit::Lost(format!("closed by server: {reason:?}"));
                     }
                     Some(Err(e)) => {
-                        eprintln!("{} tunnel: read failed ({e}); closing tunnel", warn_prefix());
-                        return;
+                        return TunnelExit::Lost(format!("read failed: {e}"));
                     }
                     None => {
-                        eprintln!("{} tunnel: stream ended", warn_prefix());
-                        return;
+                        return TunnelExit::Lost("stream ended".to_string());
                     }
                     Some(Ok(Message::Frame(_))) => {}
                 }
@@ -592,12 +729,16 @@ fn ping_payload(hash: Option<&str>) -> Option<serde_json::Value> {
 /// block the 30s heartbeat and serialize concurrent asset/API requests
 /// behind it. Any other frame type (register/register_ack only ever arrive
 /// during the handshake; the SQL plane is still deferred) is ignored.
+///
+/// Returns the parsed frame type (`None` when the frame is malformed) so the
+/// caller can observe liveness — specifically the `pong` answering our
+/// heartbeat — without paying for a second parse of the same bytes.
 fn spawn_rpc_relay_if_req(
     text: &str,
     tx: &mpsc::UnboundedSender<RelayReply>,
     http: &reqwest::Client,
     ctx: &Arc<RelayCtx>,
-) {
+) -> Option<FrameType> {
     let frame: Frame = match serde_json::from_str(text) {
         Ok(f) => f,
         Err(e) => {
@@ -605,21 +746,22 @@ fn spawn_rpc_relay_if_req(
                 "{} tunnel: malformed inbound frame ({e}); ignoring",
                 warn_prefix()
             );
-            return;
+            return None;
         }
     };
     if frame.frame_type != FrameType::RpcReq {
         // register/register_ack only ever arrive pre-handshake; sql.* is
-        // still deferred to Phase 3; ping/pong/close aren't sent as
-        // Text/Binary. Nothing else to act on client-side yet.
-        return;
+        // still deferred to Phase 3; close isn't sent as Text/Binary. `pong`
+        // IS — it's the JSON answer to our JSON heartbeat — and the caller
+        // uses it as the liveness signal, so report the type either way.
+        return Some(frame.frame_type);
     }
     let Some(payload) = frame.payload else {
         eprintln!(
             "{} tunnel: rpc.req missing payload; ignoring",
             warn_prefix()
         );
-        return;
+        return Some(FrameType::RpcReq);
     };
     let req: RpcReqPayload = match serde_json::from_value(payload) {
         Ok(r) => r,
@@ -628,7 +770,7 @@ fn spawn_rpc_relay_if_req(
                 "{} tunnel: rpc.req malformed payload ({e}); ignoring",
                 warn_prefix()
             );
-            return;
+            return Some(FrameType::RpcReq);
         }
     };
     tokio::spawn(relay_rpc_req(
@@ -638,6 +780,7 @@ fn spawn_rpc_relay_if_req(
         frame.id,
         req,
     ));
+    Some(FrameType::RpcReq)
 }
 
 /// Relay one `rpc.req` to the local module and send `rpc.resp`/`rpc.err`
@@ -839,6 +982,28 @@ async fn relay_rpc_req_inner(
 /// scope requires, and is capped by [`MANIFEST_FETCH_TIMEOUT`]. Any failure —
 /// connect refused, timeout, missing/empty header — yields `None` so the caller
 /// sends a payload-less ping instead of stalling or dropping the tunnel.
+/// One-shot [`fetch_manifest_hash`] for a RE-register, with its own client.
+///
+/// The FIRST register carries `manifest_hash: None` because `open_tunnels`
+/// runs before `docker compose up` — there is no module to ask yet. A
+/// reconnect is the opposite: the module has been serving for however long the
+/// dev session has run, so the re-register can carry its real hash instead of
+/// leaving the platform to rediscover it.
+///
+/// `service_token` is the PREVIOUS session's token. That is deliberate and
+/// correct: the module authenticates this call against its
+/// `MS_PLATFORM_TOKEN_FILE`, which still holds the old value because the
+/// supervisor only rewrites that file AFTER a successful re-register. A
+/// failure here is a `None` hash, never a failed reconnect.
+pub(super) async fn current_manifest_hash(
+    local_url: &str,
+    service_token: &str,
+    internal_secret: Option<&str>,
+) -> Option<String> {
+    let client = relay_http_client().ok()?;
+    fetch_manifest_hash(&client, local_url, service_token, internal_secret).await
+}
+
 async fn fetch_manifest_hash(
     client: &reqwest::Client,
     local_url: &str,
@@ -1395,7 +1560,173 @@ mod tests {
         let ping = Frame::new(FrameType::Ping, None);
         let text = serde_json::to_string(&ping).unwrap();
         let ctx = test_ctx("http://127.0.0.1:1", "", None);
-        spawn_rpc_relay_if_req(&text, &tx, &http, &ctx);
+        assert_eq!(
+            spawn_rpc_relay_if_req(&text, &tx, &http, &ctx),
+            Some(FrameType::Ping)
+        );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn inbound_pong_is_reported_so_the_watchdog_can_arm() {
+        // The half-open-socket watchdog is ARMED by seeing a pong, and the
+        // server answers our JSON heartbeat with a JSON `pong` Text frame —
+        // not a protocol-level Pong. If this ever stops being reported the
+        // watchdog silently never arms and a half-open socket goes back to
+        // being invisible, which is the whole failure this work removes.
+        let (tx, _rx) = mpsc::unbounded_channel::<RelayReply>();
+        let http = reqwest::Client::new();
+        let ctx = test_ctx("http://127.0.0.1:1", "", None);
+        let pong = serde_json::to_string(&Frame::new(FrameType::Pong, None)).unwrap();
+        assert_eq!(
+            spawn_rpc_relay_if_req(&pong, &tx, &http, &ctx),
+            Some(FrameType::Pong)
+        );
+        // A malformed frame proves nothing about liveness.
+        assert_eq!(spawn_rpc_relay_if_req("{not json", &tx, &http, &ctx), None);
+    }
+
+    // ── End-to-end loop-exit tests ──────────────────────────────────
+    //
+    // These stand up a real local WebSocket server and drive `open` against
+    // it, because the bug being fixed lives entirely in what the loop does
+    // when the connection ends — the thing no unit-level seam could observe
+    // while every terminal path was a bare `return` from a detached task.
+
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    fn test_register() -> RegisterPayload<'static> {
+        RegisterPayload {
+            module_id: "m_abc",
+            local_url: "http://127.0.0.1:1",
+            version: "0.0.0-test",
+            internal_secret: Some("sec"),
+            manifest_hash: None,
+        }
+    }
+
+    /// Accept one connection, complete the register handshake, and hand back
+    /// the live server-side socket for the test to script.
+    async fn accept_and_ack(
+        listener: TcpListener,
+    ) -> WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>> {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws =
+            tokio_tungstenite::accept_async(tokio_tungstenite::MaybeTlsStream::Plain(stream))
+                .await
+                .unwrap();
+        let Some(Ok(Message::Text(text))) = ws.next().await else {
+            panic!("expected a register frame")
+        };
+        let register: Frame = serde_json::from_str(&text).unwrap();
+        assert_eq!(register.frame_type, FrameType::Register);
+        let mut ack = Frame::new(
+            FrameType::RegisterAck,
+            Some(serde_json::json!({
+                "session_id": "sess_new",
+                "service_token": "stk_new",
+                "expires_at": "2026-08-06T00:00:00Z",
+            })),
+        );
+        ack.corr_id = Some(register.id);
+        ws.send(Message::Text(serde_json::to_string(&ack).unwrap()))
+            .await
+            .unwrap();
+        ws
+    }
+
+    async fn wait_exit(session: TunnelSession) -> TunnelExit {
+        tokio::time::timeout(Duration::from_secs(5), session.exit)
+            .await
+            .expect("the tunnel loop must report its exit, not hang")
+            .expect("the exit sender must not be dropped without a reason")
+    }
+
+    #[tokio::test]
+    async fn server_close_frame_surfaces_as_lost() {
+        // THE observed outage: after an idle period the server sends WS 1001
+        // "Going away". This used to print one warning and end a detached
+        // task nobody watched, leaving the process alive while the platform
+        // 503'd every routed call. It must now be reported as `Lost` so the
+        // supervisor reconnects.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut ws = accept_and_ack(listener).await;
+            ws.close(Some(CloseFrame {
+                code: CloseCode::Away,
+                reason: "Going away".into(),
+            }))
+            .await
+            .unwrap();
+        });
+
+        let session = open(&format!("ws://{addr}/"), "ttok", test_register())
+            .await
+            .expect("handshake");
+        assert_eq!(session.handle.session_id, "sess_new");
+        assert_eq!(session.handle.service_token, "stk_new");
+
+        match wait_exit(session).await {
+            TunnelExit::Lost(reason) => {
+                assert!(reason.contains("closed by server"), "got {reason:?}");
+                // The reason has to name the close code, or the operator
+                // still can't tell an idle reap from an auth rejection.
+                assert!(reason.contains("Away"), "got {reason:?}");
+            }
+            other => panic!("expected Lost, got {other:?}"),
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn abrupt_disconnect_surfaces_as_lost() {
+        // A socket that simply goes away (no close handshake) is the silent
+        // variant of the same failure and must be just as observable.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let ws = accept_and_ack(listener).await;
+            drop(ws);
+        });
+
+        let session = open(&format!("ws://{addr}/"), "ttok", test_register())
+            .await
+            .expect("handshake");
+        assert!(
+            matches!(wait_exit(session).await, TunnelExit::Lost(_)),
+            "a dropped connection must not look like a clean shutdown"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn operator_shutdown_surfaces_as_shutdown_not_lost() {
+        // The other half of the contract: tearing the dev session down must
+        // NOT be mistaken for a lost tunnel, or every Ctrl-C would kick off a
+        // pointless reconnect storm on the way out.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut ws = accept_and_ack(listener).await;
+            // Stay idle and readable until the client closes.
+            while let Some(Ok(msg)) = ws.next().await {
+                if msg.is_close() {
+                    break;
+                }
+            }
+        });
+
+        let session = open(&format!("ws://{addr}/"), "ttok", test_register())
+            .await
+            .expect("handshake");
+        session.handle.shutdown();
+        assert!(
+            matches!(wait_exit(session).await, TunnelExit::Shutdown),
+            "operator shutdown must be distinguishable from a lost tunnel"
+        );
+        server.await.unwrap();
     }
 }
