@@ -40,6 +40,7 @@ use console::style;
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 
+use super::supervisor::ShareInvalidator;
 use super::{ok_mark, warn_prefix};
 use crate::api::{self, ApiError, DevBundlePresignInput};
 use crate::credentials::{self, Credentials};
@@ -206,15 +207,28 @@ struct TargetState {
 /// until `stop` is set. Returns the join handle so `run_outer` can join it on
 /// teardown. Never returns an error to the caller: a setup failure disables
 /// sharing with a warning rather than failing the whole `dev` session.
+///
+/// `invalidator` carries slugs whose tunnel reconnected. The platform stores
+/// the dev-bundle CDN pointer per SESSION and deletes it with the session, so
+/// after a reconnect the shared bundle is silently gone — and the hash gate
+/// below would never re-upload it, because the bytes on disk are unchanged.
+/// Draining the invalidator each scan clears that target's gate so the very
+/// next pass re-confirms the pointer.
 pub(super) fn spawn_watcher(
     apps_base: String,
     targets: Vec<ShareTarget>,
     stop: Arc<AtomicBool>,
+    invalidator: Arc<ShareInvalidator>,
 ) -> thread::JoinHandle<()> {
-    thread::spawn(move || run_watcher(&apps_base, &targets, &stop))
+    thread::spawn(move || run_watcher(&apps_base, &targets, &stop, &invalidator))
 }
 
-fn run_watcher(apps_base: &str, targets: &[ShareTarget], stop: &AtomicBool) {
+fn run_watcher(
+    apps_base: &str,
+    targets: &[ShareTarget],
+    stop: &AtomicBool,
+    invalidator: &ShareInvalidator,
+) {
     if targets.is_empty() {
         return;
     }
@@ -277,6 +291,18 @@ fn run_watcher(apps_base: &str, targets: &[ShareTarget], stop: &AtomicBool) {
     while !stop.load(Ordering::SeqCst) {
         if last_scan.elapsed() >= SCAN_INTERVAL {
             last_scan = Instant::now();
+            let reconnected = invalidator.drain();
+            if !reconnected.is_empty() {
+                for (target, state) in targets.iter().zip(states.iter_mut()) {
+                    if reconnected.contains(&target.slug) {
+                        // Forget both gates: the pointer needs re-confirming,
+                        // and a warning about the old session's failure no
+                        // longer applies.
+                        state.last_uploaded = None;
+                        state.last_warned = None;
+                    }
+                }
+            }
             for (target, state) in targets.iter().zip(states.iter_mut()) {
                 share_once(
                     &api_client,

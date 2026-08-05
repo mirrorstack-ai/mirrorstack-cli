@@ -57,6 +57,7 @@ pub(crate) mod module_meta;
 mod proxy;
 mod reload;
 mod share;
+mod supervisor;
 mod tunnel;
 pub(crate) mod workspace;
 
@@ -248,29 +249,51 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         None
     };
 
+    // Shared with both the tunnel supervisors (which fill it on every
+    // successful reconnect) and the --share watcher (which drains it). Built
+    // unconditionally so the supervisor never has to care whether --share is
+    // on; with the watcher absent nothing drains it and it stays a handful of
+    // slugs.
+    let share_invalidator = Arc::new(supervisor::ShareInvalidator::default());
+
     // Register tunnels before compose so auth failures surface early.
     let tunnel_state = if args.tunnel {
         let secret = internal_secret
             .as_deref()
             .expect("tunnel mode mints a secret");
-        let state = open_tunnels(root, &ready, args.local_url.as_deref(), secret)?;
+        let opened = open_tunnels(root, &ready, args.local_url.as_deref(), secret)?;
         std::fs::create_dir_all(root.join(".secret"))
             .context("dev: create .secret directory for platform token files")?;
-        // `open_tunnels` pushes handles in `ready` order, so zip is aligned.
-        for (m, handle) in ready.iter().zip(state.0.iter()) {
-            let slug = m.dir.file_name().unwrap().to_string_lossy();
-            let f = platform_token_file(root, &slug);
-            std::fs::write(&f, &handle.service_token)
-                .with_context(|| format!("dev: write platform token file for {slug}"))?;
+        // `open_tunnels` builds sessions and targets together, so zip is aligned.
+        for (target, session) in opened.targets.iter().zip(opened.sessions.iter()) {
+            supervisor::write_platform_token(
+                &target.token_file,
+                &session.handle.service_token,
+                &target.slug,
+            )?;
             eprintln!(
                 "{} wrote platform token for {} → {}",
                 ok_mark(),
-                style(&*slug).cyan(),
-                style(f.display()).dim()
+                style(&target.slug).cyan(),
+                style(target.token_file.display()).dim()
             );
-            token_files.push(f);
+            token_files.push(target.token_file.clone());
         }
-        Some(state)
+        // From here on each module's tunnel is supervised: a server close no
+        // longer ends the session for good, and a module that cannot be
+        // brought back says so instead of idling quietly.
+        Some(supervisor::spawn(
+            opened.runtime,
+            opened.sessions,
+            opened.targets,
+            supervisor::ReconnectCtx {
+                dispatch_base: opened.dispatch_base,
+                // Reused verbatim, never re-minted: every already-running
+                // module process holds this exact value from the compose env.
+                internal_secret: secret.to_string(),
+                share: share_invalidator.clone(),
+            },
+        ))
     } else {
         None
     };
@@ -304,7 +327,8 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         } else {
             let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
             let stop = Arc::new(AtomicBool::new(false));
-            let handle = share::spawn_watcher(apps_base, targets, stop.clone());
+            let handle =
+                share::spawn_watcher(apps_base, targets, stop.clone(), share_invalidator.clone());
             Some((stop, handle))
         }
     } else {
@@ -343,6 +367,18 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         let _ = handle.join();
     }
 
+    // Snapshot the supervision verdict before tearing it down — `shutdown`
+    // consumes the set.
+    let (dead_slugs, tunnel_count) = match &tunnel_state {
+        Some(set) => (set.dead_slugs(), set.len()),
+        None => (Vec::new(), 0),
+    };
+    // Stop supervising and close the live sessions BEFORE removing the token
+    // files, so a reconnect in flight can't rewrite a file we just deleted.
+    if let Some(set) = tunnel_state {
+        set.shutdown();
+    }
+
     // Cleanup per-module token files.
     for f in &token_files {
         let _ = std::fs::remove_file(f);
@@ -351,13 +387,14 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         let _ = std::fs::remove_file(skip_file);
     }
 
-    if let Some((handles, runtime)) = tunnel_state {
-        for h in &handles {
-            h.shutdown();
-        }
-        runtime.block_on(async {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        });
+    if !dead_slugs.is_empty() {
+        eprintln!(
+            "{} {} of {} tunnel(s) were permanently offline this session: {}",
+            warn_prefix(),
+            dead_slugs.len(),
+            tunnel_count,
+            dead_slugs.join(", ")
+        );
     }
 
     if !compose_status.success() {
@@ -367,6 +404,16 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
                 .code()
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "signal".into())
+        ));
+    }
+
+    // A dev session whose tunnels all died served nothing, however clean
+    // compose's own exit was. Exit non-zero so scripts and CI see it — the
+    // whole complaint was that every local signal said "fine".
+    if tunnel_count > 0 && dead_slugs.len() == tunnel_count {
+        return Err(anyhow!(
+            "dev: every tunnel went permanently offline ({}). Routed calls returned 503 tunnel_offline and ms.Emit returned 403 unknown_sender for the rest of the session. Re-run `mirrorstack dev --tunnel`.",
+            dead_slugs.join(", ")
         ));
     }
 
@@ -1100,8 +1147,22 @@ fn line_prefix(label: &str) -> String {
 
 // ── Tunnel registration ─────────────────────────────────────────────
 
-/// Open one WSS tunnel per ready module. Returns the handles (in `modules`
-/// order) plus the tokio runtime keeping their background tasks alive.
+/// The result of the initial registration pass: one live session and one
+/// reconnect target per ready module (index-aligned, both in `modules` order),
+/// plus the tokio runtime keeping the background tasks alive. The runtime is
+/// an `Arc` because every supervisor thread hops into it with `block_on` for
+/// the async connect half of a reconnect.
+struct OpenedTunnels {
+    sessions: Vec<tunnel::TunnelSession>,
+    targets: Vec<supervisor::TunnelTarget>,
+    runtime: Arc<tokio::runtime::Runtime>,
+    /// The base every reconnect re-mints against — carried out of here rather
+    /// than re-resolved so the first register and every re-register can never
+    /// end up pointed at different dispatch deployments.
+    dispatch_base: String,
+}
+
+/// Open one WSS tunnel per ready module.
 ///
 /// Each module's tunnel-token mint is wrapped in
 /// [`credentials::with_refresh_retry`] so a 401 on a long-running
@@ -1118,18 +1179,21 @@ fn open_tunnels(
     modules: &[workspace::WorkspaceModule],
     local_url_base: Option<&str>,
     internal_secret: &str,
-) -> Result<(Vec<tunnel::TunnelHandle>, tokio::runtime::Runtime)> {
+) -> Result<OpenedTunnels> {
     let mut creds = credentials::load_or_login_hint()?;
     let dispatch_base = resolve_base(ENV_DISPATCH_URL, DEFAULT_DISPATCH_BASE);
     let client = http::client(Duration::from_secs(15))?;
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .context("dev: build tokio runtime")?;
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .context("dev: build tokio runtime")?,
+    );
 
-    let mut handles = Vec::with_capacity(modules.len());
+    let mut sessions = Vec::with_capacity(modules.len());
+    let mut targets = Vec::with_capacity(modules.len());
 
     let local_url = match local_url_base {
         Some(url) => url.to_string(),
@@ -1161,7 +1225,7 @@ fn open_tunnels(
             }
         };
 
-        let handle = match runtime.block_on(async {
+        let session = match runtime.block_on(async {
             tunnel::open(
                 &token.wss_url,
                 &token.token,
@@ -1172,7 +1236,8 @@ fn open_tunnels(
                     internal_secret: Some(internal_secret),
                     // The module isn't up yet at register (open_tunnels precedes
                     // `docker compose up`); the platform seeds the hash from its
-                    // own fetch and the first heartbeat carries it.
+                    // own fetch and the first heartbeat carries it. A RECONNECT
+                    // does carry the real hash — see `supervisor`.
                     manifest_hash: None,
                 },
             )
@@ -1202,13 +1267,24 @@ fn open_tunnels(
             ok_mark(),
             style(m.dir.display()).cyan(),
             style(&module_local_url).dim(),
-            style(&handle.session_id).dim()
+            style(&session.handle.session_id).dim()
         );
 
-        handles.push(handle);
+        targets.push(supervisor::TunnelTarget {
+            slug: slug.to_string(),
+            module_id,
+            local_url: module_local_url,
+            token_file: platform_token_file(root, &slug),
+        });
+        sessions.push(session);
     }
 
-    Ok((handles, runtime))
+    Ok(OpenedTunnels {
+        sessions,
+        targets,
+        runtime,
+        dispatch_base,
+    })
 }
 
 /// Access tokens are short (15 min per the platform's TokenConfig).
