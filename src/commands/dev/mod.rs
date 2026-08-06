@@ -61,13 +61,24 @@ mod supervisor;
 mod tunnel;
 pub(crate) mod workspace;
 
-const PASSTHROUGH_ENV: [&str; 10] = [
+const PASSTHROUGH_ENV: [&str; 17] = [
     "MS_INTERNAL_SECRET",
     "REDIS_URL",
     "AWS_ENDPOINT_URL",
     "AWS_REGION",
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
+    // Storage SDK plane. These are deliberately explicit: `env_clear()`
+    // prevents compose's MinIO configuration from reaching a module unless
+    // the runner forwards every key the SDK consumes. Without them a module
+    // silently presigns against AWS's default endpoint instead of local S3.
+    "S3_BUCKET",
+    "S3_REGION",
+    "S3_ENDPOINT",
+    "S3_PUBLIC_ENDPOINT",
+    "S3_STS_ENDPOINT",
+    "S3_STS_ROLE_ARN",
+    "CDN_BASE_URL",
     // Platform plane. `env_clear()` in `start_module` means anything not
     // named here never reaches the module, and the SDK's dispatch fallback
     // is a local port that a tunnel session does not run. Dropping
@@ -1438,7 +1449,7 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_env_includes_infra_and_platform_plane() {
+    fn passthrough_env_includes_infra_storage_and_platform_planes() {
         for expected in [
             "MS_INTERNAL_SECRET",
             "REDIS_URL",
@@ -1446,6 +1457,13 @@ mod tests {
             "AWS_REGION",
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
+            "S3_BUCKET",
+            "S3_REGION",
+            "S3_ENDPOINT",
+            "S3_PUBLIC_ENDPOINT",
+            "S3_STS_ENDPOINT",
+            "S3_STS_ROLE_ARN",
+            "CDN_BASE_URL",
             "MS_DISPATCH_URL",
             "MS_PUBLIC_BASE_URL",
             "MS_PLATFORM_BROKER_BASE",
@@ -1469,19 +1487,22 @@ mod tests {
     /// Simulates the loaded root `.env` and compose platform configuration by
     /// setting the vars directly, spawns `/usr/bin/env` (which just dumps its
     /// own env to stdout) through `start_module`, and asserts the allowlisted
-    /// platform vars are forwarded while the poisoned sibling var is not.
+    /// platform/storage vars are forwarded while the poisoned sibling var is
+    /// not.
     #[cfg(unix)]
     #[test]
     fn start_module_does_not_leak_parent_process_env_into_child() {
         let old_module_id = std::env::var_os("MS_MODULE_ID_OAUTH_CORE");
         let old_dispatch_url = std::env::var_os("MS_DISPATCH_URL");
         let old_assertion_key = std::env::var_os("MS_PLATFORM_ASSERTION_PUBLIC_KEY");
+        let old_s3_endpoint = std::env::var_os("S3_ENDPOINT");
 
         // SAFETY: test-only process-global env mutation; no other test reads
         // or depends on these keys, and their prior values are restored below.
         unsafe {
             std::env::set_var("MS_MODULE_ID_OAUTH_CORE", "leaked-sibling-id");
             std::env::set_var("MS_DISPATCH_URL", "https://api.mirrorstack.ai/dispatch");
+            std::env::set_var("S3_ENDPOINT", "http://s3:9000");
             std::env::set_var(
                 "MS_PLATFORM_ASSERTION_PUBLIC_KEY",
                 "test-assertion-public-key",
@@ -1514,6 +1535,7 @@ mod tests {
                 ("MS_MODULE_ID_OAUTH_CORE", old_module_id),
                 ("MS_DISPATCH_URL", old_dispatch_url),
                 ("MS_PLATFORM_ASSERTION_PUBLIC_KEY", old_assertion_key),
+                ("S3_ENDPOINT", old_s3_endpoint),
             ] {
                 match old_value {
                     Some(value) => std::env::set_var(key, value),
@@ -1537,6 +1559,10 @@ mod tests {
                 .iter()
                 .any(|l| l == "MS_PLATFORM_ASSERTION_PUBLIC_KEY=test-assertion-public-key"),
             "expected MS_PLATFORM_ASSERTION_PUBLIC_KEY to pass through to the child: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "S3_ENDPOINT=http://s3:9000"),
+            "expected S3_ENDPOINT to pass through to the child: {lines:?}"
         );
         assert!(
             !lines.iter().any(|l| l.starts_with("MS_MODULE_ID_")),
