@@ -23,10 +23,12 @@
 //!     ack. The runner points each module's MS_PLATFORM_TOKEN_FILE at its
 //!     own file (see docs/platform-module-auth.md). This is the primary
 //!     platform→module auth path.
-//!   - A per-session MS_INTERNAL_SECRET, minted here and both sent on the
-//!     register frame and injected into the compose env, keeps the SDK's
-//!     legacy InternalAuth fallback enforcing (not bypassing) while
-//!     dispatch round-trips the value. Backward-compat with older SDKs.
+//!   - A per-module MS_INTERNAL_SECRET, minted here and sent on that module's
+//!     register frame, keeps the SDK's legacy InternalAuth fallback enforcing
+//!     (not bypassing) while dispatch round-trips the value. A compose-level
+//!     env var reaches every module and therefore cannot identify the caller;
+//!     each value instead crosses into the runner through its module's own
+//!     `.secret/ms-internal-secret-<slug>` file.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, IsTerminal, Read};
@@ -61,8 +63,11 @@ mod supervisor;
 mod tunnel;
 pub(crate) mod workspace;
 
-const PASSTHROUGH_ENV: [&str; 17] = [
-    "MS_INTERNAL_SECRET",
+// MS_INTERNAL_SECRET is deliberately absent: append_passthrough_env runs after
+// module_process_envs, and Command::env is last-wins. Forwarding a shared
+// compose value here would overwrite the module's own caller credential and
+// restore ambiguous authentication across co-located modules.
+const PASSTHROUGH_ENV: [&str; 16] = [
     "REDIS_URL",
     "AWS_ENDPOINT_URL",
     "AWS_REGION",
@@ -151,6 +156,48 @@ pub(crate) fn platform_token_file(root: &Path, slug: &str) -> PathBuf {
         .join(format!("ms-platform-token-{slug}"))
 }
 
+/// Per-module internal-secret file. Like the platform-token file above, this
+/// is a host↔container contract carried by the `.:/modules` bind mount.
+pub(crate) fn internal_secret_file(root: &Path, slug: &str) -> PathBuf {
+    root.join(".secret")
+        .join(format!("ms-internal-secret-{slug}"))
+}
+
+pub(crate) fn read_internal_secret(root: &Path, slug: &str) -> Option<String> {
+    std::fs::read_to_string(internal_secret_file(root, slug))
+        .ok()
+        .map(|secret| secret.trim().to_string())
+        .filter(|secret| !secret.is_empty())
+}
+
+/// THE precedence rule for one module's internal secret, kept in one place
+/// because both consumers (the runner's module env + log shipper, and the
+/// capability probe's request headers) must apply it identically.
+///
+/// The per-slug file is authoritative, and its mere PRESENCE also disables the
+/// `legacy` fallback: a per-module credential that failed to read must never
+/// silently degrade to a value several co-located modules could present, since
+/// that shared value is exactly what dispatch rejects as an ambiguous caller
+/// identity. `legacy` is the runner's own `MS_INTERNAL_SECRET` env — a shared
+/// infrastructure value the non-tunnel local-platform compose stack still
+/// sets, honored only when this module has no file of its own.
+pub(crate) fn resolve_internal_secret(
+    root: &Path,
+    slug: &str,
+    legacy: Option<&str>,
+) -> Option<String> {
+    if internal_secret_file(root, slug).exists() {
+        return read_internal_secret(root, slug);
+    }
+    legacy.map(str::to_string)
+}
+
+/// Write one module's internal-secret file before its tunnel is registered.
+fn write_internal_secret(file: &Path, secret: &str, slug: &str) -> Result<()> {
+    std::fs::write(file, secret)
+        .with_context(|| format!("dev: write internal secret file for {slug}"))
+}
+
 fn capability_skip_file(root: &Path) -> PathBuf {
     root.join(".secret").join("ms-skip-capability-check")
 }
@@ -237,7 +284,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         );
     }
 
-    // Per-module platform-token files. Each tunnel session gets its OWN
+    // Per-module platform-token and internal-secret files. Each tunnel session gets its OWN
     // dispatch-minted service token, so each module process must read the
     // token for ITS session. The old behavior wrote a single shared file
     // (only the first module's token), which authenticated whichever module
@@ -247,17 +294,27 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     // the `.:/modules` bind mount; the inner runner (`run_inner`) points
     // each module's MS_PLATFORM_TOKEN_FILE at `.secret/ms-platform-token-<slug>`.
     let mut token_files: Vec<PathBuf> = Vec::new();
+    let mut internal_secret_files: Vec<PathBuf> = Vec::new();
 
-    // Per-session MS_INTERNAL_SECRET. Sent on each register frame (so
-    // dispatch can attach X-MS-Internal-Secret on forwarded requests) and
-    // injected into the compose env (so the runner forwards it to each
-    // module and the SDK's legacy InternalAuth fallback enforces rather
-    // than bypasses). Only minted in tunnel mode — without a tunnel the
-    // module isn't reachable by remote callers.
-    let internal_secret = if args.tunnel {
-        Some(mint_internal_secret()?)
+    // One MS_INTERNAL_SECRET per module, minted only in tunnel mode. The files
+    // must exist before compose starts because the inner runner reads them
+    // while constructing each module process's environment at boot.
+    let internal_secrets = if args.tunnel {
+        std::fs::create_dir_all(root.join(".secret"))
+            .context("dev: create .secret directory for tunnel credentials")?;
+        let slugs: Vec<_> = ready
+            .iter()
+            .map(|m| m.dir.file_name().unwrap().to_string_lossy())
+            .collect();
+        let secrets = mint_internal_secrets(slugs.iter().map(|slug| slug.as_ref()))?;
+        for (slug, secret) in &secrets {
+            let file = internal_secret_file(root, slug);
+            write_internal_secret(&file, secret, slug)?;
+            internal_secret_files.push(file);
+        }
+        secrets
     } else {
-        None
+        HashMap::new()
     };
 
     // Shared with both the tunnel supervisors (which fill it on every
@@ -269,12 +326,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
 
     // Register tunnels before compose so auth failures surface early.
     let tunnel_state = if args.tunnel {
-        let secret = internal_secret
-            .as_deref()
-            .expect("tunnel mode mints a secret");
-        let opened = open_tunnels(root, &ready, args.local_url.as_deref(), secret)?;
-        std::fs::create_dir_all(root.join(".secret"))
-            .context("dev: create .secret directory for platform token files")?;
+        let opened = open_tunnels(root, &ready, args.local_url.as_deref(), &internal_secrets)?;
         // `open_tunnels` builds sessions and targets together, so zip is aligned.
         for (target, session) in opened.targets.iter().zip(opened.sessions.iter()) {
             supervisor::write_platform_token(
@@ -299,9 +351,6 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
             opened.targets,
             supervisor::ReconnectCtx {
                 dispatch_base: opened.dispatch_base,
-                // Reused verbatim, never re-minted: every already-running
-                // module process holds this exact value from the compose env.
-                internal_secret: secret.to_string(),
                 // One copy for every supervisor: the platform rotates the
                 // refresh token, so parallel refreshes would invalidate each
                 // other's.
@@ -358,13 +407,9 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    // MS_PLATFORM_TOKEN_FILE is set per-module by the inner runner (each
-    // module reads its own `.secret/ms-platform-token-<slug>`). MS_INTERNAL_SECRET
-    // is injected once on the compose env; the runner forwards it to every
-    // module process as the SDK's legacy InternalAuth fallback.
-    if let Some(secret) = &internal_secret {
-        compose.env("MS_INTERNAL_SECRET", secret);
-    }
+    // A compose-level MS_INTERNAL_SECRET would reach EVERY module and cannot
+    // serve as a per-caller identity credential. The inner runner instead
+    // reads each module's `.secret/ms-internal-secret-<slug>` file.
     if args.skip_capability_check {
         compose.env("MS_SKIP_CAPABILITY_CHECK", "1");
     }
@@ -394,8 +439,11 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         set.shutdown();
     }
 
-    // Cleanup per-module token files.
+    // Cleanup per-module credential files.
     for f in &token_files {
+        let _ = std::fs::remove_file(f);
+    }
+    for f in &internal_secret_files {
         let _ = std::fs::remove_file(f);
     }
     if args.skip_capability_check {
@@ -499,15 +547,25 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
     });
 
     // Dev log shipping: tap each module's stdout/stderr and POST batches to
-    // dispatch's ingest, which the developer console reads. Reuses the runner's
-    // MS_DISPATCH_URL (container → dispatch) and MS_INTERNAL_SECRET (== the live
-    // tunnel session's secret, the ingest's auth). Either unset → shipping is
-    // disabled and logs just stay in the terminal.
+    // dispatch's ingest, which authenticates the session selected by that
+    // module's ID against THAT module's own InternalSecret — so the shipper's
+    // credential is per-module too, not a shared infrastructure value. See
+    // `resolve_internal_secret` for the file-over-env precedence.
     let log_dispatch_url = std::env::var("MS_DISPATCH_URL").unwrap_or_default();
-    let log_secret = std::env::var("MS_INTERNAL_SECRET").unwrap_or_default();
-    if log_dispatch_url.is_empty() || log_secret.is_empty() {
+    let legacy_internal_secret = std::env::var("MS_INTERNAL_SECRET")
+        .ok()
+        .filter(|secret| !secret.is_empty());
+    let module_internal_secrets: HashMap<String, String> = ready
+        .iter()
+        .filter_map(|(m, _)| {
+            let slug = m.dir.file_name().unwrap().to_string_lossy().to_string();
+            let secret = resolve_internal_secret(root, &slug, legacy_internal_secret.as_deref())?;
+            Some((slug, secret))
+        })
+        .collect();
+    if log_dispatch_url.is_empty() || module_internal_secrets.is_empty() {
         eprintln!(
-            "{} log shipping disabled (MS_DISPATCH_URL / MS_INTERNAL_SECRET unset) — the dev console Logcat will stay empty",
+            "{} log shipping disabled (MS_DISPATCH_URL unset or no module internal secret resolved) — the dev console Logcat will stay empty",
             warn_prefix()
         );
     }
@@ -537,13 +595,16 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
         let port = INTERNAL_PORT_BASE + u16::try_from(i).expect("module count fits u16");
         routes.insert(slug.clone(), port);
 
+        let internal_secret = module_internal_secrets.get(&slug);
         let sink = log_client.as_ref().and_then(|client| {
-            log_shipper::spawn(
-                client.clone(),
-                log_dispatch_url.clone(),
-                module_id.clone(),
-                log_secret.clone(),
-            )
+            internal_secret.and_then(|secret| {
+                log_shipper::spawn(
+                    client.clone(),
+                    log_dispatch_url.clone(),
+                    module_id.clone(),
+                    secret.clone(),
+                )
+            })
         });
 
         // Each module reads its OWN per-session platform token — dispatch
@@ -563,10 +624,13 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
             port,
             module_id,
             token_file.is_file().then_some(token_file.as_path()),
+            internal_secret.map(String::as_str),
         );
-        // Pass through env vars from compose (MS_INTERNAL_SECRET is the
-        // per-session secret minted by the outer run; the rest configure
-        // infrastructure and the platform plane).
+        // Pass through shared infrastructure and platform-plane values from
+        // compose. MS_INTERNAL_SECRET is deliberately excluded: this runs
+        // after module_process_envs, so Command::env's last-wins behavior
+        // would let a stale shared value override the module's own secret and
+        // make the caller identity ambiguous again.
         append_passthrough_env(&mut envs);
 
         eprintln!("  {} {} on internal :{}", style("✓").green(), slug, port);
@@ -947,6 +1011,7 @@ fn kill_wait(c: &mut Child) {
 
 /// Base env vars every spawned module process gets: local DB, its
 /// deterministic internal port, its per-session platform-token file path,
+/// its per-module internal secret when configured,
 /// and a PLAIN `MS_MODULE_ID` (the same per-environment value tunnel
 /// registration used, resolved from the workspace root's `.env` under this
 /// module's `MS_MODULE_ID_<SLUG>` key) so the module's own
@@ -961,6 +1026,7 @@ fn module_process_envs(
     port: u16,
     module_id: &str,
     token_file: Option<&Path>,
+    internal_secret: Option<&str>,
 ) -> Vec<(String, String)> {
     let mut envs = vec![
         ("MS_LOCAL_DB_URL".into(), db_url.to_string()),
@@ -972,6 +1038,9 @@ fn module_process_envs(
             "MS_PLATFORM_TOKEN_FILE".into(),
             token_file.display().to_string(),
         ));
+    }
+    if let Some(internal_secret) = internal_secret {
+        envs.push(("MS_INTERNAL_SECRET".into(), internal_secret.to_string()));
     }
     envs
 }
@@ -1189,16 +1258,16 @@ struct OpenedTunnels {
 /// `mirrorstack dev` silently refreshes the 15-minute access token from the
 /// stored refresh token and retries once, rather than forcing a re-login.
 /// The rotated refresh pair is persisted back to credentials between
-/// modules. `internal_secret` is the per-session value sent on every
-/// register frame so dispatch can attach X-MS-Internal-Secret on forwarded
-/// requests. `root` is the workspace directory holding `go.work` — each
-/// module's ID is resolved from `root`'s `.env`, keyed by that module's slug
-/// (see `module_meta::env_key_for_slug`).
+/// modules. `internal_secrets` holds the per-module value sent on each
+/// register frame so dispatch can identify the calling module.
+/// `root` is the workspace directory holding `go.work` — each module's ID is
+/// resolved from `root`'s `.env`, keyed by that module's slug (see
+/// `module_meta::env_key_for_slug`).
 fn open_tunnels(
     root: &Path,
     modules: &[workspace::WorkspaceModule],
     local_url_base: Option<&str>,
-    internal_secret: &str,
+    internal_secrets: &HashMap<String, String>,
 ) -> Result<OpenedTunnels> {
     let mut creds = credentials::load_or_login_hint()?;
     let dispatch_base = resolve_base(ENV_DISPATCH_URL, DEFAULT_DISPATCH_BASE);
@@ -1223,6 +1292,12 @@ fn open_tunnels(
     for m in modules {
         let module_id = module_meta::read_module_id(&m.abs_dir, root)?;
         let slug = m.dir.file_name().unwrap().to_string_lossy();
+        let internal_secret = internal_secrets.get(slug.as_ref()).ok_or_else(|| {
+            anyhow!(
+                "dev: no internal secret minted for module {}",
+                m.dir.display()
+            )
+        })?;
         let module_local_url = format!("{local_url}{MODULE_ROUTE_PREFIX}{slug}");
 
         eprintln!(
@@ -1295,6 +1370,7 @@ fn open_tunnels(
             module_id,
             local_url: module_local_url,
             token_file: platform_token_file(root, &slug),
+            internal_secret: internal_secret.clone(),
         });
         sessions.push(session);
     }
@@ -1371,7 +1447,7 @@ fn dev_console_url(dispatch_base: &str, slug: Option<&str>) -> String {
     }
 }
 
-/// Mint a 32-byte URL-safe base64 random token used as the per-session
+/// Mint a 32-byte URL-safe base64 random token used as one module's
 /// MS_INTERNAL_SECRET. Same shape as auth::random_state (OsRng → b64url),
 /// inlined here to avoid a cross-module dependency for a one-off helper.
 fn mint_internal_secret() -> Result<String> {
@@ -1380,6 +1456,14 @@ fn mint_internal_secret() -> Result<String> {
         .try_fill_bytes(&mut buf)
         .context("dev: mint tunnel secret")?;
     Ok(URL_SAFE_NO_PAD.encode(buf))
+}
+
+fn mint_internal_secrets<'a>(
+    slugs: impl Iterator<Item = &'a str>,
+) -> Result<HashMap<String, String>> {
+    slugs
+        .map(|slug| Ok((slug.to_string(), mint_internal_secret()?)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -1399,12 +1483,82 @@ mod tests {
     }
 
     #[test]
+    fn two_modules_in_one_session_get_distinct_internal_secrets() {
+        let secrets = mint_internal_secrets(["media", "oauth-core"].into_iter()).unwrap();
+        let media = secrets.get("media").expect("media secret");
+        let oauth_core = secrets.get("oauth-core").expect("oauth-core secret");
+
+        assert!(!media.is_empty());
+        assert!(!oauth_core.is_empty());
+        assert_ne!(media, oauth_core);
+        assert_eq!(secrets.len(), 2);
+    }
+
+    #[test]
+    fn internal_secret_file_round_trips_each_slug_independently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".secret")).unwrap();
+
+        let media_file = internal_secret_file(root, "media");
+        let oauth_file = internal_secret_file(root, "oauth-core");
+        write_internal_secret(&media_file, "media-secret\n", "media").unwrap();
+        write_internal_secret(&oauth_file, "oauth-secret", "oauth-core").unwrap();
+
+        assert_ne!(media_file, oauth_file);
+        assert_eq!(
+            read_internal_secret(root, "media").as_deref(),
+            Some("media-secret")
+        );
+        assert_eq!(
+            read_internal_secret(root, "oauth-core").as_deref(),
+            Some("oauth-secret")
+        );
+        assert_eq!(read_internal_secret(root, "missing"), None);
+    }
+
+    /// The precedence that keeps a shared credential out of a per-module slot:
+    /// a module's own file wins, a module with no file may use the legacy
+    /// shared env, and a module whose file exists but is unusable gets NOTHING
+    /// rather than the shared value (which is what dispatch rejects as an
+    /// ambiguous caller identity).
+    #[test]
+    fn resolve_internal_secret_never_degrades_a_present_file_to_the_shared_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".secret")).unwrap();
+        write_internal_secret(
+            &internal_secret_file(root, "media"),
+            "media-secret",
+            "media",
+        )
+        .unwrap();
+        std::fs::write(internal_secret_file(root, "empty"), "").unwrap();
+
+        assert_eq!(
+            resolve_internal_secret(root, "media", Some("shared")).as_deref(),
+            Some("media-secret")
+        );
+        assert_eq!(
+            resolve_internal_secret(root, "no-file", Some("shared")).as_deref(),
+            Some("shared")
+        );
+        assert_eq!(resolve_internal_secret(root, "no-file", None), None);
+        assert_eq!(
+            resolve_internal_secret(root, "empty", Some("shared")),
+            None,
+            "a present-but-empty per-module file must not fall back to a shared secret"
+        );
+    }
+
+    #[test]
     fn module_process_envs_includes_ms_module_id() {
         let envs = module_process_envs(
             "postgres://x/y",
             18080,
             "mbb8a3f8b123456789abcdef012345678",
             Some(Path::new("/tmp/.ms-platform-token-media")),
+            None,
         );
         assert!(envs.contains(&(
             "MS_MODULE_ID".to_string(),
@@ -1428,6 +1582,7 @@ mod tests {
             18080,
             "moauthcoreid",
             Some(Path::new("/tmp/.ms-platform-token-oauth-core")),
+            None,
         );
         assert!(
             envs.iter().any(|(k, _)| k == "MS_MODULE_ID"),
@@ -1441,7 +1596,7 @@ mod tests {
 
     #[test]
     fn module_process_envs_does_not_configure_auth_without_a_token() {
-        let envs = module_process_envs("postgres://x/y", 18080, "module-id", None);
+        let envs = module_process_envs("postgres://x/y", 18080, "module-id", None, None);
         assert!(
             !envs.iter().any(|(key, _)| key == "MS_PLATFORM_TOKEN_FILE"),
             "an absent token must not put the SDK into fail-closed configured mode"
@@ -1449,9 +1604,31 @@ mod tests {
     }
 
     #[test]
+    fn module_process_envs_carries_only_a_resolved_internal_secret() {
+        let with_secret = module_process_envs(
+            "postgres://x/y",
+            18080,
+            "module-id",
+            None,
+            Some("module-secret"),
+        );
+        assert!(with_secret.contains(&(
+            "MS_INTERNAL_SECRET".to_string(),
+            "module-secret".to_string()
+        )));
+
+        let without_secret = module_process_envs("postgres://x/y", 18080, "module-id", None, None);
+        assert!(
+            !without_secret
+                .iter()
+                .any(|(key, _)| key == "MS_INTERNAL_SECRET"),
+            "an unresolved secret must omit MS_INTERNAL_SECRET entirely"
+        );
+    }
+
+    #[test]
     fn passthrough_env_includes_infra_storage_and_platform_planes() {
         for expected in [
-            "MS_INTERNAL_SECRET",
             "REDIS_URL",
             "AWS_ENDPOINT_URL",
             "AWS_REGION",
@@ -1474,6 +1651,73 @@ mod tests {
                 "passthrough allowlist is missing {expected}"
             );
         }
+        assert!(
+            !PASSTHROUGH_ENV.contains(&"MS_INTERNAL_SECRET"),
+            "a shared value must never be able to override a module's own secret"
+        );
+    }
+
+    /// A shared compose value exists on the runner in legacy stacks, but a
+    /// tunnel module's explicitly resolved secret must be the only value its
+    /// child sees. This exercises the real `Command` env semantics rather than
+    /// only inspecting the pure env vector.
+    #[cfg(unix)]
+    #[test]
+    fn start_module_prefers_its_per_module_internal_secret() {
+        let old_internal_secret = std::env::var_os("MS_INTERNAL_SECRET");
+
+        // SAFETY: test-only process-global env mutation; no other test reads
+        // or depends on this key, and its prior value is restored below.
+        unsafe {
+            std::env::set_var("MS_INTERNAL_SECRET", "shared-compose-value");
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let mut envs = module_process_envs(
+            "postgres://x/y",
+            18080,
+            "own-id",
+            None,
+            Some("media-module-secret"),
+        );
+        append_passthrough_env(&mut envs);
+        let spec = ModuleSpec {
+            slug: "media".into(),
+            dir: std::env::temp_dir(),
+            bin: PathBuf::from("/usr/bin/env"),
+            envs,
+            sink: Some(tx),
+            watch: false,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+
+        let mut child = start_module(&spec, "test-secret").expect("spawn /usr/bin/env");
+        child.wait().expect("child exits");
+
+        let mut lines = Vec::new();
+        while let Ok(entry) = rx.recv_timeout(Duration::from_secs(2)) {
+            lines.push(entry.msg);
+        }
+
+        unsafe {
+            match old_internal_secret {
+                Some(value) => std::env::set_var("MS_INTERNAL_SECRET", value),
+                None => std::env::remove_var("MS_INTERNAL_SECRET"),
+            }
+        }
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "MS_INTERNAL_SECRET=media-module-secret"),
+            "the child must receive its own per-module secret: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line == "MS_INTERNAL_SECRET=shared-compose-value"),
+            "the shared compose value must not override the module secret: {lines:?}"
+        );
     }
 
     /// Real spawn, not just the `Vec` `module_process_envs` returns. Regression
