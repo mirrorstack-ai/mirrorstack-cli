@@ -7,7 +7,7 @@ use crate::api::{self, ApiError};
 use crate::commands::dev::module_meta::{self, ModuleMeta};
 use crate::commands::dev::{
     DEFAULT_MODULE_PORT, INTERNAL_PORT_BASE, MODULE_ROUTE_PREFIX, PROXY_PORT_DEFAULT,
-    platform_token_file, workspace,
+    platform_token_file, resolve_internal_secret, workspace,
 };
 use crate::commands::{DEFAULT_APPS_API_BASE, ENV_APPS_API_URL, resolve_base, session_expired};
 use crate::{credentials, http};
@@ -30,9 +30,13 @@ pub(crate) fn request_headers(
     {
         request = request.header("X-MS-Platform-Token", token.trim());
     }
-    if let Ok(secret) = std::env::var("MS_INTERNAL_SECRET")
-        && !secret.is_empty()
-    {
+    // This probe must present the secret the TARGET module enforces, which is
+    // that module's own — see `resolve_internal_secret` for why its per-slug
+    // file outranks (and disables) the legacy shared env.
+    let legacy = std::env::var("MS_INTERNAL_SECRET")
+        .ok()
+        .filter(|secret| !secret.is_empty());
+    if let Some(secret) = resolve_internal_secret(root, slug, legacy.as_deref()) {
         request = request.header("X-MS-Internal-Secret", secret);
     }
     request

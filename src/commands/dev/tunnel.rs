@@ -195,13 +195,13 @@ pub(super) struct RegisterPayload<'a> {
     pub module_id: &'a str,
     pub local_url: &'a str,
     pub version: &'a str,
-    /// Per-session shared secret the module enforces on its Internal
-    /// scope routes (X-MS-Internal-Secret header). The CLI mints this,
-    /// sets `MS_INTERNAL_SECRET` on the spawned module process, and
-    /// sends the same value here so dispatch can attach the header to
-    /// every forwarded request. None until --tunnel is set; serialized
-    /// only when present so older dispatch builds keep round-tripping
-    /// the register frame.
+    /// Per-module secret the module enforces on its Internal scope routes
+    /// (X-MS-Internal-Secret header). The CLI mints this, delivers it to the
+    /// module process through that module's own
+    /// `.secret/ms-internal-secret-<slug>` file, and sends the same value here
+    /// so dispatch can attach the header to every forwarded request. None
+    /// until --tunnel is set; serialized only when present so older dispatch
+    /// builds keep round-tripping the register frame.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub internal_secret: Option<&'a str>,
     /// The module's current manifest hash — the SDK's `X-MS-Manifest-Hash`

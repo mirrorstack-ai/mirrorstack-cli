@@ -28,10 +28,10 @@
 //!     session, while the watcher's content-hash cache would otherwise never
 //!     re-confirm it.
 //!
-//! `MS_INTERNAL_SECRET` is deliberately NOT re-minted: it is minted once per
-//! `dev` invocation and injected into the compose environment, so every
-//! already-running module process holds that exact value. Minting a new one
-//! would break module→dispatch ingress for the rest of the session.
+//! `MS_INTERNAL_SECRET` is deliberately NOT re-minted: the stability guarantee
+//! holds per module. A module keeps the secret it was started with for its
+//! whole lifetime, and every re-register replays that same value so the
+//! module's process env and its registered session never diverge.
 //!
 //! Why an OS thread and not a tokio task: the token mint goes through
 //! `reqwest::blocking` (`http::client`), which panics when called from inside
@@ -107,8 +107,6 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 /// Everything a reconnect needs that is identical for every module.
 pub(super) struct ReconnectCtx {
     pub dispatch_base: String,
-    /// Reused verbatim on every re-register — see the module docs.
-    pub internal_secret: String,
     /// The single credential copy every supervisor mints against. Loaded once
     /// by `open_tunnels` and moved in here, so no supervisor thread has a
     /// credential-load step that could fail and silently leave its module
@@ -126,6 +124,8 @@ pub(super) struct TunnelTarget {
     pub module_id: String,
     pub local_url: String,
     pub token_file: PathBuf,
+    /// Reused verbatim for this module on every re-register.
+    pub internal_secret: String,
 }
 
 /// Live supervision state for one module, shared between its supervisor thread
@@ -509,7 +509,7 @@ fn attempt_reconnect(
     let manifest_hash = runtime.block_on(tunnel::current_manifest_hash(
         &target.local_url,
         &previous_token,
-        Some(&ctx.internal_secret),
+        Some(&target.internal_secret),
     ));
 
     runtime
@@ -523,7 +523,7 @@ fn attempt_reconnect(
                         module_id: &target.module_id,
                         local_url: &target.local_url,
                         version: env!("CARGO_PKG_VERSION"),
-                        internal_secret: Some(&ctx.internal_secret),
+                        internal_secret: Some(&target.internal_secret),
                         manifest_hash,
                     },
                 ),
@@ -885,6 +885,7 @@ mod tests {
             module_id: "mod_abc".into(),
             local_url: "http://127.0.0.1:1".into(),
             token_file: dir.join(format!("ms-platform-token-{slug}")),
+            internal_secret: format!("secret-{slug}"),
         }
     }
 
