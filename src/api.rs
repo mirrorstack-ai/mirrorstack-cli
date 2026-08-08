@@ -274,7 +274,7 @@ pub fn create_module(
     })
 }
 
-/// POST /v1/modules/{id}/slug — rename a module without changing its platform
+/// PUT /v1/modules/{id}/slug — rename a module without changing its platform
 /// identity, installed references, or ID-namespaced tables. `module_id` is the
 /// catalog UUID (`get_module(...).id`), never the sanitized `.env` form.
 ///
@@ -298,7 +298,7 @@ pub fn rename_module_slug(
         apps_base.trim_end_matches('/')
     );
     let resp = http
-        .post(&endpoint)
+        .put(&endpoint)
         .bearer_auth(access_token)
         .header("Accept", "application/json")
         .json(&Body { slug: new_slug })
@@ -1954,11 +1954,11 @@ mod tests {
     }
 
     #[test]
-    fn rename_module_slug_posts_identity_preserving_request() {
+    fn rename_module_slug_puts_identity_preserving_request() {
         let mut server = Server::new();
         let request = server
             .mock(
-                "POST",
+                "PUT",
                 "/v1/modules/01234567-89ab-cdef-0123-456789abcdef/slug",
             )
             .match_header("authorization", "Bearer AT")
@@ -1995,7 +1995,7 @@ mod tests {
     fn rename_module_slug_surfaces_slug_taken_envelope() {
         let mut server = Server::new();
         let request = server
-            .mock("POST", "/v1/modules/module-id/slug")
+            .mock("PUT", "/v1/modules/module-id/slug")
             .with_status(409)
             .with_body(
                 r#"{"error":{"code":"slug_taken","message":"slug already belongs to a module"}}"#,
