@@ -25,6 +25,7 @@ mod artifact;
 pub(crate) mod capabilities;
 mod changelog;
 mod readme;
+mod rename;
 mod scaffold;
 mod version_move;
 
@@ -52,6 +53,9 @@ enum ModuleCommand {
     /// key in the workspace root's .env, creates them via the API, and
     /// writes the assigned ID back under that module's key in .env.
     Register(RegisterArgs),
+    /// Rename a module slug while preserving its platform ID, installs, and
+    /// tables. This is the safe alternative to re-registering after a rename.
+    Rename(rename::RenameArgs),
     /// Deploy the version your code declares (the newest Config.Versions
     /// key in ./main.go). Cross-compiles the module for Linux/arm64 and
     /// packages it as a Lambda `bootstrap` zip, records the version with its
@@ -101,6 +105,11 @@ pub struct RegisterArgs {
     /// Skip confirmation prompts.
     #[arg(long, short)]
     yes: bool,
+    /// Create a new module even when the workspace `.env` holds module IDs
+    /// that match no module here — only correct when this really is a
+    /// brand-new module.
+    #[arg(long)]
+    allow_new: bool,
 }
 
 #[derive(Args)]
@@ -126,6 +135,7 @@ pub fn run(args: ModuleArgs) -> Result<()> {
         ModuleCommand::Capabilities(c) => capabilities::run(c),
         ModuleCommand::Init(i) => init(i),
         ModuleCommand::Register(r) => register(r),
+        ModuleCommand::Rename(r) => rename::run(r),
         ModuleCommand::Deploy(d) => deploy(d),
         ModuleCommand::Move(m) => version_move::run(m),
     }
@@ -303,10 +313,16 @@ fn register(args: RegisterArgs) -> Result<()> {
     if module_dirs.is_empty() {
         return Err(anyhow!("go.work has no `use` directives"));
     }
+    // Compute this once against the pre-command workspace. If one old key is
+    // stranded, every would-be create deserves the same conservative guard;
+    // mutating the set as this loop progresses could make later modules look
+    // safer merely because an earlier module was registered.
+    let unclaimed_ids = module_meta::unclaimed_module_id_keys(&cwd);
 
     let theme = ColorfulTheme::default();
     let mut registered = 0u32;
     let mut skipped = 0u32;
+    let mut refused_new = 0u32;
 
     for rel_dir in &module_dirs {
         let abs_dir = cwd.join(rel_dir);
@@ -339,7 +355,32 @@ fn register(args: RegisterArgs) -> Result<()> {
             continue;
         }
 
-        if !args.yes {
+        let mut dangerous_create_confirmed = false;
+        if !unclaimed_ids.is_empty() && !args.allow_new {
+            print_stranded_id_register_guard(&meta.slug, &unclaimed_ids);
+            if args.yes {
+                refused_new += 1;
+                continue;
+            }
+            dangerous_create_confirmed = Confirm::with_theme(&theme)
+                .with_prompt(format!(
+                    "Create a NEW ID for {} despite the stranded workspace IDs?",
+                    meta.slug
+                ))
+                .default(false)
+                .interact()?;
+            if !dangerous_create_confirmed {
+                eprintln!(
+                    "{} skipped {}. Use `mirrorstack app module rename --from <old-slug> --to {}` to preserve the existing ID.",
+                    warn_prefix(),
+                    meta.slug,
+                    meta.slug
+                );
+                continue;
+            }
+        }
+
+        if !args.yes && !dangerous_create_confirmed {
             eprintln!();
             eprintln!("  {} {}", style("Module:").dim(), style(&meta.name).bold());
             eprintln!(
@@ -437,7 +478,30 @@ fn register(args: RegisterArgs) -> Result<()> {
         registered,
         skipped
     );
+    if refused_new > 0 {
+        return Err(anyhow!(
+            "refused to create {refused_new} new module ID(s) while the workspace has unclaimed IDs; use `module rename`, or pass --allow-new only for genuinely brand-new modules"
+        ));
+    }
     Ok(())
+}
+
+fn print_stranded_id_register_guard(slug: &str, unclaimed: &[(String, String)]) {
+    eprintln!();
+    eprintln!(
+        "{} module '{}' has no ID under its current slug, but the workspace .env contains unclaimed module-ID keys:",
+        warn_prefix(),
+        slug
+    );
+    for (key, _) in unclaimed {
+        eprintln!("  - {key}");
+    }
+    eprintln!(
+        "  This looks like a slug rename. `module register` would mint a NEW ID, create new empty module tables, and leave an existing install pointing at the old ID."
+    );
+    eprintln!(
+        "  Preserve the ID with `mirrorstack app module rename --from <old-slug> --to {slug}`. Use --allow-new only when this really is a brand-new module."
+    );
 }
 
 fn deploy(args: DeployArgs) -> Result<()> {
@@ -848,7 +912,7 @@ fn get_owned_module(
     match api::get_module(client, apps_base, access_token, slug) {
         Ok(Some(m)) => Ok(m),
         Ok(None) => Err(anyhow!(
-            "module '{slug}' not found on the platform (run `mirrorstack app module register` first)"
+            "module '{slug}' not found on the platform. The platform may still hold the OLD slug; use `mirrorstack app module rename --from <old-slug> --to {slug}`. `register` mints a new ID and orphans the existing install, so it is only correct if the module was never created."
         )),
         Err(ApiError::Unauthenticated) => Err(session_expired()),
         Err(e) => Err(e.into()),

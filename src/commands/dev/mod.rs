@@ -210,7 +210,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         let reason = if slug.is_empty() {
             "no main.go"
         } else {
-            "no ID — run `mirrorstack app module register`"
+            "no ID — if the slug was renamed, use `mirrorstack app module rename`; register is only for a brand-new module"
         };
         eprintln!(
             "  {} {} ({})",

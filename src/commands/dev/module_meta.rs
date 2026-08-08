@@ -18,6 +18,7 @@
 //! plain, unsuffixed `os.Getenv("MS_MODULE_ID")`, and `dev/mod.rs` injects a
 //! plain `MS_MODULE_ID=<value>` into just that module's child env.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -64,12 +65,47 @@ pub(crate) fn read_module_meta(module_dir: &Path, root: &Path) -> Result<ModuleM
 pub(super) fn read_module_id(module_dir: &Path, root: &Path) -> Result<String> {
     let meta = read_module_meta(module_dir, root)?;
     if meta.id.is_empty() {
-        return Err(anyhow!(
-            "dev: module {} has no ID set. Run `mirrorstack app module register` first.",
-            module_dir.display()
-        ));
+        return Err(missing_module_id_error(module_dir, root, &meta.slug));
     }
     Ok(meta.id)
+}
+
+/// Build the deliberately verbose missing-ID failure shared by `dev` and
+/// module-management commands. A slug edit can make the normal lookup miss an
+/// ID that is still present under its old key; putting the recovery before the
+/// registration warning keeps an operator from replacing a live identity.
+pub(crate) fn missing_module_id_error(module_dir: &Path, root: &Path, slug: &str) -> anyhow::Error {
+    let expected_key = env_key_for_slug(slug);
+    let path = env_path(root);
+    let stranded = unclaimed_module_id_keys(root);
+
+    // No `dev:` prefix: `module rename` raises this too, and the message
+    // already names the module dir and the .env it looked in.
+    let mut message = format!(
+        "module {} has no ID set.\nParsed slug: {slug}\nExpected env key: {expected_key}\nWorkspace .env: {}",
+        module_dir.display(),
+        path.display()
+    );
+
+    if stranded.is_empty() {
+        message.push_str("\nNo non-empty unclaimed MS_MODULE_ID_* keys were found in that file.");
+    } else {
+        message.push_str("\n\nPossible IDs stranded by a slug rename:");
+        for (key, _) in &stranded {
+            message.push_str(&format!("\n  - {key}"));
+        }
+        message.push_str(
+            "\nThe module ID is not lost. Use the non-destructive fix first: rename the matching key while keeping the SAME value:",
+        );
+        message.push_str(&format!(
+            "\n  mirrorstack app module rename --from <old-slug> --to {slug} --local-only"
+        ));
+    }
+
+    message.push_str(
+        "\n\nCreating a module here would mint a NEW module ID, create new empty module tables, and leave any existing install pointing at the old ID — there is no undo.\n`mirrorstack app module register` is only correct when this module has never been registered in THIS environment.",
+    );
+    anyhow!(message)
 }
 
 /// Path to the workspace root's `.env` file — holds one `MS_MODULE_ID_<SLUG>`
@@ -104,7 +140,7 @@ pub(crate) fn env_key_for_slug(slug: &str) -> String {
 /// comments, blank lines) is delegated to `dotenvy` — the same crate the
 /// CLI already uses for its own `.env` loading in `main.rs` — instead of a
 /// hand-rolled `KEY=value` scanner.
-fn read_env_module_id(root: &Path, slug: &str) -> String {
+pub(crate) fn read_env_module_id(root: &Path, slug: &str) -> String {
     let key = env_key_for_slug(slug);
     let Ok(iter) = dotenvy::from_path_iter(env_path(root)) else {
         return String::new();
@@ -116,6 +152,36 @@ fn read_env_module_id(root: &Path, slug: &str) -> String {
         }
     }
     String::new()
+}
+
+/// Return non-empty module-ID entries whose slug-derived key is not claimed by
+/// any module currently visible in this workspace. These are usually IDs left
+/// behind by a hand-edited `Config.Slug`, and therefore evidence that minting a
+/// replacement identity would be destructive rather than corrective.
+pub(crate) fn unclaimed_module_id_keys(root: &Path) -> Vec<(String, String)> {
+    let module_dirs = if root.join("go.work").exists() {
+        crate::commands::dev::workspace::discover_modules(root)
+            .map(|modules| modules.into_iter().map(|module| module.abs_dir).collect())
+            .unwrap_or_else(|_| vec![root.to_path_buf()])
+    } else {
+        vec![root.to_path_buf()]
+    };
+
+    let claimed: HashSet<String> = module_dirs
+        .into_iter()
+        .filter_map(|dir| fs::read_to_string(dir.join("main.go")).ok())
+        .filter_map(|body| extract_field(&body, "Slug"))
+        .map(|slug| env_key_for_slug(&slug))
+        .collect();
+
+    let Ok(iter) = dotenvy::from_path_iter(env_path(root)) else {
+        return Vec::new();
+    };
+    iter.filter_map(|item| item.ok())
+        .filter(|(key, value)| {
+            key.starts_with("MS_MODULE_ID_") && !value.is_empty() && !claimed.contains(key)
+        })
+        .collect()
 }
 
 /// Extract the value of a `Field: "..."` pattern from Go source.
@@ -315,6 +381,89 @@ pub(crate) fn promote_version(module_dir: &Path, from: &str, to: &str) -> Result
     let new_body = format!("{}\"{to}\"{}", &body[..abs], &body[abs + needle.len()..]);
     fs::write(&path, new_body).with_context(|| format!("write {}", path.display()))?;
     Ok(())
+}
+
+/// Rename only the quoted `Slug:` literal in `main.go`. The surrounding scan
+/// is intentionally anchored on the field label so comments, migration data,
+/// or other fields that happen to contain the old slug are never rewritten.
+pub(crate) fn rename_slug_in_main_go(module_dir: &Path, from: &str, to: &str) -> Result<()> {
+    let path = module_dir.join("main.go");
+    let body = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let label = body
+        .find("Slug:")
+        .ok_or_else(|| anyhow!("no Slug field in {}", path.display()))?;
+    let after_label = label + "Slug:".len();
+    let open = body[after_label..]
+        .find('"')
+        .map(|offset| after_label + offset)
+        .ok_or_else(|| anyhow!("no quoted Slug literal in {}", path.display()))?;
+    let close = body[open + 1..]
+        .find('"')
+        .map(|offset| open + 1 + offset)
+        .ok_or_else(|| anyhow!("unterminated Slug literal in {}", path.display()))?;
+    let actual = &body[open + 1..close];
+    if actual == to {
+        return Ok(());
+    }
+    if actual != from {
+        return Err(anyhow!(
+            "Slug in {} is {actual:?}, not {from:?} or {to:?}",
+            path.display()
+        ));
+    }
+
+    let new_body = format!("{}{to}{}", &body[..open + 1], &body[close..]);
+    fs::write(&path, new_body).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+/// Carry a module ID from its old slug-derived `.env` key to the new key.
+/// Only the key bytes on the matching line change: its value, position, line
+/// ending, and every unrelated byte in the file survive the operation.
+pub(crate) fn rename_module_id_key(root: &Path, from_slug: &str, to_slug: &str) -> Result<String> {
+    let old_key = env_key_for_slug(from_slug);
+    let new_key = env_key_for_slug(to_slug);
+    let path = env_path(root);
+    let existing = match fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+
+    let find_entry = |wanted: &str| -> Option<(usize, String)> {
+        let prefix = format!("{wanted}=");
+        let mut offset = 0usize;
+        for line in existing.split_inclusive('\n') {
+            let content = line.strip_suffix('\n').unwrap_or(line);
+            let content = content.strip_suffix('\r').unwrap_or(content);
+            let trimmed = content.trim_start();
+            if let Some(value) = trimmed.strip_prefix(&prefix) {
+                return Some((offset + content.len() - trimmed.len(), value.to_string()));
+            }
+            offset += line.len();
+        }
+        None
+    };
+
+    let old = find_entry(&old_key);
+    let new = find_entry(&new_key);
+    match (old, new) {
+        (Some(_), Some(_)) => Err(anyhow!(
+            "both {old_key} and {new_key} exist in {}; refusing an ambiguous module ID rename",
+            path.display()
+        )),
+        (None, Some((_, value))) => Ok(value),
+        (Some((key_offset, value)), None) => {
+            let mut new_body = existing;
+            new_body.replace_range(key_offset..key_offset + old_key.len(), &new_key);
+            fs::write(&path, new_body).with_context(|| format!("write {}", path.display()))?;
+            Ok(value)
+        }
+        (None, None) => Err(anyhow!(
+            "neither {old_key} nor {new_key} exists in {}",
+            path.display()
+        )),
+    }
 }
 
 /// Write `MS_MODULE_ID_<SLUG>=<new_id>` into `<root>/.env`, creating the
@@ -611,6 +760,144 @@ func main() {
             .unwrap_err()
             .to_string();
         assert!(err.contains("v2.0.0-dev"), "got {err}");
+    }
+
+    #[test]
+    fn rename_slug_rewrites_only_slug_literal_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = r#"package main
+
+// oauth-core remains documentation for the former name.
+var legacy = "oauth-core"
+
+func main() {
+    ms.Init(ms.Config{
+        Slug: "oauth-core",
+        Name: "oauth-core",
+    })
+}
+"#;
+        std::fs::write(tmp.path().join("main.go"), source).unwrap();
+
+        rename_slug_in_main_go(tmp.path(), "oauth-core", "identity-core").unwrap();
+        rename_slug_in_main_go(tmp.path(), "oauth-core", "identity-core").unwrap();
+
+        let rewritten = std::fs::read_to_string(tmp.path().join("main.go")).unwrap();
+        assert!(rewritten.contains("Slug: \"identity-core\""));
+        assert!(rewritten.contains("// oauth-core remains"));
+        assert!(rewritten.contains("var legacy = \"oauth-core\""));
+        assert!(rewritten.contains("Name: \"oauth-core\""));
+    }
+
+    #[test]
+    fn rename_module_id_key_preserves_value_position_and_unrelated_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let before = "# module ids\nMS_MODULE_ID_OTHER=mother\n\nMS_MODULE_ID_OAUTH_CORE=m0123ABCxyz\nUNRELATED=keep me\n";
+        std::fs::write(tmp.path().join(".env"), before).unwrap();
+
+        let carried = rename_module_id_key(tmp.path(), "oauth-core", "identity-core").unwrap();
+        assert_eq!(carried, "m0123ABCxyz");
+        let after = std::fs::read_to_string(tmp.path().join(".env")).unwrap();
+        assert_eq!(
+            after,
+            "# module ids\nMS_MODULE_ID_OTHER=mother\n\nMS_MODULE_ID_IDENTITY_CORE=m0123ABCxyz\nUNRELATED=keep me\n"
+        );
+    }
+
+    #[test]
+    fn rename_module_id_key_is_idempotent_when_new_key_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "MS_MODULE_ID_IDENTITY_CORE=msameid\nOTHER=unchanged\n";
+        std::fs::write(tmp.path().join(".env"), body).unwrap();
+        assert_eq!(
+            rename_module_id_key(tmp.path(), "oauth-core", "identity-core").unwrap(),
+            "msameid"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".env")).unwrap(),
+            body
+        );
+    }
+
+    #[test]
+    fn rename_module_id_key_refuses_both_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "MS_MODULE_ID_OAUTH_CORE=mold\nMS_MODULE_ID_IDENTITY_CORE=mnew\n",
+        )
+        .unwrap();
+        let error = rename_module_id_key(tmp.path(), "oauth-core", "identity-core")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("MS_MODULE_ID_OAUTH_CORE"), "{error}");
+        assert!(error.contains("MS_MODULE_ID_IDENTITY_CORE"), "{error}");
+    }
+
+    #[test]
+    fn rename_module_id_key_refuses_when_neither_key_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".env"), "OTHER=keep\n").unwrap();
+        let error = rename_module_id_key(tmp.path(), "oauth-core", "identity-core")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("MS_MODULE_ID_OAUTH_CORE"), "{error}");
+        assert!(error.contains("MS_MODULE_ID_IDENTITY_CORE"), "{error}");
+    }
+
+    #[test]
+    fn unclaimed_keys_find_stranded_slug_but_not_workspace_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("go.work"),
+            "go 1.26\nuse (\n  ./identity-core\n  ./media\n)\n",
+        )
+        .unwrap();
+        for (dir, slug) in [("identity-core", "identity-core"), ("media", "media")] {
+            let module = tmp.path().join(dir);
+            std::fs::create_dir(&module).unwrap();
+            std::fs::write(
+                module.join("main.go"),
+                format!("package main\nvar config = Config{{Slug: \"{slug}\"}}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            tmp.path().join(".env"),
+            "MS_MODULE_ID_OAUTH_CORE=mstranded\nMS_MODULE_ID_MEDIA=mclaimed\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            unclaimed_module_id_keys(tmp.path()),
+            vec![(
+                "MS_MODULE_ID_OAUTH_CORE".to_string(),
+                "mstranded".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn missing_id_error_leads_to_rename_for_stranded_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("main.go"),
+            "package main\nvar config = Config{Slug: \"identity-core\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "MS_MODULE_ID_OAUTH_CORE=mstranded\n",
+        )
+        .unwrap();
+
+        let error = missing_module_id_error(tmp.path(), tmp.path(), "identity-core").to_string();
+        assert!(
+            !error.contains("Run `mirrorstack app module register` first"),
+            "{error}"
+        );
+        assert!(error.contains("MS_MODULE_ID_OAUTH_CORE"), "{error}");
+        assert!(error.contains("rename"), "{error}");
     }
 
     #[test]

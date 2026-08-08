@@ -18,6 +18,7 @@ mirrorstack login --no-browser # Sign in on SSH/headless (paste the code shown o
 mirrorstack logout             # Revoke the current session and wipe local credentials
 mirrorstack whoami             # Print the currently signed-in user
 mirrorstack app module init    # Register a new module on the platform
+mirrorstack app module rename  # Safely rename a module slug without changing its ID
 mirrorstack module deploy      # Cross-compile Linux/arm64, package a bootstrap zip, and upload it
 mirrorstack app web deploy     # Deploy a static build directory to app hosting
 mirrorstack module capabilities         # Which host slots exist, who fills them, what is broken

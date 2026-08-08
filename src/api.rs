@@ -274,6 +274,46 @@ pub fn create_module(
     })
 }
 
+/// POST /v1/modules/{id}/slug — rename a module without changing its platform
+/// identity, installed references, or ID-namespaced tables. `module_id` is the
+/// catalog UUID (`get_module(...).id`), never the sanitized `.env` form.
+///
+/// The endpoint ships in the api-platform slug-rename PR and does not exist on
+/// `main` yet; this one `format!` is the whole contract surface, so a change to
+/// the agreed path or body is a one-line edit here.
+pub fn rename_module_slug(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+    new_slug: &str,
+) -> Result<Module, ApiError> {
+    #[derive(Serialize)]
+    struct Body<'a> {
+        slug: &'a str,
+    }
+
+    let endpoint = format!(
+        "{}/v1/modules/{module_id}/slug",
+        apps_base.trim_end_matches('/')
+    );
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .json(&Body { slug: new_slug })
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<Module>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
 #[derive(Debug, Serialize)]
 pub struct RecordModuleVersionInput<'a> {
     /// Canonical SemVer, no `v` prefix (the platform 422s anything else).
@@ -1911,6 +1951,73 @@ mod tests {
         let err =
             get_module(&test_client(), &server.url(), "expired", "forbidden-slug").unwrap_err();
         assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
+    }
+
+    #[test]
+    fn rename_module_slug_posts_identity_preserving_request() {
+        let mut server = Server::new();
+        let request = server
+            .mock(
+                "POST",
+                "/v1/modules/01234567-89ab-cdef-0123-456789abcdef/slug",
+            )
+            .match_header("authorization", "Bearer AT")
+            .match_header("accept", "application/json")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"slug":"identity-core"}"#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "id": "01234567-89ab-cdef-0123-456789abcdef",
+                    "name": "OAuth Core",
+                    "slug": "identity-core",
+                    "owner_id": "u-1"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let module = rename_module_slug(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "identity-core",
+        )
+        .unwrap();
+        request.assert();
+        assert_eq!(module.slug, "identity-core");
+        assert_eq!(module.id, "01234567-89ab-cdef-0123-456789abcdef");
+    }
+
+    #[test]
+    fn rename_module_slug_surfaces_slug_taken_envelope() {
+        let mut server = Server::new();
+        let request = server
+            .mock("POST", "/v1/modules/module-id/slug")
+            .with_status(409)
+            .with_body(
+                r#"{"error":{"code":"slug_taken","message":"slug already belongs to a module"}}"#,
+            )
+            .create();
+
+        let error = rename_module_slug(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "module-id",
+            "identity-core",
+        )
+        .unwrap_err();
+        request.assert();
+        match error {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 409);
+                assert_eq!(code, "slug_taken");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
     }
 
     #[test]
