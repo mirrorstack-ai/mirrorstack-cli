@@ -61,8 +61,23 @@ const MAX_INBOUND_FRAME_BYTES: usize = 1 << 20;
 /// reserve another chunk for the envelope, so a body that passes this check
 /// is guaranteed to still fit once encoded and wrapped.
 const RELAY_ENVELOPE_OVERHEAD_BYTES: usize = 8 * 1024;
-const MAX_RELAY_BODY_BYTES: usize =
-    (MAX_INBOUND_FRAME_BYTES / 4) * 3 - RELAY_ENVELOPE_OVERHEAD_BYTES;
+
+/// Ceiling on the raw local-module response body.
+///
+/// 🔴 THIS IS NO LONGER A FRAME CALCULATION. It used to be scaled from
+/// MAX_INBOUND_FRAME_BYTES, because one reply had to fit one frame — but replies
+/// are split across frames now (see split_rpc_resp), so the frame size stops
+/// bounding the body entirely.
+///
+/// Leaving it derived from the frame size made chunking useless for the payload
+/// it exists for: a certificate PDF with an embedded background is comfortably
+/// over the old ~778 KB, and the check REJECTS a body before it is ever split.
+/// The module answers 200, the CLI turns it into an rpc.err, and the browser
+/// reports a failed fetch — with nothing in the log to say a cap did it.
+///
+/// What remains is a memory-bomb guard, not a transport limit: this many bytes
+/// are held in RAM and base64-encoded before being split.
+const MAX_RELAY_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// 🔴 API Gateway's cap on a frame we SEND, which is a different number in a
 /// different direction from [`MAX_INBOUND_FRAME_BYTES`] (our own read limit).
@@ -1026,13 +1041,11 @@ async fn relay_rpc_req_inner(
         slug: None,
     })?;
 
-    // Reject before handing an oversized frame to the WSS transport (whose
-    // own frame-size cap is the same MAX_INBOUND_FRAME_BYTES ceiling) — a
-    // clean rpc.err beats an opaque transport-level send failure. Compare
-    // against MAX_RELAY_BODY_BYTES (not MAX_INBOUND_FRAME_BYTES): the raw
-    // body is base64-encoded and then JSON-wrapped before it reaches the
-    // transport, so gating on the raw length alone would let a body through
-    // that's actually oversized once encoded.
+    // A memory guard, NOT a transport check: the body is split across frames
+    // below, so its size no longer has to fit anything. What it does bound is
+    // how much this process will hold and base64 in one go. Compare against
+    // MAX_RELAY_BODY_BYTES, which is deliberately no longer derived from the
+    // frame size.
     if body.len() > MAX_RELAY_BODY_BYTES {
         return Err(ErrorPayload {
             code: "local_body_too_large".to_string(),
