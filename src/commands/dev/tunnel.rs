@@ -64,6 +64,25 @@ const RELAY_ENVELOPE_OVERHEAD_BYTES: usize = 8 * 1024;
 const MAX_RELAY_BODY_BYTES: usize =
     (MAX_INBOUND_FRAME_BYTES / 4) * 3 - RELAY_ENVELOPE_OVERHEAD_BYTES;
 
+/// 🔴 API Gateway's cap on a frame we SEND, which is a different number in a
+/// different direction from [`MAX_INBOUND_FRAME_BYTES`] (our own read limit).
+/// Confusing the two is how this went unfound for a day: 1 MiB says "payload
+/// size cannot be the problem" while 32 KiB is the wall the reply actually hit.
+///
+/// Over it, API Gateway does not truncate and does not error — it CLOSES the
+/// connection. The module has already answered 200 by then, so the tunnel dies
+/// on a successful response and the platform reports the module as "installed
+/// but has nothing to serve right now".
+const MAX_OUTBOUND_FRAME_BYTES: usize = 32 * 1024;
+
+/// Raw bytes of body per part. Base64 inflates by 4/3 and the JSON envelope
+/// (status, headers, ids, field names) rides on top, so the raw slice is scaled
+/// down for both. A multiple of 3 keeps each part's base64 padding-free, which
+/// is not required for correctness — each part is decoded independently — but
+/// keeps the encoded sizes even and the arithmetic honest.
+const CHUNK_BODY_BYTES: usize =
+    ((MAX_OUTBOUND_FRAME_BYTES - RELAY_ENVELOPE_OVERHEAD_BYTES) / 4) * 3 / 3 * 3;
+
 /// Local Internal-scope endpoint the SDK serves the module manifest on. The
 /// heartbeat GETs this (through the CLI's own dev proxy) purely to read the
 /// hash response header — it is NOT the platform's `/v1/tunnel/manifest` route.
@@ -266,6 +285,18 @@ pub(super) struct RpcRespPayload {
     /// empty body, matching the request side's `omitempty` convention.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// 0-based index of this part, and how many parts make up the reply.
+    /// BOTH omitted on a whole reply, so every frame the CLI sent before
+    /// chunking is byte-identical to what it sends now — and a dispatch that
+    /// predates chunking keeps reading them as complete replies.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub seq: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub total: usize,
+}
+
+fn is_zero(v: &usize) -> bool {
+    *v == 0
 }
 
 /// Typed register-time rejection. Distinguishes the cases the CLI knows
@@ -792,7 +823,7 @@ async fn relay_rpc_req(
     corr_id: String,
     req: RpcReqPayload,
 ) {
-    let mut frame = match relay_rpc_req_inner(
+    let payloads = match relay_rpc_req_inner(
         &http,
         &ctx.local_url,
         &ctx.service_token,
@@ -801,10 +832,23 @@ async fn relay_rpc_req(
     )
     .await
     {
-        Ok(resp) => Frame::new(FrameType::RpcResp, serde_json::to_value(&resp).ok()),
-        Err(err) => Frame::new(FrameType::RpcErr, serde_json::to_value(&err).ok()),
+        Ok(resp) => split_rpc_resp(resp)
+            .into_iter()
+            .map(|part| Frame::new(FrameType::RpcResp, serde_json::to_value(&part).ok()))
+            .collect::<Vec<_>>(),
+        Err(err) => vec![Frame::new(
+            FrameType::RpcErr,
+            serde_json::to_value(&err).ok(),
+        )],
     };
-    frame.corr_id = Some(corr_id.clone());
+    for mut frame in payloads {
+        frame.corr_id = Some(corr_id.clone());
+        send_relay_frame(&tx, &corr_id, frame);
+    }
+}
+
+/// Send one already-addressed frame on the reply channel.
+fn send_relay_frame(tx: &mpsc::UnboundedSender<RelayReply>, corr_id: &str, frame: Frame) {
     if let Ok(body) = serde_json::to_string(&frame) {
         // The receiving end (`rx.recv()` in `run_tunnel_loop`) only goes
         // away when the loop itself is exiting/exited, so a send failure
@@ -812,10 +856,45 @@ async fn relay_rpc_req(
         // shutting down — nothing left to report it to. The `corr_id` rides
         // along so the loop can name this request if the sink send fails.
         let _ = tx.send(RelayReply {
-            corr_id,
+            corr_id: corr_id.to_string(),
             msg: Message::Text(body),
         });
     }
+}
+
+/// Split one reply into as many frames as the outbound ceiling requires.
+///
+/// A reply that already fits comes back as a single part with `seq`/`total`
+/// left at zero, so the frame is byte-identical to what the CLI sent before
+/// chunking existed — that is what keeps this safe against a dispatch that has
+/// not deployed reassembly yet.
+///
+/// Status and headers ride on part 0 ONLY. Repeating them on every part would
+/// cost a copy of the header block per frame, and dispatch reads them from the
+/// first part regardless.
+fn split_rpc_resp(resp: RpcRespPayload) -> Vec<RpcRespPayload> {
+    let raw = match resp.body.as_deref().map(|b| STANDARD.decode(b)) {
+        Some(Ok(bytes)) => bytes,
+        // An un-decodable body is not something to split. Pass it through and
+        // let the existing path report it.
+        _ => return vec![resp],
+    };
+    if raw.len() <= CHUNK_BODY_BYTES {
+        return vec![resp];
+    }
+    let slices: Vec<&[u8]> = raw.chunks(CHUNK_BODY_BYTES).collect();
+    let total = slices.len();
+    slices
+        .into_iter()
+        .enumerate()
+        .map(|(seq, slice)| RpcRespPayload {
+            status: if seq == 0 { resp.status } else { 0 },
+            headers: if seq == 0 { resp.headers.clone() } else { None },
+            body: (!slice.is_empty()).then(|| STANDARD.encode(slice)),
+            seq,
+            total,
+        })
+        .collect()
 }
 
 /// HTTP client for the tunnel's local calls (heartbeat manifest GET +
@@ -970,6 +1049,9 @@ async fn relay_rpc_req_inner(
         status,
         headers: (!headers.is_empty()).then_some(headers),
         body: (!body.is_empty()).then(|| STANDARD.encode(&body)),
+        // Whole reply. split_rpc_resp decides whether it stays one.
+        seq: 0,
+        total: 0,
     })
 }
 
@@ -1237,6 +1319,8 @@ mod tests {
             status: 204,
             headers: None,
             body: None,
+            seq: 0,
+            total: 0,
         };
         let s = serde_json::to_string(&payload).unwrap();
         assert_eq!(s, r#"{"status":204}"#);
@@ -1251,6 +1335,8 @@ mod tests {
                 vec!["text/plain".to_string()],
             )])),
             body: Some(STANDARD.encode(b"hello")),
+            seq: 0,
+            total: 0,
         };
         let s = serde_json::to_string(&payload).unwrap();
         assert!(s.contains(r#""status":200"#));
@@ -1728,5 +1814,113 @@ mod tests {
             "operator shutdown must be distinguishable from a lost tunnel"
         );
         server.await.unwrap();
+    }
+
+    /// A reply that fits stays ONE frame with no chunk fields, so it serializes
+    /// byte-identically to what the CLI sent before chunking — that is what
+    /// makes this safe to run against a dispatch that has not deployed
+    /// reassembly yet.
+    #[test]
+    fn small_reply_is_not_split_and_declares_no_chunking() {
+        let payload = RpcRespPayload {
+            status: 200,
+            headers: None,
+            body: Some(STANDARD.encode(b"hello")),
+            seq: 0,
+            total: 0,
+        };
+        let parts = split_rpc_resp(payload);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0].total, 0,
+            "a whole reply must not claim a part count"
+        );
+
+        let json = serde_json::to_string(&parts[0]).unwrap();
+        assert!(
+            !json.contains("\"seq\"") && !json.contains("\"total\""),
+            "chunk fields must be omitted on a whole reply: {json}"
+        );
+    }
+
+    /// The bytes the module produced must survive the split exactly — every
+    /// part decoded on its own and concatenated in seq order.
+    #[test]
+    fn large_reply_splits_and_reassembles_byte_for_byte() {
+        let raw: Vec<u8> = (0..CHUNK_BODY_BYTES * 2 + 17)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let parts = split_rpc_resp(RpcRespPayload {
+            status: 200,
+            headers: Some(HashMap::from([(
+                "content-type".to_string(),
+                vec!["application/pdf".to_string()],
+            )])),
+            body: Some(STANDARD.encode(&raw)),
+            seq: 0,
+            total: 0,
+        });
+
+        assert_eq!(parts.len(), 3, "two full parts and a remainder");
+        for (index, part) in parts.iter().enumerate() {
+            assert_eq!(part.seq, index);
+            assert_eq!(part.total, 3);
+        }
+
+        // Status and headers ride on part 0 only — repeating the header block
+        // on every frame would cost a copy of it per part.
+        assert_eq!(parts[0].status, 200);
+        assert!(parts[0].headers.is_some());
+        assert!(parts[1].headers.is_none() && parts[2].headers.is_none());
+
+        let mut rebuilt = Vec::new();
+        for part in &parts {
+            rebuilt.extend_from_slice(&STANDARD.decode(part.body.as_ref().unwrap()).unwrap());
+        }
+        assert_eq!(rebuilt, raw, "the body must survive the split unchanged");
+    }
+
+    /// Each part must fit the ceiling that closes the socket. This is the whole
+    /// point of the change, so it is asserted on the ENCODED frame rather than
+    /// on the raw slice.
+    #[test]
+    fn every_part_fits_the_outbound_frame() {
+        let raw = vec![b'x'; CHUNK_BODY_BYTES * 4];
+        let parts = split_rpc_resp(RpcRespPayload {
+            status: 200,
+            headers: Some(HashMap::from([(
+                "content-type".to_string(),
+                vec!["application/json".to_string()],
+            )])),
+            body: Some(STANDARD.encode(&raw)),
+            seq: 0,
+            total: 0,
+        });
+        for part in &parts {
+            let mut frame = Frame::new(FrameType::RpcResp, serde_json::to_value(part).ok());
+            frame.corr_id = Some("corr-abcdef0123456789".to_string());
+            let encoded = serde_json::to_string(&frame).unwrap();
+            assert!(
+                encoded.len() <= MAX_OUTBOUND_FRAME_BYTES,
+                "part {} encodes to {} bytes, over the {} ceiling that closes the connection",
+                part.seq,
+                encoded.len(),
+                MAX_OUTBOUND_FRAME_BYTES
+            );
+        }
+    }
+
+    /// An empty body is a legal reply (204, HEAD) and must not become a part.
+    #[test]
+    fn empty_reply_is_left_alone() {
+        let parts = split_rpc_resp(RpcRespPayload {
+            status: 204,
+            headers: None,
+            body: None,
+            seq: 0,
+            total: 0,
+        });
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].total, 0);
     }
 }
