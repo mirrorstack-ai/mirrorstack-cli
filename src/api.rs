@@ -78,7 +78,7 @@ pub struct CreateModuleInput<'a> {
 }
 
 /// GET /v1/auth/me — returns the authenticated user's identity.
-/// Response shape from `POST /v1/tunnel/token`. The CLI follows up with
+/// Response shape from `POST /v1/dispatch/tunnel/token`. The CLI follows up with
 /// a WebSocket connect against `wss_url` carrying `?token=<token>`.
 #[derive(Deserialize, Debug)]
 pub struct TunnelToken {
@@ -91,13 +91,13 @@ pub struct TunnelToken {
     pub expires_at: String,
 }
 
-/// POST /v1/tunnel/token — mint a connect token for the WSS dev tunnel.
+/// POST /v1/dispatch/tunnel/token — mint a connect token for the WSS dev tunnel.
 pub fn tunnel_token(
     http: &Client,
     dispatch_base: &str,
     access_token: &str,
 ) -> Result<TunnelToken, ApiError> {
-    let endpoint = format!("{}/v1/tunnel/token", dispatch_base.trim_end_matches('/'));
+    let endpoint = format!("{}/v1/dispatch/tunnel/token", dispatch_base.trim_end_matches('/'));
     let resp = http
         .post(&endpoint)
         .bearer_auth(access_token)
@@ -113,7 +113,7 @@ pub fn tunnel_token(
     Err(unexpected_body_error(resp))
 }
 
-/// GET /v1/tunnel/manifest/{moduleId} — the module's live manifest, proxied
+/// GET /v1/dispatch/tunnel/manifest/{moduleId} — the module's live manifest, proxied
 /// off its `mirrorstack dev` tunnel by the dispatch service. `module_id` is
 /// the raw platform UUID. The 200 body is the manifest object itself (no
 /// envelope), returned as opaque JSON. Owner-gated: someone else's (or an
@@ -127,7 +127,7 @@ pub fn get_tunnel_manifest(
     module_id: &str,
 ) -> Result<serde_json::Value, ApiError> {
     let endpoint = format!(
-        "{}/v1/tunnel/manifest/{}",
+        "{}/v1/dispatch/tunnel/manifest/{}",
         dispatch_base.trim_end_matches('/'),
         module_id
     );
@@ -2595,7 +2595,7 @@ mod tests {
     fn get_tunnel_manifest_success() {
         let mut server = Server::new();
         let _m = server
-            .mock("GET", "/v1/tunnel/manifest/mod-uuid")
+            .mock("GET", "/v1/dispatch/tunnel/manifest/mod-uuid")
             .match_header("authorization", "Bearer AT")
             .with_status(200)
             .with_body(
@@ -2618,7 +2618,7 @@ mod tests {
     fn get_tunnel_manifest_401_is_unauthenticated() {
         let mut server = Server::new();
         let _m = server
-            .mock("GET", "/v1/tunnel/manifest/mod-uuid")
+            .mock("GET", "/v1/dispatch/tunnel/manifest/mod-uuid")
             .with_status(401)
             .with_body(r#"{"error":{"code":"token_expired","message":"token expired"}}"#)
             .create();
@@ -2632,7 +2632,7 @@ mod tests {
     fn get_tunnel_manifest_404_surfaces_code() {
         let mut server = Server::new();
         let _m = server
-            .mock("GET", "/v1/tunnel/manifest/mod-uuid")
+            .mock("GET", "/v1/dispatch/tunnel/manifest/mod-uuid")
             .with_status(404)
             .with_body(r#"{"error":{"code":"not_found","message":"module not found"}}"#)
             .create();
@@ -2651,7 +2651,7 @@ mod tests {
     fn get_tunnel_manifest_503_tunnel_offline_surfaces_code() {
         let mut server = Server::new();
         let _m = server
-            .mock("GET", "/v1/tunnel/manifest/mod-uuid")
+            .mock("GET", "/v1/dispatch/tunnel/manifest/mod-uuid")
             .with_status(503)
             .with_body(
                 r#"{"error":{"code":"tunnel_offline","message":"no live dev tunnel for this module"}}"#,
