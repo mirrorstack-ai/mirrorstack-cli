@@ -97,7 +97,10 @@ pub fn tunnel_token(
     dispatch_base: &str,
     access_token: &str,
 ) -> Result<TunnelToken, ApiError> {
-    let endpoint = format!("{}/v1/dispatch/tunnel/token", dispatch_base.trim_end_matches('/'));
+    let endpoint = format!(
+        "{}/v1/dispatch/tunnel/token",
+        dispatch_base.trim_end_matches('/')
+    );
     let resp = http
         .post(&endpoint)
         .bearer_auth(access_token)
