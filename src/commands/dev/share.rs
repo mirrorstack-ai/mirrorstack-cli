@@ -40,6 +40,7 @@ use console::style;
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 
+use super::module_meta::catalog_uuid;
 use super::supervisor::ShareInvalidator;
 use super::{ok_mark, warn_prefix};
 use crate::api::{self, ApiError, DevBundlePresignInput};
@@ -96,29 +97,6 @@ impl ShareTarget {
             module_id,
             dist: module_dir.join(WEB_BUNDLE_REL),
         })
-    }
-}
-
-/// The dev-bundle REST endpoints (`/v1/modules/{id}/dev-bundle/...`) key on the
-/// dashed catalog UUID, but the tunnel — and `MS_MODULE_ID_<SLUG>` / the value
-/// `read_module_id` resolves — use the sanitized `m<32-hex>` form. Convert
-/// `m5dcba905ba6c4242a9c3696f9efc92e9` -> `5dcba905-ba6c-4242-a9c3-696f9efc92e9`
-/// so presign/confirm resolve the module instead of 404ing on a non-UUID id.
-/// A value that isn't the `m` + 32-hex shape is passed through unchanged (it's
-/// already a UUID, or an unexpected id the server will reject on its own).
-fn catalog_uuid(module_id: &str) -> String {
-    let hex = module_id.strip_prefix('m').unwrap_or(module_id);
-    if hex.len() == 32 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        format!(
-            "{}-{}-{}-{}-{}",
-            &hex[0..8],
-            &hex[8..12],
-            &hex[12..16],
-            &hex[16..20],
-            &hex[20..32],
-        )
-    } else {
-        module_id.to_string()
     }
 }
 
@@ -387,7 +365,7 @@ fn share_once(
             // distinct content hash. Re-reading the file is what makes the
             // promise true.
             if matches!(e, ApiError::Unauthenticated) {
-                adopt_rotated_credentials(creds);
+                credentials::adopt_rotated(creds);
             }
             // Best-effort: keep the tunnel serving. Suppress a repeat warning
             // for the same still-failing bytes; leaving `last_uploaded`
@@ -402,24 +380,6 @@ fn share_once(
                 state.last_warned = Some(hash);
             }
         }
-    }
-}
-
-/// Adopt the on-disk pair when ours has been rotated away by someone else.
-/// Returns whether it found one.
-///
-/// Only called after a 401, and only adopts a pair whose refresh token differs
-/// from the one we hold — an identical pair means the session really is gone
-/// and re-reading it every tick would be pointless churn. A missing or corrupt
-/// file leaves the watcher exactly where it was: sharing is best-effort and
-/// must never take the dev session down with it.
-fn adopt_rotated_credentials(creds: &mut Credentials) -> bool {
-    match credentials::load() {
-        Ok(disk) if disk.refresh_token != creds.refresh_token => {
-            *creds = disk;
-            true
-        }
-        _ => false,
     }
 }
 
@@ -677,7 +637,7 @@ mod tests {
         };
 
         // Nothing on disk yet → nothing to adopt, and no panic.
-        assert!(!adopt_rotated_credentials(&mut mine));
+        assert!(!credentials::adopt_rotated(&mut mine));
         assert_eq!(mine.refresh_token, "RT_spent");
 
         credentials::save(&Credentials {
@@ -687,12 +647,12 @@ mod tests {
         })
         .expect("seed credentials.json");
 
-        assert!(adopt_rotated_credentials(&mut mine));
+        assert!(credentials::adopt_rotated(&mut mine));
         assert_eq!(mine.access_token, "AT_live");
         assert_eq!(mine.refresh_token, "RT_rotated");
 
         // Already current → no adoption, so a genuinely dead session does not
         // re-read the file on every failing tick.
-        assert!(!adopt_rotated_credentials(&mut mine));
+        assert!(!credentials::adopt_rotated(&mut mine));
     }
 }

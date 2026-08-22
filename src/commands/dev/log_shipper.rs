@@ -41,36 +41,36 @@ pub type LogSink = Sender<LogEntry>;
 /// print, a panic, the SDK's own stderr diagnostics) falls back to the stream:
 /// stderr → warn, stdout → info, with the raw line as the message.
 pub fn parse_line(raw: &str, is_stderr: bool) -> LogEntry {
-    if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(raw) {
-        if obj.contains_key("level") {
-            let level = obj
-                .get("level")
-                .and_then(|v| v.as_str())
-                .map(normalize_level)
-                .unwrap_or_else(|| default_level(is_stderr));
-            let msg = obj
-                .get("msg")
-                .or_else(|| obj.get("message"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(raw)
-                .to_string();
-            let ts = obj
-                .get("time")
-                .and_then(|v| v.as_str())
-                .map(short_time)
-                .unwrap_or_default();
-            let app_id = obj
-                .get("app_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            return LogEntry {
-                ts,
-                level,
-                msg,
-                app_id,
-            };
-        }
+    if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(raw)
+        && obj.contains_key("level")
+    {
+        let level = obj
+            .get("level")
+            .and_then(|v| v.as_str())
+            .map(normalize_level)
+            .unwrap_or_else(|| default_level(is_stderr));
+        let msg = obj
+            .get("msg")
+            .or_else(|| obj.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(raw)
+            .to_string();
+        let ts = obj
+            .get("time")
+            .and_then(|v| v.as_str())
+            .map(short_time)
+            .unwrap_or_default();
+        let app_id = obj
+            .get("app_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        return LogEntry {
+            ts,
+            level,
+            msg,
+            app_id,
+        };
     }
     LogEntry {
         ts: String::new(),

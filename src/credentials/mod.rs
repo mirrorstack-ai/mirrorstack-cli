@@ -4,12 +4,13 @@
 //! Windows. The `cli` segment reserves room for future MirrorStack
 //! tools (SDK, daemons, GUIs) under the same parent. Mode 0600 on Unix.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -17,6 +18,9 @@ use thiserror::Error;
 use crate::api::{self, ApiError};
 use crate::commands::{DEFAULT_API_BASE, ENV_API_URL, resolve_base, warn_prefix};
 use crate::http;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 /// Process environment is global, so tests redirecting the config path or
 /// API base share one lock across modules.
@@ -64,6 +68,7 @@ pub(crate) fn redirect_config_dir(dir: &std::path::Path) -> TestConfigDir {
 /// keep `expires_at` honest on disk. Mirrors `login`'s use of the
 /// exchange's `expires_in`.
 const ACCESS_TTL: Duration = Duration::from_secs(15 * 60);
+const CREDENTIALS_LOCK_FILE: &str = "credentials.lock";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Credentials {
@@ -94,6 +99,11 @@ pub fn path() -> Result<PathBuf, LoadError> {
 /// write to a temp file in the same directory, then rename — protects
 /// against truncated files if the process is killed mid-write.
 pub fn save(creds: &Credentials) -> Result<()> {
+    let _lock = lock_credentials()?;
+    save_unlocked(creds)
+}
+
+fn save_unlocked(creds: &Credentials) -> Result<()> {
     let p = path().context("credentials: path")?;
     let parent = p.parent().expect("credentials path has parent");
     fs::create_dir_all(parent).context("credentials: mkdir")?;
@@ -117,6 +127,28 @@ pub fn save(creds: &Credentials) -> Result<()> {
     Ok(())
 }
 
+/// Serialize credential replacement across every CLI process. Refresh tokens
+/// rotate exactly once, so an in-process mutex is insufficient when a dev
+/// tunnel and a command in another terminal both receive a 401 together.
+fn lock_credentials() -> Result<fs::File> {
+    let credentials_path = path().context("credentials: path")?;
+    let parent = credentials_path
+        .parent()
+        .expect("credentials path has parent");
+    fs::create_dir_all(parent).context("credentials: mkdir")?;
+    let lock_path = parent.join(CREDENTIALS_LOCK_FILE);
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(&lock_path)
+        .with_context(|| format!("credentials: open refresh lock {}", lock_path.display()))?;
+    FileExt::lock_exclusive(&file)
+        .with_context(|| format!("credentials: lock refresh session {}", lock_path.display()))?;
+    Ok(file)
+}
+
 #[allow(dead_code)] // API surface for future commands (whoami, etc.)
 pub fn load() -> Result<Credentials, LoadError> {
     let p = path()?;
@@ -127,8 +159,10 @@ pub fn load() -> Result<Credentials, LoadError> {
     }
 }
 
-/// Exchange the stored refresh token for a fresh access + refresh pair,
-/// persist the rotated pair, and return the new credentials.
+/// Return a live access + refresh pair under the cross-process credential
+/// lock. This exchanges and persists `refresh_token` when it is still the
+/// newest pair; when another CLI already rotated it, the newer on-disk pair is
+/// adopted instead (and refreshed only if its access token has expired).
 ///
 /// `expires_at` is re-derived locally from [`ACCESS_TTL`] (the refresh
 /// response's `expires_at` is informational only). The platform rotates
@@ -142,16 +176,39 @@ pub fn load() -> Result<Credentials, LoadError> {
 /// returns `ApiError::Unauthenticated` via the `?` — the refresh token
 /// itself is gone, so the caller should fall back to the login hint.
 pub fn refresh_and_save(refresh_token: &str) -> Result<Credentials> {
-    let api_base = resolve_base(ENV_API_URL, DEFAULT_API_BASE);
-    let client = http::client(std::time::Duration::from_secs(15))
-        .context("credentials: build HTTP client for refresh")?;
-    let refreshed = api::refresh_session(&client, &api_base, refresh_token)?;
-    let creds = Credentials {
-        access_token: refreshed.access_token,
-        refresh_token: refreshed.refresh_token,
-        expires_at: SystemTime::now() + ACCESS_TTL,
+    refresh_and_save_with(refresh_token, |current_refresh_token| {
+        let api_base = resolve_base(ENV_API_URL, DEFAULT_API_BASE);
+        let client = http::client(std::time::Duration::from_secs(15))
+            .context("credentials: build HTTP client for refresh")?;
+        let refreshed = api::refresh_session(&client, &api_base, current_refresh_token)?;
+        Ok(Credentials {
+            access_token: refreshed.access_token,
+            refresh_token: refreshed.refresh_token,
+            expires_at: SystemTime::now() + ACCESS_TTL,
+        })
+    })
+}
+
+fn refresh_and_save_with(
+    refresh_token: &str,
+    refresh: impl FnOnce(&str) -> Result<Credentials>,
+) -> Result<Credentials> {
+    let _lock = lock_credentials()?;
+
+    // A waiter must never spend the token the lock holder just invalidated.
+    // If that holder persisted a still-live replacement, adopt it directly;
+    // if its access token has since expired, rotate its newest refresh token.
+    let current_refresh_token = match load() {
+        Ok(disk) if disk.refresh_token != refresh_token => {
+            if disk.expires_at > SystemTime::now() {
+                return Ok(disk);
+            }
+            disk.refresh_token
+        }
+        _ => refresh_token.to_owned(),
     };
-    if let Err(e) = save(&creds) {
+    let creds = refresh(&current_refresh_token)?;
+    if let Err(e) = save_unlocked(&creds) {
         eprintln!(
             "{} refreshed session but failed to save credentials: {e:#}",
             warn_prefix()
@@ -203,10 +260,10 @@ pub fn with_refresh_retry<T>(
 pub fn load_or_login_hint() -> Result<Credentials> {
     match load() {
         Ok(c) => {
-            if c.expires_at <= SystemTime::now() {
-                if let Ok(refreshed) = refresh_and_save(&c.refresh_token) {
-                    return Ok(refreshed);
-                }
+            if c.expires_at <= SystemTime::now()
+                && let Ok(refreshed) = refresh_and_save(&c.refresh_token)
+            {
+                return Ok(refreshed);
             }
             Ok(c)
         }
@@ -217,11 +274,25 @@ pub fn load_or_login_hint() -> Result<Credentials> {
     }
 }
 
+/// Adopt a newer on-disk credential pair after this process's cached refresh
+/// token was rotated by another long-lived CLI worker or another terminal.
+/// An identical, missing, or unreadable pair leaves `creds` unchanged.
+pub(crate) fn adopt_rotated(creds: &mut Credentials) -> bool {
+    match load() {
+        Ok(disk) if disk.refresh_token != creds.refresh_token => {
+            *creds = disk;
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Wipe the credentials file. Idempotent — a missing file is treated as
 /// success so callers don't need to special-case "already logged out".
 /// On other errors (typically permissions) the path is included in the
 /// message so the user can act manually.
 pub fn delete() -> Result<()> {
+    let _lock = lock_credentials()?;
     let p = path().context("credentials: path")?;
     match fs::remove_file(&p) {
         Ok(()) => Ok(()),

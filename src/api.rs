@@ -1436,6 +1436,103 @@ pub fn confirm_dev_bundle(
     Err(envelope_error(resp))
 }
 
+/// Declaration for one canonical module-client artifact. The exact tunnel
+/// session is part of both phases so a predecessor cannot publish after a
+/// reconnect installs its successor.
+#[derive(Debug, Serialize)]
+pub struct DevClientPresignInput<'a> {
+    pub session_id: &'a str,
+    pub size_bytes: u64,
+    pub sha256: &'a str,
+    pub format_version: u8,
+}
+
+// Do not derive Debug: upload_url is a bearer-like presigned credential and
+// must never become printable through an otherwise harmless debug log.
+#[derive(Deserialize)]
+pub struct DevClientPresign {
+    pub upload_url: String,
+    pub key: String,
+    pub headers: BTreeMap<String, String>,
+    #[allow(dead_code)]
+    pub expires_at: String,
+}
+
+pub fn presign_dev_client(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+    input: &DevClientPresignInput<'_>,
+) -> Result<DevClientPresign, ApiError> {
+    let endpoint = format!(
+        "{}/v1/modules/{}/dev-client/presign",
+        apps_base.trim_end_matches('/'),
+        module_id
+    );
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .json(input)
+        .send()?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<DevClientPresign>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
+#[derive(Debug, Serialize)]
+pub struct DevClientConfirmInput<'a> {
+    pub key: &'a str,
+    pub session_id: &'a str,
+    pub size_bytes: u64,
+    pub sha256: &'a str,
+    pub format_version: u8,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DevClientConfirmed {
+    pub source: String,
+    pub revision: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    #[allow(dead_code)]
+    pub confirmed_at: String,
+}
+
+pub fn confirm_dev_client(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+    input: &DevClientConfirmInput<'_>,
+) -> Result<DevClientConfirmed, ApiError> {
+    let endpoint = format!(
+        "{}/v1/modules/{}/dev-client/confirm",
+        apps_base.trim_end_matches('/'),
+        module_id
+    );
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .json(input)
+        .send()?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<DevClientConfirmed>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
 /// Body of a successful `POST /v1/auth/sessions/refresh`. The platform
 /// rotates the refresh token on every refresh (replay defense), so we
 /// must persist the new one back to credentials. expires_at is RFC3339
@@ -3088,6 +3185,118 @@ mod tests {
             }
             other => panic!("expected Server, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn presign_dev_client_binds_exact_session_and_artifact() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/dev-client/presign")
+            .match_header("authorization", "Bearer AT")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"session_id":"session-1","size_bytes":512,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","format_version":1}"#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "upload_url": "https://s3.example/put?secret=redacted",
+                    "key": "dev-client/uploads/mod-uuid/session/sha.tgz",
+                    "headers": {"Content-Type": "application/octet-stream"},
+                    "expires_at": "2026-08-22T00:01:00Z"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let response = presign_dev_client(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            &DevClientPresignInput {
+                session_id: "session-1",
+                size_bytes: 512,
+                sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                format_version: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.headers["Content-Type"], "application/octet-stream");
+        assert!(response.upload_url.contains("secret=redacted"));
+    }
+
+    #[test]
+    fn confirm_dev_client_repeats_presigned_declaration() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/dev-client/confirm")
+            .match_header("authorization", "Bearer AT")
+            .match_body(mockito::Matcher::JsonString(
+                r#"{"key":"dev-client/uploads/mod-uuid/session/sha.tgz","session_id":"session-1","size_bytes":512,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","format_version":1}"#.into(),
+            ))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "source": "tunnel",
+                    "revision": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size_bytes": 512,
+                    "confirmed_at": "2026-08-22T00:00:00Z"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let response = confirm_dev_client(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            &DevClientConfirmInput {
+                key: "dev-client/uploads/mod-uuid/session/sha.tgz",
+                session_id: "session-1",
+                size_bytes: 512,
+                sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                format_version: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.source, "tunnel");
+        assert!(response.revision.starts_with("sha256:"));
+        assert_eq!(response.size_bytes, 512);
+    }
+
+    #[test]
+    fn confirm_dev_client_preserves_superseded_session_code() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/dev-client/confirm")
+            .with_status(409)
+            .with_body(r#"{"error":{"code":"tunnel_session_superseded","message":"session was replaced"}}"#)
+            .create();
+
+        let error = confirm_dev_client(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            &DevClientConfirmInput {
+                key: "key",
+                session_id: "old",
+                size_bytes: 1,
+                sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                format_version: 1,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApiError::Server { status: 409, ref code, .. }
+                if code == "tunnel_session_superseded"
+        ));
     }
 
     #[test]

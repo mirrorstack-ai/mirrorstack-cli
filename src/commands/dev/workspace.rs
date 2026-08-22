@@ -18,6 +18,27 @@ pub(crate) struct WorkspaceModule {
 /// module entries. Fails if `go.work` is missing or contains no `use`
 /// directives.
 pub(crate) fn discover_modules(root: &Path) -> Result<Vec<WorkspaceModule>> {
+    let modules = discover_module_entries(root)?;
+    for module in &modules {
+        if !module.abs_dir.join("main.go").exists() {
+            return Err(anyhow!(
+                "module {} has no main.go — is it a valid module?",
+                module.abs_dir.display()
+            ));
+        }
+    }
+    Ok(modules)
+}
+
+/// Dev startup historically skips `go.work` entries that are not modules yet.
+/// Keep those entries visible long enough for `dev/mod.rs` to distinguish a
+/// genuine missing `main.go` from a malformed module, while stricter callers
+/// continue using [`discover_modules`].
+pub(super) fn discover_dev_modules(root: &Path) -> Result<Vec<WorkspaceModule>> {
+    discover_module_entries(root)
+}
+
+fn discover_module_entries(root: &Path) -> Result<Vec<WorkspaceModule>> {
     let go_work = root.join("go.work");
     let body =
         fs::read_to_string(&go_work).with_context(|| format!("dev: read {}", go_work.display()))?;
@@ -32,12 +53,6 @@ pub(crate) fn discover_modules(root: &Path) -> Result<Vec<WorkspaceModule>> {
     let mut modules = Vec::with_capacity(dirs.len());
     for rel in dirs {
         let abs = root.join(&rel);
-        if !abs.join("main.go").exists() {
-            return Err(anyhow!(
-                "module {} has no main.go — is it a valid module?",
-                abs.display()
-            ));
-        }
         modules.push(WorkspaceModule {
             dir: PathBuf::from(&rel),
             abs_dir: abs,
