@@ -52,7 +52,7 @@
 //! giving up permanently leaves the other four serving. The shared credentials
 //! are the one thing they contend on, and only on the refresh itself.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -115,6 +115,10 @@ pub(super) struct ReconnectCtx {
     /// Notified on each successful reconnect so the `--share` watcher
     /// re-confirms the session-scoped bundle pointer.
     pub share: Arc<ShareInvalidator>,
+    /// Exact current tunnel identity for session-bound client publication.
+    /// Updated only after a reconnect is fully installed and its service
+    /// token is durable on disk.
+    pub clients: Arc<SessionTracker>,
 }
 
 /// The per-module facts a reconnect replays: who to register as, where the
@@ -454,6 +458,7 @@ fn reconnect(
                 // with the old one; the share watcher's content-hash gate
                 // would never notice, since the bytes did not change.
                 ctx.share.invalidate(&target.slug);
+                ctx.clients.replace(&target.slug, &session_id);
                 eprintln!(
                     "{} [{}] tunnel reconnected (session {})",
                     ok_mark(),
@@ -835,6 +840,50 @@ impl SharedCredentials {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SessionSnapshot {
+    pub session_id: String,
+    pub generation: u64,
+}
+
+/// Current tunnel session per module. Client artifacts are content-addressed,
+/// but their live pointer is session-owned, so a reconnect must force a new
+/// confirmation even when the bytes did not change.
+#[derive(Default)]
+pub(super) struct SessionTracker {
+    sessions: Mutex<HashMap<String, SessionSnapshot>>,
+}
+
+impl SessionTracker {
+    pub(super) fn seed(&self, slug: &str, session_id: &str) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.insert(
+            slug.to_string(),
+            SessionSnapshot {
+                session_id: session_id.to_string(),
+                generation: 0,
+            },
+        );
+    }
+
+    fn replace(&self, slug: &str, session_id: &str) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(current) = sessions.get_mut(slug) else {
+            return;
+        };
+        current.session_id = session_id.to_string();
+        current.generation = current.generation.saturating_add(1);
+    }
+
+    pub(super) fn current(&self, slug: &str) -> Option<SessionSnapshot> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(slug)
+            .cloned()
+    }
+}
+
 /// Slugs whose `--share` bundle pointer must be re-confirmed after a
 /// reconnect. Lives here rather than in `share` so the supervisor can hand one
 /// out even when `--share` is off (nothing drains it; it just stays a handful
@@ -1026,6 +1075,38 @@ mod tests {
         // Draining twice must not re-trigger an upload for bytes that never
         // changed.
         assert!(inv.drain().is_empty());
+    }
+
+    #[test]
+    fn session_tracker_seeds_and_advances_generation() {
+        let tracker = SessionTracker::default();
+        tracker.seed("oauth-core", "session-1");
+
+        assert_eq!(
+            tracker.current("oauth-core"),
+            Some(SessionSnapshot {
+                session_id: "session-1".into(),
+                generation: 0,
+            })
+        );
+
+        tracker.replace("oauth-core", "session-2");
+        assert_eq!(
+            tracker.current("oauth-core"),
+            Some(SessionSnapshot {
+                session_id: "session-2".into(),
+                generation: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn session_tracker_does_not_create_reconnect_state_without_seed() {
+        let tracker = SessionTracker::default();
+
+        tracker.replace("unknown", "session-2");
+
+        assert_eq!(tracker.current("unknown"), None);
     }
 
     #[test]

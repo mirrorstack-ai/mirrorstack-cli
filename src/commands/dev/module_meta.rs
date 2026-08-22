@@ -24,6 +24,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
+/// Local build roots declared by `system.ClientSpec` in the module config.
+/// Both paths are relative: `dir` to the module root and `output_dir` to
+/// `dir`. Package identity is deliberately absent because the platform owns
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClientMeta {
+    pub dir: PathBuf,
+    pub output_dir: PathBuf,
+}
+
 /// All parseable identity fields from a module's main.go.
 #[derive(Debug, Clone)]
 pub(crate) struct ModuleMeta {
@@ -33,6 +43,7 @@ pub(crate) struct ModuleMeta {
     /// Newest `Config.Versions` map key, verbatim (e.g. "v0.1.0-dev").
     /// None when the map is absent or has no SemVer-shaped keys.
     pub version: Option<String>,
+    pub client: Option<ClientMeta>,
 }
 
 /// Read ID, Slug, Name, and the newest version for `module_dir`. Slug, Name,
@@ -53,12 +64,351 @@ pub(crate) fn read_module_meta(module_dir: &Path, root: &Path) -> Result<ModuleM
     let id = read_env_module_id(root, &slug);
     let name = extract_field(&body, "Name").unwrap_or_else(|| slug.clone());
     let version = latest_version(&extract_versions_keys(&body));
+    let client = extract_client_meta(&body)
+        .with_context(|| format!("dev: invalid Client declaration in {}", path.display()))?;
     Ok(ModuleMeta {
         id,
         slug,
         name,
         version,
+        client,
     })
+}
+
+/// Extract the literal `Client: &system.ClientSpec{...}` declaration. Dev has
+/// to know the build roots before the module process exists, so accepting a Go
+/// expression here would make the CLI guess at runtime. A declared client is
+/// therefore intentionally a small literal contract.
+fn extract_client_meta(go_source: &str) -> Result<Option<ClientMeta>> {
+    let source = strip_go_comments(go_source);
+    let Some(config) = config_literal(&source) else {
+        return Ok(None);
+    };
+    let Some((_, value_start)) = find_struct_field(config, "Client") else {
+        return Ok(None);
+    };
+    let after = config[value_start..].trim_start();
+    if let Some(rest) = after.strip_prefix("nil") {
+        let rest = rest.trim_start();
+        if rest.starts_with(',') || rest.starts_with('}') {
+            return Ok(None);
+        }
+    }
+    let open = after
+        .find('{')
+        .ok_or_else(|| anyhow!("Client must be a literal &system.ClientSpec{{...}} declaration"))?;
+    let declaration = after[..open].trim();
+    if !declaration.starts_with('&') || !declaration.ends_with("ClientSpec") {
+        return Err(anyhow!(
+            "Client must be a literal &system.ClientSpec{{...}} declaration"
+        ));
+    }
+    let block = braced_block(&after[open..])
+        .ok_or_else(|| anyhow!("ClientSpec literal has unbalanced braces"))?;
+    let dir = extract_struct_string_field(block, "Dir")
+        .ok_or_else(|| anyhow!("Client.Dir must be a non-empty string literal"))?;
+    let output_dir = extract_struct_string_field(block, "OutputDir")
+        .ok_or_else(|| anyhow!("Client.OutputDir must be a non-empty string literal"))?;
+
+    Ok(Some(ClientMeta {
+        dir: canonical_relative_path(&dir, "Client.Dir")?,
+        output_dir: canonical_relative_path(&output_dir, "Client.OutputDir")?,
+    }))
+}
+
+/// Find the SDK `Config{...}` literal used by the module. Keeping the client
+/// scan inside this block prevents an unrelated `Client:` field or a quoted
+/// example elsewhere in main.go from opting the module in. The SDK import may
+/// use an explicit alias, and a type reference before the literal must not
+/// stop the scan.
+fn config_literal(source: &str) -> Option<&str> {
+    let mut aliases = Vec::new();
+    const SDK_IMPORT: &str = "\"github.com/mirrorstack-ai/app-module-sdk\"";
+    for line in source.lines() {
+        let Some(import_offset) = line.find(SDK_IMPORT) else {
+            continue;
+        };
+        let prefix = line[..import_offset].trim();
+        let alias = prefix.split_whitespace().last().unwrap_or("mirrorstack");
+        let alias = if alias == "import" || alias.is_empty() {
+            "mirrorstack"
+        } else {
+            alias
+        };
+        if alias != "_"
+            && alias != "."
+            && alias
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            && !aliases.iter().any(|candidate| candidate == alias)
+        {
+            aliases.push(alias.to_string());
+        }
+    }
+    // Older parser tests and generated snippets may omit their import block;
+    // generated MirrorStack modules historically use the explicit `ms` alias.
+    if aliases.is_empty() {
+        aliases.push("ms".to_string());
+    }
+
+    let mut best: Option<(usize, &str)> = None;
+    for alias in aliases {
+        let needle = format!("{alias}.Config");
+        let mut cursor = 0usize;
+        while cursor < source.len() {
+            let Some(relative) = find_unquoted(&source[cursor..], &needle) else {
+                break;
+            };
+            let label = cursor + relative;
+            let token_end = label + needle.len();
+            let before_is_identifier = label
+                .checked_sub(1)
+                .and_then(|index| source.as_bytes().get(index))
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+            let after_is_identifier = source
+                .as_bytes()
+                .get(token_end)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_');
+            if !before_is_identifier && !after_is_identifier {
+                let after = source[token_end..].trim_start();
+                if after.starts_with('{')
+                    && let Some(block) = braced_block(after)
+                    && find_struct_field(block, "Slug").is_some()
+                    && best.is_none_or(|(best_offset, _)| label < best_offset)
+                {
+                    best = Some((label, block));
+                }
+            }
+            cursor = token_end;
+        }
+    }
+    best.map(|(_, block)| block)
+}
+
+fn find_unquoted(source: &str, needle: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut index = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active) = quote {
+            if active != b'`' && !escaped && byte == b'\\' {
+                escaped = true;
+            } else {
+                if !escaped && byte == active {
+                    quote = None;
+                }
+                escaped = false;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(byte, b'"' | b'\'' | b'`') {
+            quote = Some(byte);
+            index += 1;
+            continue;
+        }
+        if source.is_char_boundary(index) && source[index..].starts_with(needle) {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Locate an exact field at depth one of a Go struct literal and return the
+/// field and value byte offsets. Nested structs/maps cannot impersonate a
+/// top-level Config field.
+fn find_struct_field(block: &str, field: &str) -> Option<(usize, usize)> {
+    let bytes = block.as_bytes();
+    let mut index = 0usize;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active) = quote {
+            if active != b'`' && !escaped && byte == b'\\' {
+                escaped = true;
+            } else {
+                if !escaped && byte == active {
+                    quote = None;
+                }
+                escaped = false;
+            }
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' | b'`' => {
+                quote = Some(byte);
+                index += 1;
+                continue;
+            }
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth == 1
+            && block.is_char_boundary(index)
+            && block[index..].starts_with(field)
+            && index
+                .checked_sub(1)
+                .and_then(|before| bytes.get(before))
+                .is_none_or(|before| !before.is_ascii_alphanumeric() && *before != b'_')
+        {
+            let mut cursor = index + field.len();
+            while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+                cursor += 1;
+            }
+            if bytes.get(cursor) == Some(&b':') {
+                return Some((index, cursor + 1));
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Read an exact `Field: "value"` member from one struct literal. The
+/// identifier boundaries matter: `Dir` must not match the suffix of
+/// `OutputDir` when the required Dir field is absent.
+fn extract_struct_string_field(block: &str, field: &str) -> Option<String> {
+    let bytes = block.as_bytes();
+    let (_, mut cursor) = find_struct_field(block, field)?;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b'"') {
+        return None;
+    }
+    cursor += 1;
+    let value_start = cursor;
+    while let Some(byte) = bytes.get(cursor) {
+        if *byte == b'\\' {
+            // Paths containing escapes are not part of the literal
+            // cross-language contract; require the written value.
+            return None;
+        }
+        if *byte == b'"' {
+            let value = &block[value_start..cursor];
+            return (!value.is_empty()).then(|| value.to_string());
+        }
+        cursor += 1;
+    }
+    None
+}
+
+fn canonical_relative_path(value: &str, field: &str) -> Result<PathBuf> {
+    if value.is_empty() || value.contains(['\\', ':', '\0']) {
+        return Err(anyhow!("{field} must be a canonical relative slash path"));
+    }
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return Err(anyhow!("{field} must be relative"));
+    }
+    let mut normal = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => normal.push(part.to_string_lossy()),
+            _ => return Err(anyhow!("{field} must not contain '.' or '..' components")),
+        }
+    }
+    if normal.is_empty() || normal.join("/") != value {
+        return Err(anyhow!("{field} must be a canonical relative slash path"));
+    }
+    Ok(path.to_path_buf())
+}
+
+/// Return the first balanced `{...}` block, ignoring braces inside quoted Go
+/// strings. The returned slice includes both braces.
+fn braced_block(source: &str) -> Option<&str> {
+    if !source.starts_with('{') {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if let Some(active) = quote {
+            if active != b'`' && !escaped && byte == b'\\' {
+                escaped = true;
+                continue;
+            }
+            if !escaped && byte == active {
+                quote = None;
+            }
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' | b'`' => quote = Some(byte),
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&source[..=index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Remove Go comments while preserving newlines and quoted strings. This is
+/// enough to keep a documentation example from becoming a fake ClientSpec;
+/// it is not intended to replace the Go parser used by the compiler.
+fn strip_go_comments(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut quote = None;
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if let Some(active) = quote {
+            out.push(ch);
+            if active != '`' && !escaped && ch == '\\' {
+                escaped = true;
+            } else {
+                if !escaped && ch == active {
+                    quote = None;
+                }
+                escaped = false;
+            }
+            continue;
+        }
+        if matches!(ch, '"' | '\'' | '`') {
+            quote = Some(ch);
+            out.push(ch);
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'/') {
+            chars.next();
+            while chars.next_if(|next| *next != '\n').is_some() {
+                out.push(' ');
+            }
+            continue;
+        }
+        if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            while let Some(next) = chars.next() {
+                if next == '\n' {
+                    out.push('\n');
+                    continue;
+                }
+                if next == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    break;
+                }
+                out.push(' ');
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Convenience wrapper that returns just the ID (for tunnel registration).
@@ -131,6 +481,25 @@ pub(crate) fn env_key_for_slug(slug: &str) -> String {
         "MS_MODULE_ID_{}",
         slug.to_ascii_uppercase().replace('-', "_")
     )
+}
+
+/// REST catalog routes use dashed UUIDs, while module runtimes store the
+/// equivalent sanitized `m<32-hex>` identifier. Values already in catalog
+/// form (or invalid values for the server to reject) pass through unchanged.
+pub(super) fn catalog_uuid(module_id: &str) -> String {
+    let hex = module_id.strip_prefix('m').unwrap_or(module_id);
+    if hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        )
+    } else {
+        module_id.to_string()
+    }
 }
 
 /// Read `MS_MODULE_ID_<SLUG>` out of `<root>/.env`. Returns an empty string
@@ -526,6 +895,196 @@ func main() {
     }
 }
 "#;
+
+    const CLIENT_MAIN_GO: &str = r#"
+package main
+
+func main() {
+    ms.Init(ms.Config{
+        Slug: "media",
+        Name: "Media",
+        Client: &system.ClientSpec{
+            Dir:       "client",
+            OutputDir: "dist",
+        },
+    })
+}
+"#;
+
+    #[test]
+    fn client_spec_is_absent_when_not_declared() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.go"), SAMPLE_MAIN_GO).unwrap();
+
+        let meta = read_module_meta(tmp.path(), tmp.path()).unwrap();
+
+        assert!(meta.client.is_none());
+    }
+
+    #[test]
+    fn client_spec_reads_literal_relative_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.go"), CLIENT_MAIN_GO).unwrap();
+
+        let meta = read_module_meta(tmp.path(), tmp.path()).unwrap();
+
+        assert_eq!(
+            meta.client,
+            Some(ClientMeta {
+                dir: PathBuf::from("client"),
+                output_dir: PathBuf::from("dist"),
+            })
+        );
+    }
+
+    #[test]
+    fn client_spec_skips_config_type_uses_before_the_literal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = CLIENT_MAIN_GO.replace(
+            "func main() {",
+            "func validate(config ms.Config) {}\n\nfunc main() {",
+        );
+        std::fs::write(tmp.path().join("main.go"), source).unwrap();
+
+        let meta = read_module_meta(tmp.path(), tmp.path()).unwrap();
+
+        assert_eq!(meta.client.unwrap().dir, PathBuf::from("client"));
+    }
+
+    #[test]
+    fn client_spec_supports_an_explicit_sdk_import_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = CLIENT_MAIN_GO
+            .replace(
+                "package main",
+                "package main\n\nimport sdk \"github.com/mirrorstack-ai/app-module-sdk\"",
+            )
+            .replace("ms.Init(ms.Config", "sdk.Init(sdk.Config");
+        std::fs::write(tmp.path().join("main.go"), source).unwrap();
+
+        let meta = read_module_meta(tmp.path(), tmp.path()).unwrap();
+
+        assert_eq!(meta.client.unwrap().output_dir, PathBuf::from("dist"));
+    }
+
+    #[test]
+    fn client_spec_supports_the_sdk_default_import_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = CLIENT_MAIN_GO
+            .replace(
+                "package main",
+                "package main\n\nimport \"github.com/mirrorstack-ai/app-module-sdk\"",
+            )
+            .replace("ms.Init(ms.Config", "mirrorstack.Init(mirrorstack.Config");
+        std::fs::write(tmp.path().join("main.go"), source).unwrap();
+
+        let meta = read_module_meta(tmp.path(), tmp.path()).unwrap();
+
+        assert_eq!(meta.client.unwrap().dir, PathBuf::from("client"));
+    }
+
+    #[test]
+    fn client_spec_accepts_only_the_exact_nil_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = CLIENT_MAIN_GO.replace(
+            "&system.ClientSpec{\n            Dir:       \"client\",\n            OutputDir: \"dist\",\n        }",
+            "nil",
+        );
+        std::fs::write(tmp.path().join("main.go"), &absent).unwrap();
+        assert!(
+            read_module_meta(tmp.path(), tmp.path())
+                .unwrap()
+                .client
+                .is_none()
+        );
+
+        let invalid = absent.replace("Client: nil", "Client: nilClient");
+        std::fs::write(tmp.path().join("main.go"), invalid).unwrap();
+        let error = format!(
+            "{:#}",
+            read_module_meta(tmp.path(), tmp.path())
+                .expect_err("nil-prefixed expressions are not the nil literal")
+        );
+        assert!(error.contains("literal"), "{error}");
+    }
+
+    #[test]
+    fn client_spec_ignores_commented_example() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = r#"
+package main
+// Client: &system.ClientSpec{Dir: "client", OutputDir: "dist"},
+func main() { ms.Init(ms.Config{Slug: "media", Name: "Media"}) }
+"#;
+        std::fs::write(tmp.path().join("main.go"), source).unwrap();
+
+        let meta = read_module_meta(tmp.path(), tmp.path()).unwrap();
+
+        assert!(meta.client.is_none());
+    }
+
+    #[test]
+    fn client_spec_ignores_quoted_and_unrelated_client_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = r#"
+package main
+var note = `Client: &system.ClientSpec{Dir: "wrong", OutputDir: "wrong"}`
+var other = OtherConfig{Client: &HTTPClient{}}
+func main() {
+    ms.Init(ms.Config{
+        Slug: "media",
+        Name: "Media",
+        Other: OtherConfig{Client: &HTTPClient{}},
+    })
+}
+"#;
+        std::fs::write(tmp.path().join("main.go"), source).unwrap();
+
+        let meta = read_module_meta(tmp.path(), tmp.path()).unwrap();
+
+        assert!(meta.client.is_none());
+    }
+
+    #[test]
+    fn client_spec_does_not_read_dir_from_output_dir_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = CLIENT_MAIN_GO.replace("Dir:       \"client\",\n", "");
+        std::fs::write(tmp.path().join("main.go"), source).unwrap();
+
+        let error = format!(
+            "{:#}",
+            read_module_meta(tmp.path(), tmp.path()).expect_err("Client.Dir is required")
+        );
+
+        assert!(error.contains("Client.Dir"), "{error}");
+    }
+
+    #[test]
+    fn client_spec_rejects_unsafe_or_noncanonical_paths() {
+        for (dir, output) in [
+            ("", "dist"),
+            ("/client", "dist"),
+            ("C:/client", "dist"),
+            ("../client", "dist"),
+            ("client/./src", "dist"),
+            ("client\\src", "dist"),
+            ("client", ""),
+            ("client", "../dist"),
+            ("client", "dist/"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let source = CLIENT_MAIN_GO
+                .replace("Dir:       \"client\"", &format!("Dir:       \"{dir}\""))
+                .replace("OutputDir: \"dist\"", &format!("OutputDir: \"{output}\""));
+            std::fs::write(tmp.path().join("main.go"), source).unwrap();
+
+            let error = read_module_meta(tmp.path(), tmp.path())
+                .expect_err("unsafe client path must fail")
+                .to_string();
+
+            assert!(error.contains("Client"), "{dir:?}/{output:?}: {error}");
+        }
+    }
 
     #[test]
     fn extract_field_id() {

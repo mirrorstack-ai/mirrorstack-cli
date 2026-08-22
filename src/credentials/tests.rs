@@ -126,6 +126,9 @@ fn credentials_lifecycle() {
     // Refresh itself 401s (revoked/expired session): the original
     // Unauthenticated is returned and the call is NOT retried.
     {
+        // Keep this case independent from the live rotated pair written by
+        // the preceding case; otherwise coordination correctly adopts RT2.
+        delete().expect("clear preceding refresh");
         let mut server = Server::new();
         let _refresh = server
             .mock("POST", "/v1/auth/sessions/refresh")
@@ -148,6 +151,53 @@ fn credentials_lifecycle() {
     }
 
     unsafe { std::env::remove_var("MIRRORSTACK_API_URL") };
+}
+
+#[test]
+fn concurrent_refreshes_spend_one_rotating_token() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread;
+
+    let _env = TEST_ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let config = tempfile::tempdir().unwrap();
+    let _restore = redirect_config_dir(config.path());
+    let refreshes = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, entered_rx) = mpsc::channel();
+
+    let first_count = refreshes.clone();
+    let first = thread::spawn(move || {
+        refresh_and_save_with("RT1", move |token| {
+            assert_eq!(token, "RT1");
+            first_count.fetch_add(1, Ordering::SeqCst);
+            entered_tx.send(()).unwrap();
+            thread::sleep(Duration::from_millis(100));
+            Ok(Credentials {
+                access_token: "AT2".into(),
+                refresh_token: "RT2".into(),
+                expires_at: SystemTime::now() + Duration::from_secs(900),
+            })
+        })
+    });
+    entered_rx.recv().unwrap();
+
+    let second_count = refreshes.clone();
+    let second = thread::spawn(move || {
+        refresh_and_save_with("RT1", move |_| {
+            second_count.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("a waiting process must adopt the rotated pair")
+        })
+    });
+
+    let first = first.join().unwrap().unwrap();
+    let second = second.join().unwrap().unwrap();
+    assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(first.refresh_token, "RT2");
+    assert_eq!(second.access_token, first.access_token);
+    assert_eq!(second.refresh_token, first.refresh_token);
+    assert_eq!(load().unwrap(), second);
 }
 
 /// Happy path needs no network: the call succeeds on the first token, so

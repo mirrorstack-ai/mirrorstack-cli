@@ -676,10 +676,10 @@ async fn tunnel_loop(
                 )
                 .await;
                 let ping = Frame::new(FrameType::Ping, ping_payload(hash.as_deref()));
-                if let Ok(body) = serde_json::to_string(&ping) {
-                    if let Err(e) = sink.send(Message::Text(body)).await {
-                        return TunnelExit::Lost(format!("heartbeat ping send failed: {e}"));
-                    }
+                if let Ok(body) = serde_json::to_string(&ping)
+                    && let Err(e) = sink.send(Message::Text(body)).await
+                {
+                    return TunnelExit::Lost(format!("heartbeat ping send failed: {e}"));
                 }
             }
             Some(reply) = rx.recv() => {

@@ -54,6 +54,7 @@ use super::{
 };
 use crate::{api, credentials, http};
 
+mod client;
 mod log_shipper;
 pub(crate) mod module_meta;
 mod proxy;
@@ -62,6 +63,8 @@ mod share;
 mod supervisor;
 mod tunnel;
 pub(crate) mod workspace;
+
+const COMPOSE_UP_ARGS: [&str; 4] = ["compose", "up", "--build", "--force-recreate"];
 
 // MS_INTERNAL_SECRET is deliberately absent: append_passthrough_env runs after
 // module_process_envs, and Command::env is last-wins. Forwarding a shared
@@ -99,7 +102,9 @@ pub struct DevArgs {
     /// Working directory containing go.work.
     #[arg(long)]
     dir: Option<PathBuf>,
-    /// Open WSS tunnels so deployed callers can reach local modules.
+    /// Open WSS tunnels so deployed callers can reach local modules. Declared
+    /// module clients are built and published automatically; --share is not
+    /// required for them.
     #[arg(long)]
     tunnel: bool,
     /// Base URL for tunnel routing. Default: http://localhost.
@@ -230,16 +235,64 @@ pub fn run(args: DevArgs) -> Result<()> {
 
 // ── Outer mode: host runs `docker compose up` ───────────────────────
 
+#[derive(Debug)]
+struct WorkspaceMetadata {
+    parsed: Vec<(workspace::WorkspaceModule, module_meta::ModuleMeta)>,
+    missing_main: Vec<workspace::WorkspaceModule>,
+}
+
+fn read_workspace_metadata(
+    root: &Path,
+    modules: &[workspace::WorkspaceModule],
+) -> Result<WorkspaceMetadata> {
+    let mut parsed = Vec::with_capacity(modules.len());
+    let mut missing_main = Vec::new();
+    for module in modules {
+        let main_go = module.abs_dir.join("main.go");
+        match std::fs::metadata(&main_go) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing_main.push(module.clone());
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("dev: inspect {}", main_go.display()));
+            }
+            Ok(_) => {}
+        }
+        let meta = module_meta::read_module_meta(&module.abs_dir, root)
+            .with_context(|| format!("dev: validate module {}", module.dir.display()))?;
+        parsed.push((module.clone(), meta));
+    }
+    Ok(WorkspaceMetadata {
+        parsed,
+        missing_main,
+    })
+}
+
 fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
-    let all_modules = workspace::discover_modules(root)?;
+    // A workspace has one compose project and one bind-mounted control plane.
+    // Hold this through compose teardown so concurrent outer invocations can
+    // never consume each other's tunnel/client markers or credentials.
+    let _workspace_lock = client::lock_workspace(root)?;
+    let all_modules = workspace::discover_dev_modules(root)?;
+    let metadata = read_workspace_metadata(root, &all_modules)?;
 
     let mut ready = Vec::new();
     let mut skipped = Vec::new();
-    for m in &all_modules {
-        match module_meta::read_module_meta(&m.abs_dir, root) {
-            Ok(meta) if !meta.id.is_empty() => ready.push(m.clone()),
-            Ok(meta) => skipped.push((m.dir.display().to_string(), meta.slug)),
-            Err(_) => skipped.push((m.dir.display().to_string(), String::new())),
+    skipped.extend(metadata.missing_main.into_iter().map(|module| {
+        (
+            module.dir.display().to_string(),
+            "no main.go — add it to make this go.work entry a module",
+        )
+    }));
+    for (module, meta) in metadata.parsed {
+        if meta.id.is_empty() {
+            skipped.push((
+                module.dir.display().to_string(),
+                "no ID — if the slug was renamed, use `mirrorstack app module rename`; register is only for a brand-new module",
+            ));
+        } else {
+            ready.push(module);
         }
     }
 
@@ -253,12 +306,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     for m in &ready {
         eprintln!("  {} {}", style("✓").green(), m.dir.display());
     }
-    for (dir, slug) in &skipped {
-        let reason = if slug.is_empty() {
-            "no main.go"
-        } else {
-            "no ID — if the slug was renamed, use `mirrorstack app module rename`; register is only for a brand-new module"
-        };
+    for (dir, reason) in &skipped {
         eprintln!(
             "  {} {} ({})",
             style("–").yellow(),
@@ -283,6 +331,27 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
             warn_prefix()
         );
     }
+
+    // Compose files created before the outer/inner split commonly hardcode
+    // `mirrorstack dev --all --watch`. Publish the host's explicit choice over
+    // the bind-mounted control directory so both `--watch` and
+    // `--watch=false` survive that compatibility command unchanged.
+    let _watch_mode = client::WatchModeGuard::publish(root, args.watch)?;
+
+    // Declaring a client opts a tunnel run into the host/runner publication
+    // handshake. The marker is written before compose starts so the inner
+    // runner can build with its Node toolchain; local-only dev never creates
+    // it and keeps the existing module-only behavior.
+    let client_run = if args.tunnel {
+        client::ClientRun::prepare(root, &ready)?
+    } else {
+        client::disable(root)?;
+        None
+    };
+    let previous_runner_instances = match client_run.as_ref() {
+        Some(_) => client::existing_runner_instances(root)?,
+        None => Default::default(),
+    };
 
     // Per-module platform-token and internal-secret files. Each tunnel session gets its OWN
     // dispatch-minted service token, so each module process must read the
@@ -323,12 +392,14 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     // on; with the watcher absent nothing drains it and it stays a handful of
     // slugs.
     let share_invalidator = Arc::new(supervisor::ShareInvalidator::default());
+    let client_sessions = Arc::new(supervisor::SessionTracker::default());
 
     // Register tunnels before compose so auth failures surface early.
     let tunnel_state = if args.tunnel {
         let opened = open_tunnels(root, &ready, args.local_url.as_deref(), &internal_secrets)?;
         // `open_tunnels` builds sessions and targets together, so zip is aligned.
         for (target, session) in opened.targets.iter().zip(opened.sessions.iter()) {
+            client_sessions.seed(&target.slug, &session.handle.session_id);
             supervisor::write_platform_token(
                 &target.token_file,
                 &session.handle.service_token,
@@ -356,6 +427,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
                 // other's.
                 creds: supervisor::SharedCredentials::new(opened.creds),
                 share: share_invalidator.clone(),
+                clients: client_sessions.clone(),
             },
         ))
     } else {
@@ -402,7 +474,9 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     eprintln!("{} starting docker compose…", ok_mark());
     let mut compose = Command::new("docker");
     compose
-        .args(["compose", "up", "--build"])
+        // The outer workspace lock dies with this process, but containers can
+        // survive a crash. A fresh runner must consume this run's new pointer.
+        .args(COMPOSE_UP_ARGS)
         .current_dir(root)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
@@ -414,12 +488,68 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         compose.env("MS_SKIP_CAPABILITY_CHECK", "1");
     }
 
-    let compose_status = compose.status().map_err(|e| match e.kind() {
+    let mut compose_child = compose.spawn().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => {
             anyhow!("`docker` not found on PATH. Install Docker Desktop before running dev.")
         }
         _ => anyhow!("dev: docker compose up: {e}"),
     })?;
+
+    // Initial publication is a startup gate: a declared client must be
+    // installable before this tunnel is reported healthy. Start the publisher
+    // first so each confirmed target becomes supervised immediately, even
+    // while a later target is still building. The runner handshake prevents a
+    // stale bind-mounted `.mirrorstack-linux` from turning that wait into the
+    // generic ten-minute build timeout.
+    let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
+    let mut client_error = None;
+    let client_publisher = match client_run.as_ref() {
+        Some(run) => {
+            match client::await_runner(run, &mut compose_child, root, &previous_runner_instances)
+                .and_then(|()| {
+                    let publisher = client::spawn_publisher(
+                        run.run_id().to_string(),
+                        client_sessions.clone(),
+                        apps_base.clone(),
+                    )?;
+                    match client::publish_initial(
+                        run,
+                        &client_sessions,
+                        &mut compose_child,
+                        &apps_base,
+                        &publisher,
+                    ) {
+                        Ok(()) => Ok(publisher),
+                        Err(error) => {
+                            publisher.shutdown();
+                            Err(error)
+                        }
+                    }
+                }) {
+                Ok(publisher) => Some(publisher),
+                Err(error) => {
+                    client_error = Some(error);
+                    if let Err(stop_error) = stop_compose(root) {
+                        eprintln!(
+                            "{} graceful compose teardown failed: {stop_error:#}",
+                            warn_prefix()
+                        );
+                        let _ = compose_child.kill();
+                    }
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
+    let compose_status = compose_child
+        .wait()
+        .context("dev: wait for docker compose")?;
+
+    if let Some(publisher) = client_publisher {
+        publisher.shutdown();
+    }
 
     // Stop the share watcher and let its current scan drain before we return.
     if let Some((stop, handle)) = share_state {
@@ -448,6 +578,10 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     }
     if args.skip_capability_check {
         let _ = std::fs::remove_file(skip_file);
+    }
+
+    if let Some(error) = client_error {
+        return Err(error);
     }
 
     if !dead_slugs.is_empty() {
@@ -524,17 +658,29 @@ struct ModuleSpec {
 }
 
 fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
-    let all_modules = workspace::discover_modules(root)?;
+    let watch = client::effective_watch(root, args.watch)?;
+    let all_modules = workspace::discover_dev_modules(root)?;
+    let metadata = read_workspace_metadata(root, &all_modules)?;
 
     // Ready modules carry their platform id so the shipper sink below
     // doesn't have to re-parse main.go per module.
     let mut ready = Vec::new();
-    for m in &all_modules {
-        match module_meta::read_module_meta(&m.abs_dir, root) {
-            Ok(meta) if !meta.id.is_empty() => ready.push((m.clone(), meta.id)),
-            _ => {
-                eprintln!("{} skipping {} (no ID)", warn_prefix(), m.dir.display());
-            }
+    for module in metadata.missing_main {
+        eprintln!(
+            "{} skipping {} (no main.go)",
+            warn_prefix(),
+            module.dir.display()
+        );
+    }
+    for (module, meta) in metadata.parsed {
+        if meta.id.is_empty() {
+            eprintln!(
+                "{} skipping {} (no ID)",
+                warn_prefix(),
+                module.dir.display()
+            );
+        } else {
+            ready.push((module, meta.id));
         }
     }
 
@@ -580,10 +726,12 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
         } else {
             "modules"
         },
-        if args.watch { " (hot-reload)" } else { "" }
+        if watch { " (hot-reload)" } else { "" }
     );
 
     let stop = Arc::new(AtomicBool::new(false));
+    let client_modules: Vec<_> = ready.iter().map(|(module, _)| module.clone()).collect();
+    let client_builders = client::build_in_runner(root, &client_modules, watch, stop.clone())?;
     let web_children: Arc<Mutex<Vec<Child>>> = Arc::new(Mutex::new(Vec::new()));
     let mut supervisors = Vec::new();
     let mut routes: HashMap<String, u16> = HashMap::new();
@@ -641,22 +789,27 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
             bin: std::env::temp_dir().join(format!("ms-dev-{slug}")),
             envs,
             sink,
-            watch: args.watch,
+            watch,
             stop: stop.clone(),
         };
         supervisors.push(thread::spawn(move || supervise_module(spec)));
 
         if m.abs_dir.join("web/esbuild.config.mjs").exists() {
-            eprintln!(
-                "  {} {} web watcher (esbuild + livereload :{})",
-                style("✓").green(),
-                slug,
-                lr_port
-            );
-            spawn_web_watcher(
+            if watch {
+                eprintln!(
+                    "  {} {} web watcher (esbuild + livereload :{})",
+                    style("✓").green(),
+                    slug,
+                    lr_port
+                );
+            } else {
+                eprintln!("  {} {} web build (one-shot)", style("✓").green(), slug);
+            }
+            spawn_web_builder(
                 slug,
                 m.abs_dir.join("web"),
                 lr_port,
+                watch,
                 web_children.clone(),
                 stop.clone(),
             );
@@ -710,6 +863,9 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
     // then the esbuild watchers go.
     stop.store(true, Ordering::SeqCst);
     for h in supervisors {
+        let _ = h.join();
+    }
+    for h in client_builders {
         let _ = h.join();
     }
     for child in web_children.lock().unwrap().iter_mut() {
@@ -957,19 +1113,19 @@ fn supervise_module(spec: ModuleSpec) {
             break;
         }
 
-        if let Some(c) = child.as_mut() {
-            if let Ok(Some(status)) = c.try_wait() {
-                eprintln!(
-                    "{} module {} exited ({})",
-                    warn_prefix(),
-                    label,
-                    status
-                        .code()
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "signal".into())
-                );
-                child = None;
-            }
+        if let Some(c) = child.as_mut()
+            && let Ok(Some(status)) = c.try_wait()
+        {
+            eprintln!(
+                "{} module {} exited ({})",
+                warn_prefix(),
+                label,
+                status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "signal".into())
+            );
+            child = None;
         }
 
         // One-shot mode ends with the module; watch mode keeps polling so
@@ -978,19 +1134,19 @@ fn supervise_module(spec: ModuleSpec) {
             return;
         }
 
-        if let Some(prev) = sig.as_mut() {
-            if last_scan.elapsed() >= REBUILD_POLL {
-                last_scan = Instant::now();
-                let next = reload::scan(&spec.dir);
-                if *prev != next {
-                    *prev = next;
-                    eprintln!("{} {} changed — rebuilding…", ok_mark(), label);
-                    if build_module(&spec, label) {
-                        if let Some(mut old) = child.take() {
-                            kill_wait(&mut old);
-                        }
-                        child = start_module(&spec, label);
+        if let Some(prev) = sig.as_mut()
+            && last_scan.elapsed() >= REBUILD_POLL
+        {
+            last_scan = Instant::now();
+            let next = reload::scan(&spec.dir);
+            if *prev != next {
+                *prev = next;
+                eprintln!("{} {} changed — rebuilding…", ok_mark(), label);
+                if build_module(&spec, label) {
+                    if let Some(mut old) = child.take() {
+                        kill_wait(&mut old);
                     }
+                    child = start_module(&spec, label);
                 }
             }
         }
@@ -1007,6 +1163,24 @@ fn supervise_module(spec: ModuleSpec) {
 fn kill_wait(c: &mut Child) {
     let _ = c.kill();
     let _ = c.wait();
+}
+
+/// Stop the compose project through Docker so the `compose up` frontend can
+/// run its own shutdown path. Killing that frontend directly can leave the
+/// runner, database, and network alive after a client startup failure.
+fn stop_compose(root: &Path) -> Result<()> {
+    let status = Command::new("docker")
+        .args(["compose", "down", "--remove-orphans"])
+        .current_dir(root)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("dev: run docker compose down")?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!("docker compose down exited with {status}"))
+    }
 }
 
 /// Base env vars every spawned module process gets: local DB, its
@@ -1129,15 +1303,26 @@ fn start_module(spec: &ModuleSpec, label: &'static str) -> Option<Child> {
     }
 }
 
-/// `npm install --silent` then `node esbuild.config.mjs --watch` with
-/// LR_PORT, mirroring the shell runner. The module's own esbuild config
-/// hosts the SSE livereload server — the runner only sets LR_PORT. Output
-/// is prefixed `[<slug>:web]` and stays terminal-only (the shell runner
-/// never shipped web-watcher lines either).
-fn spawn_web_watcher(
+const WEB_BUILD_ARGS: [&str; 1] = ["esbuild.config.mjs"];
+const WEB_WATCH_ARGS: [&str; 2] = ["esbuild.config.mjs", "--watch"];
+
+fn web_build_args(watch: bool) -> &'static [&'static str] {
+    if watch {
+        &WEB_WATCH_ARGS
+    } else {
+        &WEB_BUILD_ARGS
+    }
+}
+
+/// `npm install --silent` then `node esbuild.config.mjs`, adding `--watch`
+/// only for hot-reload mode. The module's own esbuild config performs one
+/// initial production build without that flag, or hosts the SSE livereload
+/// server with it. Output is prefixed `[<slug>:web]` and stays terminal-only.
+fn spawn_web_builder(
     slug: String,
     web_dir: PathBuf,
     lr_port: u16,
+    watch: bool,
     children: Arc<Mutex<Vec<Child>>>,
     stop: Arc<AtomicBool>,
 ) {
@@ -1159,7 +1344,7 @@ fn spawn_web_watcher(
         }
         let label: &'static str = Box::leak(format!("{slug}:web").into_boxed_str());
         let spawned = Command::new("node")
-            .args(["esbuild.config.mjs", "--watch"])
+            .args(web_build_args(watch))
             .current_dir(&web_dir)
             .env("LR_PORT", lr_port.to_string())
             .stdout(Stdio::piped())
@@ -1469,6 +1654,82 @@ fn mint_internal_secrets<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn workspace_module(root: &Path, slug: &str, source: &str) -> workspace::WorkspaceModule {
+        let dir = root.join(slug);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.go"), source).unwrap();
+        workspace::WorkspaceModule {
+            dir: PathBuf::from(slug),
+            abs_dir: dir,
+        }
+    }
+
+    #[test]
+    fn compose_runner_is_recreated_after_a_crashed_outer_process() {
+        assert_eq!(
+            COMPOSE_UP_ARGS,
+            ["compose", "up", "--build", "--force-recreate"]
+        );
+    }
+
+    #[test]
+    fn one_shot_web_mode_builds_once_without_starting_a_watcher() {
+        assert_eq!(web_build_args(false), ["esbuild.config.mjs"]);
+        assert_eq!(web_build_args(true), ["esbuild.config.mjs", "--watch"]);
+    }
+
+    #[test]
+    fn missing_main_is_skipped_but_invalid_client_fails_multi_module_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join(".env"),
+            "MS_MODULE_ID_GOOD=11111111-1111-1111-1111-111111111111\nMS_MODULE_ID_BROKEN=22222222-2222-2222-2222-222222222222\n",
+        )
+        .unwrap();
+        let good = workspace_module(
+            temp.path(),
+            "good",
+            r#"package main
+import mirrorstack "github.com/mirrorstack-ai/app-module-sdk"
+var _ = mirrorstack.Config{Slug: "good", Name: "Good"}
+"#,
+        );
+        let broken = workspace_module(
+            temp.path(),
+            "broken",
+            r#"package main
+import mirrorstack "github.com/mirrorstack-ai/app-module-sdk"
+var _ = mirrorstack.Config{
+    Slug: "broken",
+    Name: "Broken",
+    Client: &system.ClientSpec{Dir: "/outside", OutputDir: "dist"},
+}
+"#,
+        );
+        let missing_dir = temp.path().join("not-a-module-yet");
+        std::fs::create_dir_all(&missing_dir).unwrap();
+        let missing = workspace::WorkspaceModule {
+            dir: PathBuf::from("not-a-module-yet"),
+            abs_dir: missing_dir,
+        };
+
+        let compatible = read_workspace_metadata(temp.path(), &[missing.clone(), good.clone()])
+            .expect("a genuinely missing main.go remains skippable");
+        assert_eq!(compatible.missing_main.len(), 1);
+        assert_eq!(compatible.missing_main[0].dir, missing.dir);
+        assert_eq!(compatible.parsed.len(), 1);
+
+        let error = format!(
+            "{:#}",
+            read_workspace_metadata(temp.path(), &[missing, good, broken])
+                .expect_err("an invalid declared client must fail the whole startup")
+        );
+
+        assert!(error.contains("validate module broken"), "{error}");
+        assert!(error.contains("invalid Client declaration"), "{error}");
+        assert!(error.contains("Client.Dir must be relative"), "{error}");
+    }
 
     #[test]
     fn capability_skip_flag_parsing() {
