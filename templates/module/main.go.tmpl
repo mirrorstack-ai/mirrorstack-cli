@@ -1,6 +1,9 @@
-// Package main is a MirrorStack module. All features live in sibling files
-// which register themselves via postInitHooks — main.go never changes when
-// the CLI adds or removes features.
+// Package main is a MirrorStack module.
+//
+// main.go does four things and then stops growing: read the module's identity,
+// load its i18n catalogs, run the two Register() entry points, and start.
+// Adding a feature never edits this file — that is what declare/ and
+// internal/handlers/ are for. See the SDK's docs/concepts/module-structure.md.
 package main
 
 import (
@@ -10,18 +13,16 @@ import (
 
 	ms "github.com/mirrorstack-ai/app-module-sdk"
 	"github.com/mirrorstack-ai/app-module-sdk/system"
+
+	"__MS_SLUG__/declare"
+	"__MS_SLUG__/internal/handlers"
 )
 
 //go:embed sql/*
 var sqlFS embed.FS
 
-// postInitHooks is the extension point every feature file registers into via
-// its own init(). Hooks run after ms.Init (so the default module exists) and
-// before ms.Start (so registrations complete before routes mount).
-//
-// This indirection is the reason the CLI can drop any feature file without
-// editing main.go.
-var postInitHooks []func()
+//go:embed i18n/*.json
+var i18nFS embed.FS
 
 func main() {
 	if err := ms.Init(ms.Config{
@@ -42,30 +43,41 @@ func main() {
 		Description: "Replace this description with your module's purpose.",
 		Icon:        "extension",
 		SQL:         sqlFS,
+		// semver → migration high-water mark, mirroring CHANGELOG.md. The
+		// platform reads this to translate an install/upgrade target into the
+		// (from, to] migration window it runs. Entries are CUMULATIVE: keep
+		// every released version and ADD a new one, never replace. One entry
+		// per CHANGELOG version.
+		//
+		// The `-dev` prerelease tag distinguishes "iterating locally" from
+		// "real release". `mirrorstack app module deploy` prompts to promote
+		// before shipping; CI (--yes) refuses `-dev` versions.
 		Versions: map[string]system.MigrationVersions{
-			// `-dev` prerelease tag distinguishes "iterating locally" from
-			// "real release". `mirrorstack app module deploy` prompts to promote
-			// before shipping; CI (--yes) refuses `-dev` versions.
 			"v0.1.0-dev": {App: "0001"},
 		},
 	}); err != nil {
 		log.Fatalf("mirrorstack: init failed: %v", err)
 	}
 
+	// i18n BEFORE declarations: RegisterPermission resolves ms.T(...) labels
+	// against the loaded catalogs, so a declaration that runs first gets an
+	// unresolved key. This ordering is the reason declare.Register() is an
+	// explicit call and not a pile of init() functions.
+	if err := ms.RegisterMessages(i18nFS, "i18n"); err != nil {
+		log.Fatalf("mirrorstack: i18n load failed: %v", err)
+	}
+
 	// Required deps go here — these become install-time preconditions.
-	// Use @<owner>/<id>@<semver> for the spec; the optional callback
+	// Use @<owner>/<slug>@<semver> for the spec; the optional callback
 	// declares which relations and events this module reads from the dep.
-	// The catalog validates names at install time and surfaces them for
-	// app-owner approval before issuing GRANT SELECT.
 	//
 	//	ms.DependsOn("@anna/oauth@^1.0.0", func(n *ms.Need) {
 	//	    n.Table("oauth_users")
 	//	    n.Event("user.signed_in")
 	//	})
 
-	for _, hook := range postInitHooks {
-		hook()
-	}
+	declare.Register()
+	handlers.Register()
 
 	if err := ms.Start(); err != nil {
 		log.Fatalf("mirrorstack: start failed: %v", err)

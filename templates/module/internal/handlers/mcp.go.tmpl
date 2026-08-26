@@ -1,0 +1,43 @@
+package handlers
+
+// The agent-facing MCP surface. Every module should expose at least one tool:
+// the platform is an agentic CMS, and a module with no tools is a module an
+// agent cannot reason about.
+
+import (
+	"context"
+
+	ms "github.com/mirrorstack-ai/app-module-sdk"
+
+	"__MS_SLUG__/declare"
+)
+
+// GreetArgs is decoded from the agent's tool call and enforced against the JSON
+// Schema derived from this struct: a missing required field or an unknown key
+// is rejected before the handler runs.
+//
+// DESCRIBE EVERY FIELD. The model picks arguments from this schema and nothing
+// else, so an undescribed field is one it has to guess at from the name.
+// Registration logs a warning naming any field that has none.
+type GreetArgs struct {
+	Name string `json:"name" jsonschema:"description=The name of the person to greet."`
+}
+
+// GreetResult is serialized back to the agent. Its schema reaches the model
+// too, so the field names are part of the contract.
+type GreetResult struct {
+	Message string `json:"message" jsonschema:"description=The greeting, addressed to Name."`
+}
+
+func registerMCP() {
+	// The description is what an agent reads when deciding whether to call
+	// this. Say what it does and when to use it, not what it is named.
+	ms.MCPTool("greet", "Greet someone by name. Use when asked to say hello to a specific person.",
+		func(_ context.Context, args GreetArgs) (GreetResult, error) {
+			return GreetResult{Message: "hi " + args.Name}, nil
+		},
+		// Gate a tool on the same permission its HTTP equivalent uses: the
+		// platform lists and invokes it only for callers who hold it.
+		ms.ToolPermission(declare.PermRead),
+	)
+}

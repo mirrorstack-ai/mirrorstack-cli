@@ -1,0 +1,42 @@
+// Package declare holds this module's PURE-DATA declarations: permissions, UI,
+// events, exposed tables, contribution slots, metrics.
+//
+// The boundary rule: if it mounts a route or carries an http.HandlerFunc it
+// belongs in internal/handlers/, not here. Nothing in this package should ever
+// see an *http.Request — these declarations run ONCE at startup and become the
+// module's manifest, which is what the platform reads to decide what this
+// module may do.
+package declare
+
+import (
+	ms "github.com/mirrorstack-ai/app-module-sdk"
+	"github.com/mirrorstack-ai/app-module-sdk/roles"
+)
+
+// Permission names gating this module's surfaces. Declared as constants and
+// referenced from internal/handlers so the name a route gates on can never
+// drift from the name registered here.
+const (
+	PermRead = "read"
+)
+
+// Register is the single entry point main.go calls. Add new declaration
+// functions here rather than adding init() functions — startup ORDER matters
+// (i18n catalogs load before these run) and init() gives you no way to say so.
+func Register() {
+	registerPermissions()
+	// registerUI()      — add when this module ships a web bundle
+	// registerEvents()  — ms.Emits / ms.OnEvent
+	// registerExpose()  — ms.ExposeTable, the read-only surface for dependents
+}
+
+// registerPermissions declares the permissions this module's routes gate on.
+// Labels resolve per loaded locale from i18n/<locale>.json.
+func registerPermissions() {
+	ms.RegisterPermission(PermRead, ms.PermissionOpts{
+		// DefaultRole is the LOWEST role that gets this permission by default.
+		// An app owner can widen or narrow it later; this is only the default.
+		DefaultRole: roles.Viewer(),
+		Label:       ms.T("permissions.read"),
+	})
+}

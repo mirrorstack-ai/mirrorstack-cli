@@ -17,8 +17,11 @@ use anyhow::{Context, Result, anyhow};
 use crate::commands::dev::module_meta;
 
 const MAIN_GO: &str = include_str!("../../../templates/module/main.go.tmpl");
-const MCP_GO: &str = include_str!("../../../templates/module/mcp.go.tmpl");
-const ROUTES_GO: &str = include_str!("../../../templates/module/routes.go.tmpl");
+const DECLARE_GO: &str = include_str!("../../../templates/module/declare/register.go.tmpl");
+const MCP_GO: &str = include_str!("../../../templates/module/internal/handlers/mcp.go.tmpl");
+const ROUTES_GO: &str = include_str!("../../../templates/module/internal/handlers/routes.go.tmpl");
+const I18N_EN: &str = include_str!("../../../templates/module/i18n/en-US.json.tmpl");
+const I18N_ZH: &str = include_str!("../../../templates/module/i18n/zh-TW.json.tmpl");
 const GO_MOD: &str = include_str!("../../../templates/module/go.mod.tmpl");
 const SQL_INIT: &str = include_str!("../../../templates/module/sql/app/0001_init.up.sql.tmpl");
 const GITIGNORE: &str = include_str!("../../../templates/module/.gitignore.tmpl");
@@ -97,12 +100,25 @@ pub(super) fn ensure_target_writable(target: &Path) -> Result<()> {
 }
 
 pub(super) fn write_tree(target: &Path, inputs: &Inputs<'_>) -> Result<()> {
-    fs::create_dir_all(target.join("sql/app"))
-        .with_context(|| format!("scaffold: mkdir {}/sql/app", target.display()))?;
+    // The skeleton every shipped module uses. The boundary rule: pure-data
+    // declaration goes in declare/, anything mounting a route or carrying an
+    // http.HandlerFunc goes in internal/handlers/. Documented in the SDK at
+    // docs/concepts/module-structure.md.
+    //
+    // The old flat main.go/routes.go/mcp.go tree with a postInitHooks registry
+    // was scaffolded here for months and had 0 of 11 adoption — a new author's
+    // very first commit diverged from every module they would later read.
+    for dir in ["sql/app", "declare", "internal/handlers", "i18n"] {
+        fs::create_dir_all(target.join(dir))
+            .with_context(|| format!("scaffold: mkdir {}/{dir}", target.display()))?;
+    }
 
     write_file(target, "main.go", MAIN_GO, inputs)?;
-    write_file(target, "mcp.go", MCP_GO, inputs)?;
-    write_file(target, "routes.go", ROUTES_GO, inputs)?;
+    write_file(target, "declare/register.go", DECLARE_GO, inputs)?;
+    write_file(target, "internal/handlers/routes.go", ROUTES_GO, inputs)?;
+    write_file(target, "internal/handlers/mcp.go", MCP_GO, inputs)?;
+    write_file(target, "i18n/en-US.json", I18N_EN, inputs)?;
+    write_file(target, "i18n/zh-TW.json", I18N_ZH, inputs)?;
     write_file(target, "go.mod", GO_MOD, inputs)?;
     write_file(target, "sql/app/0001_init.up.sql", SQL_INIT, inputs)?;
     write_file(target, ".gitignore", GITIGNORE, inputs)?;
@@ -362,17 +378,33 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("media");
         write_tree(&target, &ins("media", "Media")).unwrap();
+        // The canonical skeleton, not a flat tree: declare/ holds pure-data
+        // declarations, internal/handlers/ holds anything that runs per
+        // request. All 11 shipped modules use this shape; the old flat
+        // main.go/routes.go/mcp.go layout had 0 of 11 adoption.
         for rel in [
             "main.go",
-            "mcp.go",
-            "routes.go",
+            "declare/register.go",
+            "internal/handlers/routes.go",
+            "internal/handlers/mcp.go",
+            "i18n/en-US.json",
+            "i18n/zh-TW.json",
             "go.mod",
+            "CHANGELOG.md",
             "sql/app/0001_init.up.sql",
             ".gitignore",
             ".env",
         ] {
             let p = target.join(rel);
             assert!(p.exists(), "missing {}", p.display());
+        }
+        // And the shape it replaced must NOT come back: a flat routes.go at the
+        // module root is the pattern nothing in the fleet uses.
+        for gone in ["routes.go", "mcp.go"] {
+            assert!(
+                !target.join(gone).exists(),
+                "scaffolded a root-level {gone} — that is the flat layout this replaced"
+            );
         }
         let main = fs::read_to_string(target.join("main.go")).unwrap();
         assert!(main.contains(r#"ID: os.Getenv("MS_MODULE_ID"),"#));
