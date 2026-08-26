@@ -1,0 +1,13 @@
+# Changelog
+
+Every version you deploy needs a `## <version>` section here. `mirrorstack app
+module deploy` reads the one matching the version in `main.go` and publishes it
+as that release's notes — a missing or empty section is a hard deploy failure,
+not a warning.
+
+Write the heading WITHOUT the `v` prefix and without the `-dev` tag: the
+deploy promotes `v0.1.0-dev` to `0.1.0` before it looks the section up.
+
+## 0.1.0
+
+- Initial release of __MS_NAME__.

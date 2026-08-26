@@ -36,8 +36,12 @@ func main() {
 		// force a new recorded version with auto-generated rename migrations.
 		Slug: "__MS_SLUG__",
 		Name: "__MS_NAME__",
-		Icon: "extension",
-		SQL:  sqlFS,
+		// Description is the short, plain-language summary the catalog and
+		// the agent tool listings show. Optional, but an empty one makes the
+		// module unfindable in discovery — write it before you publish.
+		Description: "Replace this description with your module's purpose.",
+		Icon:        "extension",
+		SQL:         sqlFS,
 		Versions: map[string]system.MigrationVersions{
 			// `-dev` prerelease tag distinguishes "iterating locally" from
 			// "real release". `mirrorstack app module deploy` prompts to promote
@@ -47,8 +51,6 @@ func main() {
 	}); err != nil {
 		log.Fatalf("mirrorstack: init failed: %v", err)
 	}
-
-	ms.Describe("Replace this description with your module's purpose.")
 
 	// Required deps go here — these become install-time preconditions.
 	// Use @<owner>/<id>@<semver> for the spec; the optional callback

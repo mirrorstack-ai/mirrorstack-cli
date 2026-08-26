@@ -76,9 +76,10 @@ pub struct InitArgs {
     /// Module name (human-readable). When omitted, prompts interactively.
     #[arg(long)]
     name: Option<String>,
-    /// URL slug. When omitted, derived from --name. The platform regex is
-    /// 3-40 chars, must start with a letter, end with a letter or digit,
-    /// lowercase + hyphen only.
+    /// URL slug. When omitted, derived from --name. 3-16 chars, must start
+    /// with a letter, end with a letter or digit, lowercase + hyphen only.
+    /// The 16-char ceiling is the SDK's, and it is the binding one — see
+    /// SLUG_MAX_BYTES.
     #[arg(long)]
     slug: Option<String>,
     /// Skip prompts. Requires --name; --slug optional (derived from name).
@@ -168,9 +169,7 @@ fn init(args: InitArgs) -> Result<()> {
     let (name, slug) = collect_name_and_slug(&theme, &args)?;
 
     if !slug_valid(&slug) {
-        return Err(anyhow!(
-            "slug '{slug}' is invalid: must be 3-40 chars, start with a letter, end with a letter or digit, lowercase + hyphen only."
-        ));
+        return Err(slug_invalid_error(&slug));
     }
 
     // Pre-flight: scaffold target. If the caller wants scaffolding, fail now
@@ -515,9 +514,7 @@ fn deploy(args: DeployArgs) -> Result<()> {
     let meta = read_meta(&dir)?;
     let slug = args.module.clone().unwrap_or_else(|| meta.slug.clone());
     if !slug_valid(&slug) {
-        return Err(anyhow!(
-            "slug '{slug}' is invalid: must be 3-40 chars, start with a letter, end with a letter or digit, lowercase + hyphen only."
-        ));
+        return Err(slug_invalid_error(&slug));
     }
 
     let raw = code_version(&meta, &dir)?;
@@ -1220,9 +1217,35 @@ fn print_already_exists(username: &str, slug: &str, id: Option<&str>) {
 /// Same regex as the platform service and api-client-shared:
 /// `^[a-z][a-z0-9-]{1,38}[a-z0-9]$`. Inlined as a manual check to avoid a
 /// `regex` dependency for one pattern — the rule is small enough.
+/// Upper bound on a module slug, in bytes.
+///
+/// 🔴 THIS NUMBER COMES FROM THE SDK, NOT FROM THE CATALOG. Three validators
+/// see a slug and they did not agree: the platform catalog accepts 3-40, this
+/// CLI accepted 3-40, and the SDK's `moduleSlugPattern`
+/// (`^[a-z][a-z0-9-]{0,15}$`) caps it at 16. The SDK runs LAST — at `ms.Init`,
+/// after `module init` has already POSTed the slug and the catalog has already
+/// minted an ID for it. So a 17-char slug sailed through both remote checks and
+/// then killed the module on every boot, leaving a registered module nobody can
+/// run and a slug nobody else can claim.
+///
+/// The rule for a cross-repo validator chain is that the CALLER enforces the
+/// narrowest link, because the narrowest link is the one that fails after the
+/// side effects have landed. Keep this at the SDK's cap; if the SDK widens
+/// `moduleSlugPattern`, widen this in the same wave.
+const SLUG_MAX_BYTES: usize = 16;
+
+/// The one rejection message for an invalid slug. It was written out twice,
+/// which is how both copies came to advertise a bound neither validator held.
+fn slug_invalid_error(slug: &str) -> anyhow::Error {
+    anyhow!(
+        "slug '{slug}' is invalid: must be 3-{SLUG_MAX_BYTES} chars, start with a letter, \
+         end with a letter or digit, lowercase + hyphen only."
+    )
+}
+
 fn slug_valid(s: &str) -> bool {
     let len = s.len();
-    if !(3..=40).contains(&len) {
+    if !(3..=SLUG_MAX_BYTES).contains(&len) {
         return false;
     }
     let bytes = s.as_bytes();
@@ -1289,8 +1312,42 @@ mod tests {
 
     #[test]
     fn slug_valid_rejects_too_long() {
-        let s = "a".repeat(41);
+        // 17 bytes: one past the SDK's cap, and the exact width that used to
+        // register fine and then die at ms.Init.
+        let s = "a".repeat(SLUG_MAX_BYTES + 1);
         assert!(!slug_valid(&s));
+        assert!(
+            slug_valid(&"a".repeat(SLUG_MAX_BYTES)),
+            "16 must still pass"
+        );
+    }
+
+    /// The CLI must never accept a slug the SDK's regex rejects — that
+    /// direction strands a registration. Mirrors moduleSlugPattern
+    /// (`^[a-z][a-z0-9-]{0,15}$`) rather than importing it: they are different
+    /// languages in different repos, so the tie is kept by an assertion.
+    #[test]
+    fn slug_valid_never_looser_than_the_sdk_pattern() {
+        let sdk_ok = |s: &str| {
+            let b = s.as_bytes();
+            (1..=16).contains(&s.len())
+                && b[0].is_ascii_lowercase()
+                && b.iter()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+        };
+        for s in [
+            "media",
+            "a".repeat(16).as_str(),
+            &"a".repeat(17),
+            "my-really-long-module-slug",
+            "Media",
+            "1media",
+        ] {
+            assert!(
+                !(slug_valid(s) && !sdk_ok(s)),
+                "CLI accepts {s:?} but the SDK would reject it at ms.Init"
+            );
+        }
     }
 
     #[test]

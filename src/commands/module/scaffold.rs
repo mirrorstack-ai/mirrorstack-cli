@@ -22,12 +22,30 @@ const ROUTES_GO: &str = include_str!("../../../templates/module/routes.go.tmpl")
 const GO_MOD: &str = include_str!("../../../templates/module/go.mod.tmpl");
 const SQL_INIT: &str = include_str!("../../../templates/module/sql/app/0001_init.up.sql.tmpl");
 const GITIGNORE: &str = include_str!("../../../templates/module/.gitignore.tmpl");
+const CHANGELOG: &str = include_str!("../../../templates/module/CHANGELOG.md.tmpl");
 
 // Placeholder tokens. Kept in one place so the contract between the .tmpl
 // files and this renderer is auditable from a single grep.
 const SLUG_TOKEN: &str = "__MS_SLUG__";
 const NAME_TOKEN: &str = "__MS_NAME__";
 const MODULE_ID_TOKEN: &str = "__MS_MODULE_ID__";
+const SDK_VERSION_TOKEN: &str = "__MS_SDK_VERSION__";
+
+/// The `app-module-sdk` release a scaffold is pinned to, rendered into the
+/// generated `go.mod`.
+///
+/// 🔴 WHY THIS IS A CONSTANT AND NOT A LITERAL IN THE TEMPLATE. It was
+/// hardcoded as `v0.2.0` in `go.mod.tmpl` long after the SDK had moved on, and
+/// that stale pin was the only thing keeping the scaffold green: the template
+/// called `ms.Describe`, which the SDK deleted on 2026-06-08, so a scaffold
+/// resolved against a CURRENT SDK did not compile. Nothing noticed, because
+/// nothing ever built the rendered output. `scaffold_builds_against_sdk` in CI
+/// is what does now — it renders this tree and runs `go build ./...` both at
+/// this pin and at the SDK's `main`, so a template that outruns its pin fails
+/// there instead of in a new user's first five minutes.
+///
+/// Bump this in the same PR that adopts a new SDK API in the templates.
+const SCAFFOLD_SDK_VERSION: &str = "v0.4.6";
 
 /// Runtime placeholder the SDK's db.Querier wrapper resolves against
 /// `Config.ID` on every query, at request time (see
@@ -88,6 +106,11 @@ pub(super) fn write_tree(target: &Path, inputs: &Inputs<'_>) -> Result<()> {
     write_file(target, "go.mod", GO_MOD, inputs)?;
     write_file(target, "sql/app/0001_init.up.sql", SQL_INIT, inputs)?;
     write_file(target, ".gitignore", GITIGNORE, inputs)?;
+    // CHANGELOG.md is hard-linted at deploy (changelog::lint) and was never
+    // scaffolded, so every new module hit "no CHANGELOG.md" on its first
+    // deploy. The seeded heading is `## 0.1.0` — canonical, no `v`, no `-dev`
+    // — because the deploy promotes the Versions key before looking it up.
+    write_file(target, "CHANGELOG.md", CHANGELOG, inputs)?;
     write_env_file(target, inputs)?;
     Ok(())
 }
@@ -138,6 +161,7 @@ fn render(body: &str, inputs: &Inputs<'_>) -> String {
     body.replace(SLUG_TOKEN, inputs.slug)
         .replace(NAME_TOKEN, inputs.name)
         .replace(MODULE_ID_TOKEN, RUNTIME_MODULE_ID_PLACEHOLDER)
+        .replace(SDK_VERSION_TOKEN, SCAFFOLD_SDK_VERSION)
 }
 
 /// Convert a platform UUID (`bb8a3f8b-1234-5678-9abc-def012345678`) into a
@@ -252,7 +276,9 @@ mod tests {
         // OptionalDependOn — the template's main.go uses both.
         let out = render(GO_MOD, &ins("media", "Media"));
         assert!(
-            out.contains("github.com/mirrorstack-ai/app-module-sdk v0.2.0"),
+            out.contains(&format!(
+                "github.com/mirrorstack-ai/app-module-sdk {SCAFFOLD_SDK_VERSION}"
+            )),
             "go.mod must pin SDK v0.2.0 to match scaffolded API surface"
         );
     }
@@ -382,6 +408,79 @@ mod tests {
         assert!(
             gitignore.lines().any(|l| l.trim() == ".env"),
             "scaffolded .gitignore must ignore .env: {gitignore:?}"
+        );
+    }
+
+    /// Render the scaffold and BUILD it — at the pinned SDK release and again
+    /// at the SDK's `main`.
+    ///
+    /// 🔴 THIS IS THE TEST THAT WAS MISSING. Nothing in this repo ever compiled
+    /// the tooling's own output, so the templates and the SDK drifted apart in
+    /// silence and every check stayed green: `main.go.tmpl` called
+    /// `ms.Describe`, deleted from the SDK on 2026-06-08, and `go.mod.tmpl`
+    /// pinned `v0.2.0` — a version old enough to still HAVE it. The stale pin
+    /// was the only thing hiding the breakage; bumping it alone would have
+    /// turned a new user's first `go build` into `undefined: ms.Describe`.
+    ///
+    /// Building at BOTH versions is the point. The pin proves what we ship
+    /// resolves today; `@main` proves the templates have not fallen behind the
+    /// SDK again, and fails while the SDK change is still in living memory
+    /// rather than at the next pin bump.
+    ///
+    /// `#[ignore]` because it needs the Go toolchain and the network. CI runs
+    /// it explicitly and asserts that exactly one test ran, so filtering it
+    /// away cannot read as a pass — see the `scaffold` job in ci.yml.
+    #[test]
+    #[ignore = "needs the Go toolchain and network; run explicitly in CI"]
+    fn scaffold_builds_against_the_sdk() {
+        use std::process::Command;
+
+        let go = |dir: &Path, args: &[&str]| -> (bool, String) {
+            let out = Command::new("go")
+                .args(args)
+                .current_dir(dir)
+                // -mod=mod lets `go mod tidy` write the go.sum the scaffold
+                // deliberately does not ship.
+                .env("GOFLAGS", "-mod=mod")
+                .output()
+                .unwrap_or_else(|e| {
+                    panic!("this test requires the Go toolchain on PATH: go {args:?}: {e}")
+                });
+            let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+            log.push_str(&String::from_utf8_lossy(&out.stderr));
+            (out.status.success(), log)
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().to_path_buf();
+        write_tree(&target, &ins("media", "Media")).expect("scaffold");
+
+        // gofmt first: a scaffold that compiles but is not formatted still
+        // fails the module's own CI on its very first commit.
+        let (ok, log) = go(&target, &["fmt", "./..."]);
+        assert!(ok, "gofmt failed:\n{log}");
+        let (ok, log) = go(&target, &["mod", "tidy"]);
+        assert!(ok, "go mod tidy failed at the pinned SDK:\n{log}");
+
+        let (ok, log) = go(&target, &["build", "./..."]);
+        assert!(
+            ok,
+            "the scaffold does not build against its own pinned SDK \
+             ({SCAFFOLD_SDK_VERSION}) — bump SCAFFOLD_SDK_VERSION or fix the \
+             templates:\n{log}"
+        );
+
+        let (ok, log) = go(
+            &target,
+            &["get", "github.com/mirrorstack-ai/app-module-sdk@main"],
+        );
+        assert!(ok, "go get app-module-sdk@main failed:\n{log}");
+        let (ok, log) = go(&target, &["build", "./..."]);
+        assert!(
+            ok,
+            "the scaffold builds at the pin but NOT at SDK main — the templates \
+             have fallen behind the SDK. Fix the templates and bump \
+             SCAFFOLD_SDK_VERSION once the SDK cuts a release:\n{log}"
         );
     }
 
