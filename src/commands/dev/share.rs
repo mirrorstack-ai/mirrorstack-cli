@@ -68,6 +68,15 @@ const SCAN_INTERVAL: Duration = Duration::from_millis(2000);
 /// Stop-flag / cadence tick — bounds shutdown latency without busy-looping.
 const TICK: Duration = Duration::from_millis(200);
 
+/// How long a target may have no bundle before we say so. Long enough that a
+/// cold `npm install` plus a first build finishes inside it, short enough that
+/// a developer hears about a build that is never going to produce one.
+const MISSING_BUNDLE_GRACE: Duration = Duration::from_secs(45);
+
+/// Sentinel in `last_warned`. It shares that field with content hashes, which
+/// are 64 hex characters, so a marker containing `-` can never collide with one.
+const MISSING_BUNDLE: &str = "__missing-bundle__";
+
 /// Longer timeout for the raw S3 PUT than the 15s JSON API calls use: a
 /// bundle body is far larger than an API payload and a slow uplink shouldn't
 /// abort it. Matches the deploy path's upload-sized client.
@@ -174,9 +183,14 @@ fn put_bundle(upload_client: &Client, url: &str, bytes: &[u8]) -> Result<(), Api
 /// Mutable per-target bookkeeping: the hash we last confirmed live, and the
 /// hash we last warned about (so a persistently-failing upload doesn't spam
 /// an identical warning every tick).
+#[derive(Default)]
 struct TargetState {
     last_uploaded: Option<String>,
     last_warned: Option<String>,
+    /// When this target was first seen with no bundle on disk, cleared the
+    /// moment one appears. A bundle that DISAPPEARS therefore starts a fresh
+    /// grace period instead of warning instantly off a stale timestamp.
+    missing_since: Option<Instant>,
 }
 
 /// Spawn the host-side share watcher. Owns its own credentials (loaded fresh
@@ -244,13 +258,7 @@ fn run_watcher(
         }
     };
 
-    let mut states: Vec<TargetState> = targets
-        .iter()
-        .map(|_| TargetState {
-            last_uploaded: None,
-            last_warned: None,
-        })
-        .collect();
+    let mut states: Vec<TargetState> = targets.iter().map(|_| TargetState::default()).collect();
 
     eprintln!(
         "{} sharing {} web {} to the CDN on change",
@@ -308,10 +316,50 @@ fn share_once(
     target: &ShareTarget,
     state: &mut TargetState,
 ) {
-    // No bundle yet (build hasn't produced it) → nothing to do this tick.
+    // 🔴 A BUNDLE THAT NEVER ARRIVES IS NOT "NOTHING TO DO THIS TICK".
+    //
+    // This returned silently on every read error, so a module whose web build
+    // never produced `web/dist/index.js` shared nothing for the entire session
+    // without printing one line. The developer's next signal was an install
+    // failing with no bundle and nothing naming the cause — and the cause was
+    // usually that `dev` ran esbuild directly and skipped the module's
+    // build:css stage, which is fixed in spawn_web_builder but cannot be the
+    // only defence: a build that simply FAILS lands in the same state.
+    //
+    // Still silent for the grace period, because a cold start legitimately has
+    // no bundle until npm install and the first build finish.
     let bytes = match std::fs::read(&target.dist) {
-        Ok(b) => b,
-        Err(_) => return,
+        Ok(b) => {
+            if state.missing_since.take().is_some()
+                && state.last_warned.as_deref() == Some(MISSING_BUNDLE)
+            {
+                // Recovered: clear the marker so a LATER disappearance warns
+                // again instead of being suppressed by this one.
+                state.last_warned = None;
+            }
+            b
+        }
+        Err(_) => {
+            let waiting = state
+                .missing_since
+                .get_or_insert_with(Instant::now)
+                .elapsed();
+            if waiting >= MISSING_BUNDLE_GRACE
+                && state.last_warned.as_deref() != Some(MISSING_BUNDLE)
+            {
+                eprintln!(
+                    "{} [{}] no web bundle at {} after {}s — nothing is being shared for this module. \
+                     Check the [{}:web] output above for a failed build.",
+                    warn_prefix(),
+                    target.slug,
+                    target.dist.display(),
+                    MISSING_BUNDLE_GRACE.as_secs(),
+                    target.slug,
+                );
+                state.last_warned = Some(MISSING_BUNDLE.to_string());
+            }
+            return;
+        }
     };
 
     if bytes.len() as u64 > MAX_BUNDLE_BYTES {
@@ -458,7 +506,7 @@ mod tests {
         };
         let mut state = TargetState {
             last_uploaded: None,
-            last_warned: None,
+            ..Default::default()
         };
         // apps_base points nowhere reachable; if it tried to upload this would
         // error, but an absent bundle must return before any network call.
@@ -472,6 +520,83 @@ mod tests {
         );
         assert!(state.last_uploaded.is_none());
         assert!(state.last_warned.is_none());
+    }
+
+    /// 🔴 A BUNDLE THAT NEVER ARRIVES MUST EVENTUALLY SAY SO.
+    ///
+    /// share_once returned silently on every read error, so a module whose web
+    /// build produced nothing shared nothing for a whole session without one
+    /// line of output. The developer's next signal was an install failing with
+    /// no bundle and nothing naming the cause.
+    ///
+    /// The grace period is driven by back-dating missing_since rather than by
+    /// sleeping, so this asserts the real threshold without costing 45 seconds.
+    #[test]
+    fn a_bundle_that_never_appears_warns_once_after_the_grace_period() {
+        let tmp = tempfile::tempdir().unwrap();
+        let api_client = http::client(Duration::from_secs(5)).unwrap();
+        let upload_client = http::client(Duration::from_secs(5)).unwrap();
+        let creds = Credentials {
+            access_token: "AT".into(),
+            refresh_token: "RT".into(),
+            expires_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+        };
+        let target = ShareTarget {
+            slug: "media".into(),
+            module_id: "m-1".into(),
+            dist: tmp.path().join("web/dist/index.js"),
+        };
+        let mut state = TargetState::default();
+        let call = |state: &mut TargetState| {
+            share_once(
+                &api_client,
+                &upload_client,
+                "http://127.0.0.1:1",
+                &mut creds.clone(),
+                &target,
+                state,
+            )
+        };
+
+        // Inside the grace period a cold start is legitimately bundle-less, so
+        // this must stay quiet — a warning on every dev startup is noise that
+        // trains people to ignore the one that matters.
+        call(&mut state);
+        assert!(
+            state.missing_since.is_some(),
+            "the wait must start on the first miss"
+        );
+        assert!(
+            state.last_warned.is_none(),
+            "must not warn during the grace period"
+        );
+
+        // Past the threshold: warn, exactly once.
+        state.missing_since = Some(Instant::now() - MISSING_BUNDLE_GRACE - Duration::from_secs(1));
+        call(&mut state);
+        assert_eq!(state.last_warned.as_deref(), Some(MISSING_BUNDLE));
+        let after_first = state.last_warned.clone();
+        call(&mut state);
+        assert_eq!(
+            state.last_warned, after_first,
+            "must not re-warn every tick"
+        );
+
+        // A bundle that finally appears clears the marker, so a LATER
+        // disappearance is reported again instead of being suppressed by this
+        // one. Without the clear, the second outage is silent forever.
+        std::fs::create_dir_all(tmp.path().join("web/dist")).unwrap();
+        std::fs::write(tmp.path().join("web/dist/index.js"), b"export default {}").unwrap();
+        call(&mut state);
+        assert!(
+            state.missing_since.is_none(),
+            "a present bundle ends the wait"
+        );
+        assert_ne!(
+            state.last_warned.as_deref(),
+            Some(MISSING_BUNDLE),
+            "the missing marker must be cleared once a bundle exists"
+        );
     }
 
     #[test]
@@ -563,7 +688,7 @@ mod tests {
         };
         let mut state = TargetState {
             last_uploaded: Some(sha256_hex(bytes)),
-            last_warned: None,
+            ..Default::default()
         };
         share_once(
             &api_client,
@@ -603,7 +728,7 @@ mod tests {
         };
         let mut state = TargetState {
             last_uploaded: None,
-            last_warned: None,
+            ..Default::default()
         };
         share_once(
             &api_client,
