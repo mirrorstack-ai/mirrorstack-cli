@@ -3,8 +3,19 @@ name: CI
 on:
   push:
     branches: [main]
+  # 🔴 NO BASE-BRANCH FILTER ON pull_request, DELIBERATELY.
+  #
+  # It was `branches: [main]`, which means a PR targeting anything else gets NO
+  # workflow runs at all — not a failure, not a skip: an EMPTY check list, which
+  # reads as "nothing to worry about". A stack is exactly where verification
+  # matters most: each link is reviewed on top of code that has not landed yet.
+  #
+  # Measured in the sibling repos before this landed here: ms-app-modules had
+  # three stacked PRs at pass=0, api-platform two. Same convention, copied.
+  #
+  # `push` keeps its filter — a push run exists to protect main, and running the
+  # suite on every branch push would duplicate the PR run.
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
