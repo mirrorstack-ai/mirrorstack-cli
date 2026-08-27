@@ -1314,6 +1314,36 @@ fn web_build_args(watch: bool) -> &'static [&'static str] {
     }
 }
 
+/// The npm script this module declares for the mode we are in, if any.
+///
+/// 🔴 THE MODULE OWNS ITS BUILD PIPELINE; THE CLI RUNS ONE STEP OF IT.
+/// Calling `node esbuild.config.mjs` directly executes exactly one stage of a
+/// pipeline the module may have declared several stages for. Every first-party
+/// module declares `"watch": "build:css && node esbuild.config.mjs --watch"`,
+/// so going straight to esbuild SKIPPED the stylesheet build entirely — the CLI
+/// never ran `build:css` anywhere, in any mode. The bundle then either
+/// referenced styles nothing had generated or, when the config reads that
+/// output, was never written at all, and the first symptom was an install
+/// failing much later with nothing to point at.
+///
+/// Falling back to esbuild keeps every module scaffolded before these scripts
+/// existed working unchanged: the fallback is the OLD behaviour, so this can
+/// only add a stage, never remove one.
+fn declared_web_script(web_dir: &Path, watch: bool) -> Option<&'static str> {
+    let name = if watch { "watch" } else { "build" };
+    let raw = std::fs::read_to_string(web_dir.join("package.json")).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let body = parsed.get("scripts")?.get(name)?.as_str()?;
+    if body.trim().is_empty() {
+        // A declared-but-empty script is not a pipeline. Falling through to
+        // esbuild builds something; running `npm run build` would exit 0 having
+        // produced nothing, which is the silent-success shape this whole change
+        // exists to remove.
+        return None;
+    }
+    Some(name)
+}
+
 /// `npm install --silent` then `node esbuild.config.mjs`, adding `--watch`
 /// only for hot-reload mode. The module's own esbuild config performs one
 /// initial production build without that flag, or hosts the SSE livereload
@@ -1343,8 +1373,22 @@ fn spawn_web_builder(
             return;
         }
         let label: &'static str = Box::leak(format!("{slug}:web").into_boxed_str());
-        let spawned = Command::new("node")
-            .args(web_build_args(watch))
+        // Prefer the module's own script so every stage it declares runs, not
+        // just the esbuild one. LR_PORT is set on the parent, so it reaches
+        // esbuild through npm exactly as it did when we spawned node directly.
+        let mut cmd = match declared_web_script(&web_dir, watch) {
+            Some(script) => {
+                let mut c = Command::new("npm");
+                c.args(["run", script]);
+                c
+            }
+            None => {
+                let mut c = Command::new("node");
+                c.args(web_build_args(watch));
+                c
+            }
+        };
+        let spawned = cmd
             .current_dir(&web_dir)
             .env("LR_PORT", lr_port.to_string())
             .stdout(Stdio::piped())
@@ -1677,6 +1721,62 @@ mod tests {
     fn one_shot_web_mode_builds_once_without_starting_a_watcher() {
         assert_eq!(web_build_args(false), ["esbuild.config.mjs"]);
         assert_eq!(web_build_args(true), ["esbuild.config.mjs", "--watch"]);
+    }
+
+    /// 🔴 THE MODULE'S OWN SCRIPT WINS, BECAUSE IT HAS MORE STAGES THAN OURS.
+    ///
+    /// Every first-party module declares `build:css && esbuild`, and the CLI
+    /// ran only the esbuild half — `build:css` appeared nowhere in this binary,
+    /// in any mode. This is the test that fails if someone routes back to
+    /// esbuild directly "to skip npm".
+    #[test]
+    fn declared_web_script_is_preferred_over_bare_esbuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"scripts":{"build":"pnpm build:css && node esbuild.config.mjs",
+                           "watch":"pnpm build:css && node esbuild.config.mjs --watch"}}"#,
+        )
+        .unwrap();
+        assert_eq!(declared_web_script(tmp.path(), false), Some("build"));
+        assert_eq!(declared_web_script(tmp.path(), true), Some("watch"));
+    }
+
+    /// The fallback IS the old behaviour, so a module scaffolded before these
+    /// scripts existed keeps building exactly as it did. This change can only
+    /// add a stage, never remove one.
+    #[test]
+    fn declared_web_script_falls_back_when_the_module_declares_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No package.json at all.
+        assert_eq!(declared_web_script(tmp.path(), true), None);
+
+        // A package.json with no scripts block.
+        std::fs::write(tmp.path().join("package.json"), r#"{"name":"m"}"#).unwrap();
+        assert_eq!(declared_web_script(tmp.path(), true), None);
+
+        // Scripts, but not the one this mode needs: watch mode must NOT fall
+        // back to the `build` script, which exits instead of watching.
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"scripts":{"build":"node esbuild.config.mjs"}}"#,
+        )
+        .unwrap();
+        assert_eq!(declared_web_script(tmp.path(), true), None);
+        assert_eq!(declared_web_script(tmp.path(), false), Some("build"));
+
+        // Unparseable JSON must not take the dev server down.
+        std::fs::write(tmp.path().join("package.json"), "{not json").unwrap();
+        assert_eq!(declared_web_script(tmp.path(), false), None);
+
+        // A declared-but-empty script would exit 0 having produced nothing —
+        // the silent success this whole change exists to remove.
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"scripts":{"build":"   "}}"#,
+        )
+        .unwrap();
+        assert_eq!(declared_web_script(tmp.path(), false), None);
     }
 
     #[test]
