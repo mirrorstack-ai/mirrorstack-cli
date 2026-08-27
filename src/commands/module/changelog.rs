@@ -239,6 +239,27 @@ mod tests {
 - initial release
 ";
 
+    /// The scaffolded CHANGELOG.md must satisfy the linter that gates deploy.
+    ///
+    /// These two lived in different files and disagreed: nothing scaffolded a
+    /// CHANGELOG.md at all, while `lint` made a missing one a hard deploy
+    /// failure — so every new module's first `deploy` failed on a file the
+    /// tool never told it to write. Reading the template through the same
+    /// `include_str!` the scaffolder uses is what keeps them agreeing: change
+    /// either the seeded heading or the lint rules and this fails here.
+    #[test]
+    fn scaffolded_changelog_passes_its_own_lint() {
+        let template = include_str!("../../../templates/module/CHANGELOG.md.tmpl")
+            .replace("__MS_NAME__", "Media");
+        let entry = lint_body(&template, "0.1.0")
+            .expect("the scaffolded CHANGELOG must lint at the version main.go scaffolds");
+        assert!(
+            !entry.body.is_empty(),
+            "a seeded section that lints but is empty defeats the point"
+        );
+        assert!(entry.warnings.is_empty(), "got {:?}", entry.warnings);
+    }
+
     #[test]
     fn lint_body_finds_exact_version() {
         let entry = lint_body(SAMPLE, "0.2.0").expect("ok");

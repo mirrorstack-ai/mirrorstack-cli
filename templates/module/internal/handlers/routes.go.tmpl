@@ -1,0 +1,70 @@
+// Package handlers holds everything that runs PER REQUEST: route registration,
+// HTTP handlers, and the module's MCP tools.
+//
+// The boundary rule: pure-data declaration belongs in declare/; anything that
+// mounts a route or carries an http.HandlerFunc belongs here. See the SDK's
+// docs/concepts/module-structure.md.
+//
+// Do not create a file called handlers.go. It is the name you reach for when
+// you have not decided what the code is, and it is how one shipped module's
+// handlers.go reached 1038 lines holding four unrelated surfaces. Name each
+// file for what it serves — sessions.go, profile.go, settings.go.
+package handlers
+
+import (
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	ms "github.com/mirrorstack-ai/app-module-sdk"
+
+	"__MS_SLUG__/declare"
+)
+
+// Register is the single entry point main.go calls, after declare.Register().
+func Register() {
+	registerRoutes()
+	registerMCP()
+}
+
+func registerRoutes() {
+	// Platform scope — authenticated platform users (the host dashboard).
+	// The SDK mounts these under /platform/, so "/hello" serves
+	// /platform/hello. Gate anything that reads or writes real data on a
+	// permission declared in declare/.
+	ms.Platform(func(r chi.Router) {
+		r.With(ms.RequirePermission(declare.PermRead)).
+			Get("/hello", hello)
+	})
+
+	// Public scope — anonymous callers (webhooks, OAuth callbacks). There is
+	// no identity here: never trust anything the request body claims about who
+	// the caller is.
+	ms.Public(func(r chi.Router) {
+		r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		})
+	})
+
+	// Internal scope — module-to-module and platform-to-module, authenticated
+	// by a shared secret.
+	//
+	// 🔴 Internal is NOT a per-module boundary. EVERY module installed in the
+	// app presents the same secret, so a route here is reachable by all of
+	// them, not only by the one you had in mind. Never mint a credential or
+	// act on an identity a caller merely asserts in the body.
+	ms.Internal(func(r chi.Router) {
+		r.Get("/ping", func(w http.ResponseWriter, _ *http.Request) {
+			ms.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+		})
+	})
+}
+
+func hello(w http.ResponseWriter, r *http.Request) {
+	// The acting user and app come from the CONTEXT, injected by the platform
+	// edge — never from a header or a query parameter the caller controls.
+	ms.WriteJSON(w, http.StatusOK, map[string]any{
+		"message": "hello from __MS_SLUG__",
+		"appId":   ms.AppID(r.Context()),
+		"userId":  ms.UserID(r.Context()),
+	})
+}

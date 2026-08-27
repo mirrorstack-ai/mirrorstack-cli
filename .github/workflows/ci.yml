@@ -63,3 +63,40 @@ jobs:
 
       - name: cargo build --release
         run: cargo build --release --locked
+
+  scaffold:
+    name: Scaffold renders and builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install Rust toolchain
+        run: rustup update stable && rustup default stable
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26"
+          cache: false
+
+      # Renders templates/module/ through the REAL scaffolder and runs
+      # `go build ./...` on the result — at the pinned SDK release and again at
+      # the SDK's main. Nothing else in this repo ever compiles the tooling's
+      # own output, which is how `ms.Describe` survived in the template for
+      # months after the SDK deleted it: a stale `v0.2.0` pin kept every check
+      # green while a freshly scaffolded module did not compile.
+      #
+      # The `test result: ok. 1 passed` grep is deliberate. The test carries
+      # #[ignore], so a rename or a filter typo yields "0 passed" — which cargo
+      # reports as SUCCESS. Asserting the count is what stops this job from
+      # going green by running nothing at all.
+      - name: Render the scaffold and build it against the SDK
+        run: |
+          set -euo pipefail
+          cargo test --all-features -- --ignored --exact \
+            commands::module::scaffold::tests::scaffold_builds_against_the_sdk \
+            --nocapture 2>&1 | tee scaffold-test.log
+          grep -qE '^test result: ok\. 1 passed' scaffold-test.log \
+            || { echo "::error::the scaffold build test did not run"; exit 1; }

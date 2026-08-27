@@ -20,7 +20,8 @@ use zip::write::SimpleFileOptions;
 use crate::api::{self, ApiError};
 use crate::http;
 
-use super::{deploy_error_hint, session_expired, with_spinner};
+use super::deploy::deploy_error_hint;
+use super::{session_expired, with_spinner};
 
 /// Client-side sanity cap on the packaged (compressed) zip, mirroring the
 /// platform's own finalize-time ceiling on the uploaded object so an oversize
