@@ -453,7 +453,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     // upload belongs here, not in the container (see share.rs). Best-effort:
     // a share failure never blocks the tunnel.
     let share_state = if args.tunnel && args.share {
-        let targets = build_share_targets(root, &ready);
+        let targets = build_share_targets(root, &ready, args.watch);
         if targets.is_empty() {
             eprintln!(
                 "{} --share: no module ships a web bundle — nothing to share",
@@ -625,6 +625,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
 fn build_share_targets(
     root: &Path,
     ready: &[workspace::WorkspaceModule],
+    watch: bool,
 ) -> Vec<share::ShareTarget> {
     let mut targets = Vec::new();
     for m in ready {
@@ -632,7 +633,7 @@ fn build_share_targets(
         let Ok(module_id) = module_meta::read_module_id(&m.abs_dir, root) else {
             continue;
         };
-        if let Some(t) = share::ShareTarget::for_module(&m.abs_dir, slug, module_id) {
+        if let Some(t) = share::ShareTarget::for_module(&m.abs_dir, slug, module_id, watch) {
             targets.push(t);
         }
     }
@@ -794,10 +795,11 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
         };
         supervisors.push(thread::spawn(move || supervise_module(spec)));
 
-        if m.abs_dir.join("web/esbuild.config.mjs").exists() {
+        let web_dir = m.abs_dir.join("web");
+        if let Some(pipeline) = web_pipeline(&web_dir, watch) {
             if watch {
                 eprintln!(
-                    "  {} {} web watcher (esbuild + livereload :{})",
+                    "  {} {} web watcher (livereload :{})",
                     style("✓").green(),
                     slug,
                     lr_port
@@ -807,7 +809,8 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
             }
             spawn_web_builder(
                 slug,
-                m.abs_dir.join("web"),
+                web_dir,
+                pipeline,
                 lr_port,
                 watch,
                 web_children.clone(),
@@ -1306,6 +1309,12 @@ fn start_module(spec: &ModuleSpec, label: &'static str) -> Option<Child> {
 const WEB_BUILD_ARGS: [&str; 1] = ["esbuild.config.mjs"];
 const WEB_WATCH_ARGS: [&str; 2] = ["esbuild.config.mjs", "--watch"];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WebPipeline {
+    DeclaredScript(&'static str),
+    LegacyEsbuild,
+}
+
 fn web_build_args(watch: bool) -> &'static [&'static str] {
     if watch {
         &WEB_WATCH_ARGS
@@ -1344,13 +1353,32 @@ fn declared_web_script(web_dir: &Path, watch: bool) -> Option<&'static str> {
     Some(name)
 }
 
-/// `npm install --silent` then `node esbuild.config.mjs`, adding `--watch`
-/// only for hot-reload mode. The module's own esbuild config performs one
-/// initial production build without that flag, or hosts the SSE livereload
-/// server with it. Output is prefixed `[<slug>:web]` and stays terminal-only.
+/// Discover the web pipeline the current dev mode can actually run.
+///
+/// A module-owned script is the current contract. The config-file branch is
+/// deliberately only a compatibility fallback for modules scaffolded before
+/// scripts declared the complete build pipeline. Both the inner builder and
+/// the outer `--share` watcher use this function, so neither can classify a
+/// module differently from the process that is expected to produce its
+/// bundle.
+fn web_pipeline(web_dir: &Path, watch: bool) -> Option<WebPipeline> {
+    if let Some(script) = declared_web_script(web_dir, watch) {
+        return Some(WebPipeline::DeclaredScript(script));
+    }
+    web_dir
+        .join("esbuild.config.mjs")
+        .is_file()
+        .then_some(WebPipeline::LegacyEsbuild)
+}
+
+/// `npm install --silent` then the discovered module-owned script or legacy
+/// esbuild config. Watch mode selects the declared `watch` script (or adds
+/// `--watch` to the legacy config); one-shot mode selects `build`. Output is
+/// prefixed `[<slug>:web]` and stays terminal-only.
 fn spawn_web_builder(
     slug: String,
     web_dir: PathBuf,
+    pipeline: WebPipeline,
     lr_port: u16,
     watch: bool,
     children: Arc<Mutex<Vec<Child>>>,
@@ -1376,13 +1404,13 @@ fn spawn_web_builder(
         // Prefer the module's own script so every stage it declares runs, not
         // just the esbuild one. LR_PORT is set on the parent, so it reaches
         // esbuild through npm exactly as it did when we spawned node directly.
-        let mut cmd = match declared_web_script(&web_dir, watch) {
-            Some(script) => {
+        let mut cmd = match pipeline {
+            WebPipeline::DeclaredScript(script) => {
                 let mut c = Command::new("npm");
                 c.args(["run", script]);
                 c
             }
-            None => {
+            WebPipeline::LegacyEsbuild => {
                 let mut c = Command::new("node");
                 c.args(web_build_args(watch));
                 c
@@ -1407,7 +1435,7 @@ fn spawn_web_builder(
                     }
                 }
             }
-            Err(e) => eprintln!("{} {slug}: node esbuild: {e}", warn_prefix()),
+            Err(e) => eprintln!("{} {slug}: web build: {e}", warn_prefix()),
         }
     });
 }
@@ -1740,6 +1768,14 @@ mod tests {
         .unwrap();
         assert_eq!(declared_web_script(tmp.path(), false), Some("build"));
         assert_eq!(declared_web_script(tmp.path(), true), Some("watch"));
+        assert_eq!(
+            web_pipeline(tmp.path(), false),
+            Some(WebPipeline::DeclaredScript("build"))
+        );
+        assert_eq!(
+            web_pipeline(tmp.path(), true),
+            Some(WebPipeline::DeclaredScript("watch"))
+        );
     }
 
     /// The fallback IS the old behaviour, so a module scaffolded before these
@@ -1750,10 +1786,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // No package.json at all.
         assert_eq!(declared_web_script(tmp.path(), true), None);
+        assert_eq!(web_pipeline(tmp.path(), true), None);
 
         // A package.json with no scripts block.
         std::fs::write(tmp.path().join("package.json"), r#"{"name":"m"}"#).unwrap();
         assert_eq!(declared_web_script(tmp.path(), true), None);
+        assert_eq!(web_pipeline(tmp.path(), true), None);
 
         // Scripts, but not the one this mode needs: watch mode must NOT fall
         // back to the `build` script, which exits instead of watching.
@@ -1764,10 +1802,16 @@ mod tests {
         .unwrap();
         assert_eq!(declared_web_script(tmp.path(), true), None);
         assert_eq!(declared_web_script(tmp.path(), false), Some("build"));
+        assert_eq!(web_pipeline(tmp.path(), true), None);
+        assert_eq!(
+            web_pipeline(tmp.path(), false),
+            Some(WebPipeline::DeclaredScript("build"))
+        );
 
         // Unparseable JSON must not take the dev server down.
         std::fs::write(tmp.path().join("package.json"), "{not json").unwrap();
         assert_eq!(declared_web_script(tmp.path(), false), None);
+        assert_eq!(web_pipeline(tmp.path(), false), None);
 
         // A declared-but-empty script would exit 0 having produced nothing —
         // the silent success this whole change exists to remove.
@@ -1777,6 +1821,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(declared_web_script(tmp.path(), false), None);
+        assert_eq!(web_pipeline(tmp.path(), false), None);
+    }
+
+    #[test]
+    fn legacy_esbuild_config_remains_a_web_pipeline_in_both_modes() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("esbuild.config.mjs"), "// build").unwrap();
+
+        assert_eq!(
+            web_pipeline(tmp.path(), false),
+            Some(WebPipeline::LegacyEsbuild)
+        );
+        assert_eq!(
+            web_pipeline(tmp.path(), true),
+            Some(WebPipeline::LegacyEsbuild)
+        );
     }
 
     #[test]

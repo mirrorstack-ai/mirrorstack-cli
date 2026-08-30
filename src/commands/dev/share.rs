@@ -42,14 +42,13 @@ use sha2::{Digest, Sha256};
 
 use super::module_meta::catalog_uuid;
 use super::supervisor::ShareInvalidator;
-use super::{ok_mark, warn_prefix};
+use super::{ok_mark, warn_prefix, web_pipeline};
 use crate::api::{self, ApiError, DevBundlePresignInput};
 use crate::credentials::{self, Credentials};
 use crate::http;
 
-/// Built web bundle path, relative to a module's directory. A module has a
-/// web bundle iff it ships `web/esbuild.config.mjs` (the same gate the web
-/// watcher uses); esbuild writes the bundle here.
+/// Built web bundle path, relative to a module's directory. The module's
+/// discovered web pipeline writes the bundle here.
 const WEB_BUNDLE_REL: &str = "web/dist/index.js";
 
 /// Content-Type the presigned PUT is signed with and the server pins on the
@@ -95,12 +94,16 @@ pub(super) struct ShareTarget {
 
 impl ShareTarget {
     /// Build a target for a module rooted at `module_dir`. Returns `None`
-    /// when the module has no web bundle to share (no `web/esbuild.config.mjs`),
-    /// so pure-backend modules are silently skipped.
-    pub(super) fn for_module(module_dir: &Path, slug: String, module_id: String) -> Option<Self> {
-        if !module_dir.join("web/esbuild.config.mjs").exists() {
-            return None;
-        }
+    /// when the module has no runnable web pipeline for this dev mode, so
+    /// pure-backend modules are silently skipped. This is the same discovery
+    /// rule the inner builder uses to produce the bundle.
+    pub(super) fn for_module(
+        module_dir: &Path,
+        slug: String,
+        module_id: String,
+        watch: bool,
+    ) -> Option<Self> {
+        web_pipeline(&module_dir.join("web"), watch)?;
         Some(Self {
             slug,
             module_id,
@@ -470,21 +473,60 @@ mod tests {
     }
 
     #[test]
-    fn for_module_none_without_esbuild_config() {
+    fn for_module_none_for_backend_only_module() {
         let tmp = tempfile::tempdir().unwrap();
-        let t = ShareTarget::for_module(tmp.path(), "media".into(), "m-1".into());
+        let t = ShareTarget::for_module(tmp.path(), "media".into(), "m-1".into(), true);
         assert!(t.is_none(), "a backend-only module has no bundle to share");
     }
 
     #[test]
-    fn for_module_some_points_at_dist_bundle() {
+    fn for_module_accepts_shared_compiler_scripts_without_legacy_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("web")).unwrap();
+        std::fs::write(
+            tmp.path().join("web/package.json"),
+            r#"{"scripts":{"build":"node ../../scripts/web/build.mjs","watch":"node ../../scripts/web/build.mjs --watch"}}"#,
+        )
+        .unwrap();
+
+        for watch in [false, true] {
+            let t = ShareTarget::for_module(tmp.path(), "media".into(), "m-1".into(), watch)
+                .expect("a declared script is a shareable web pipeline");
+            assert_eq!(t.dist, tmp.path().join("web/dist/index.js"));
+        }
+        assert!(!tmp.path().join("web/esbuild.config.mjs").exists());
+    }
+
+    #[test]
+    fn for_module_preserves_legacy_esbuild_config_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("web")).unwrap();
         std::fs::write(tmp.path().join("web/esbuild.config.mjs"), "// build").unwrap();
-        let t = ShareTarget::for_module(tmp.path(), "media".into(), "m-1".into()).unwrap();
+        let t = ShareTarget::for_module(tmp.path(), "media".into(), "m-1".into(), true).unwrap();
         assert_eq!(t.slug, "media");
         assert_eq!(t.module_id, "m-1");
         assert_eq!(t.dist, tmp.path().join("web/dist/index.js"));
+    }
+
+    #[test]
+    fn for_module_rejects_empty_or_malformed_declared_scripts() {
+        for package_json in [
+            r#"{"scripts":{"build":" ","watch":"\t"}}"#,
+            r#"{"scripts":{"build":7,"watch":false}}"#,
+            "{not json",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join("web")).unwrap();
+            std::fs::write(tmp.path().join("web/package.json"), package_json).unwrap();
+
+            for watch in [false, true] {
+                assert!(
+                    ShareTarget::for_module(tmp.path(), "media".into(), "m-1".into(), watch,)
+                        .is_none(),
+                    "invalid package must not become a web pipeline: {package_json}"
+                );
+            }
+        }
     }
 
     #[test]
