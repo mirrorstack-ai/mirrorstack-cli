@@ -106,12 +106,24 @@ pub(super) fn plan(local: &LocalRelease, remote: &RemoteRelease) -> Result<Actio
         return Err(PlanError::YankedVersion);
     }
 
-    // Bundle capture is independent of Lambda artifact state and must be
-    // proven before either artifact or deploy mutation for a web module.
+    // Validate the entire artifact/deploy snapshot before choosing capture.
+    // Capture is a write too: a missing web URL must never mask a mismatched,
+    // unknown, or contradictory Lambda state and earn that bad release a POST.
+    let next = plan_artifact_and_deploy(local, version)?;
+
+    // Once all existing remote evidence is known-safe, bundle capture still
+    // precedes either artifact or deploy mutation for a web module.
     if local.web_required && version.web_bundle_url.trim().is_empty() {
         return Ok(Action::CaptureWebBundle);
     }
 
+    Ok(next)
+}
+
+fn plan_artifact_and_deploy(
+    local: &LocalRelease,
+    version: &RemoteVersion,
+) -> Result<Action, PlanError> {
     let Some(artifact) = &version.artifact else {
         if version.deploy.is_some() {
             return Err(PlanError::ContradictoryState(
@@ -338,6 +350,38 @@ mod tests {
             plan(&release, &RemoteRelease::Present(captured)),
             Ok(Action::Done)
         );
+    }
+
+    #[test]
+    fn required_web_capture_never_masks_bad_artifact_or_deploy_state() {
+        let mut release = local();
+        release.web_required = true;
+        let cases = [
+            version(
+                Some(RemoteArtifact {
+                    sha256: OTHER_SHA.into(),
+                    ..ready()
+                }),
+                None,
+            ),
+            version(
+                Some(RemoteArtifact {
+                    status: "mystery".into(),
+                    size_bytes: 0,
+                    sha256: String::new(),
+                }),
+                None,
+            ),
+            version(None, Some(deployed("active"))),
+            version(Some(ready()), Some(deployed("mystery"))),
+        ];
+
+        for remote in cases {
+            assert!(
+                plan(&release, &remote).is_err(),
+                "missing web evidence masked bad remote state: {remote:?}"
+            );
+        }
     }
 
     #[test]
