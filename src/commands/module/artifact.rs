@@ -8,11 +8,12 @@
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
+use sha2::{Digest, Sha256};
+#[cfg(test)]
 use tempfile::TempDir;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
@@ -20,8 +21,9 @@ use zip::write::SimpleFileOptions;
 use crate::api::{self, ApiError};
 use crate::http;
 
-use super::deploy::deploy_error_hint;
+use super::deploy::{deploy_error_hint, verify_operation_release_receipt};
 use super::{session_expired, with_spinner};
+use crate::commands::release_candidate::ReleaseCandidateReceipt;
 
 /// Client-side sanity cap on the packaged (compressed) zip, mirroring the
 /// platform's own finalize-time ceiling on the uploaded object so an oversize
@@ -36,61 +38,11 @@ const MAX_ARTIFACT_BYTES: u64 = 250 * 1024 * 1024; // 250 MB
 /// The one artifact-flow error code that is not a failure: the platform in
 /// front of us has no artifact object store wired at all.
 const CODE_STORAGE_UNCONFIGURED: &str = "artifact_storage_unconfigured";
+const CODE_ALREADY_READY: &str = "artifact_already_ready";
 
 /// A Lambda package can be large enough to need substantially longer than
 /// the JSON API client's timeout on a slow uplink.
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Cross-compile the module in `dir` to a Linux/arm64 static binary named
-/// `bootstrap` inside a fresh temp dir. The returned temp dir must remain
-/// alive until the returned path has been uploaded.
-///
-/// The three build vars are set explicitly rather than inherited so a
-/// developer whose shell already exports `GOARCH=amd64` (or a CI image that
-/// does) still produces a Graviton binary — the platform's native-binary
-/// guards assert `aarch64` and a host-arch build would only fail at cold
-/// start, in prod.
-///
-/// `-trimpath` because this binary leaves the developer's machine: without it
-/// the compiled paths and DWARF carry the absolute source tree (`/Users/…`,
-/// `/home/…`, module cache paths) into an artifact stored on the platform.
-pub(crate) fn build_bootstrap(dir: &Path) -> Result<(TempDir, PathBuf)> {
-    let tmp = TempDir::new().context("create temp module build directory")?;
-    let bootstrap = tmp.path().join("bootstrap");
-    let output = Command::new("go")
-        .arg("build")
-        .arg("-trimpath")
-        .arg("-o")
-        .arg(&bootstrap)
-        .arg(".")
-        .current_dir(dir)
-        .env("GOOS", "linux")
-        .env("GOARCH", "arm64")
-        .env("CGO_ENABLED", "0")
-        .output();
-
-    let output = match output {
-        Ok(output) => output,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(anyhow!(
-                "Go toolchain required to deploy a module — install Go or run the deploy from a machine that has it"
-            ));
-        }
-        Err(error) => return Err(error).context("run Go compiler"),
-    };
-    if !output.status.success() {
-        let mut compiler_output = output.stderr;
-        compiler_output.extend_from_slice(&output.stdout);
-        return Err(anyhow!(
-            "Go build failed:\n{}",
-            String::from_utf8_lossy(&compiler_output).trim()
-        ));
-    }
-
-    assert_aarch64_elf(&bootstrap)?;
-    set_executable(&bootstrap)?;
-    Ok((tmp, bootstrap))
-}
 
 /// Zip `bootstrap_path` as the executable `bootstrap` entry at the archive
 /// root, writing the archive alongside the binary.
@@ -123,20 +75,16 @@ pub(crate) enum ShipOutcome {
     Shipped,
     /// The platform answered `artifact_storage_unconfigured`: it has no
     /// artifact store wired, so there is nothing to upload to. Not an error —
-    /// see the caller in `module::deploy` for why this stays non-fatal.
+    /// the caller may make exactly one explicit server-gated local-simulator
+    /// deploy attempt. Every other missing/failed artifact shape is fatal.
     StorageUnconfigured,
-    /// The route itself is absent — a 404 carrying no platform error
-    /// envelope. api-platform#440 is what mounts
-    /// `/v1/modules/{id}/versions/{ref}/artifact[/finalize]`; a platform build
-    /// that predates it has no such pattern at all, so chi's default handler
-    /// answers `404 page not found` as text/plain instead of the
-    /// `{"error":{"code":…}}` every real handler writes.
-    ///
-    /// Non-fatal for the same two reasons `StorageUnconfigured` is, plus a
-    /// third: such a platform also has no artifact gate on the deploy call
-    /// (#440 adds that too), so the deploy that follows still succeeds and
-    /// behaves exactly as it did before the CLI learned to upload.
-    EndpointsMissing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrepareOutcome {
+    Uploaded,
+    AlreadyReady,
+    StorageUnconfigured,
 }
 
 /// Create the upload → PUT → finalize the packaged artifact against the
@@ -146,6 +94,7 @@ pub(crate) enum ShipOutcome {
 /// `app::deploy::deploy_ssr` wraps its own: tests drive the identical
 /// upload path against a tiny cap instead of needing a genuine 250 MB
 /// fixture on disk to prove the guard rejects.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ship_artifact(
     api_client: &Client,
     apps_base: &str,
@@ -153,6 +102,8 @@ pub(crate) fn ship_artifact(
     module_id: &str,
     version_ref: &str,
     zip_path: &Path,
+    candidate: &ReleaseCandidateReceipt,
+    version_id: &str,
 ) -> Result<ShipOutcome> {
     ship_artifact_with_cap(
         api_client,
@@ -161,6 +112,8 @@ pub(crate) fn ship_artifact(
         module_id,
         version_ref,
         zip_path,
+        candidate,
+        version_id,
         MAX_ARTIFACT_BYTES,
     )
 }
@@ -183,78 +136,140 @@ fn ship_artifact_with_cap(
     module_id: &str,
     version_ref: &str,
     zip_path: &Path,
+    candidate: &ReleaseCandidateReceipt,
+    version_id: &str,
     max_artifact_bytes: u64,
 ) -> Result<ShipOutcome> {
-    let size = file_size(zip_path)?;
-    guard_size(size, max_artifact_bytes)?;
-
-    // Both legs can answer `artifact_storage_unconfigured` (the platform's
-    // handler maps store absence to it on create-upload *and* finalize) and
-    // both are mounted by the same PR, so both are checked for both
-    // non-fatal shapes; every other code stays fatal.
-    //
-    // Checking the finalize leg for a missing route is not redundant with
-    // checking the create leg: the two calls are separate requests and can
-    // land on different platform builds mid-rollout, so create can succeed
-    // against a new build while finalize hits an old one.
-    let outcome = with_spinner("Uploading artifact…", || -> Result<ShipOutcome> {
-        let upload = match api::create_module_artifact_upload(
-            api_client,
-            apps_base,
-            access_token,
-            module_id,
-            version_ref,
-        ) {
-            Ok(upload) => upload,
-            Err(error) if storage_unconfigured(&error) => {
-                return Ok(ShipOutcome::StorageUnconfigured);
-            }
-            Err(error) if endpoints_missing(&error) => {
-                return Ok(ShipOutcome::EndpointsMissing);
-            }
-            Err(error) => return Err(api_error(error)),
-        };
-        // Presigned URLs carry their own auth, so this PUT goes out on a
-        // client with no bearer token and an upload-sized timeout.
-        let upload_client = http::client(UPLOAD_TIMEOUT)?;
-        upload_one(&upload_client, &upload, zip_path)?;
-        Ok(ShipOutcome::Shipped)
-    })?;
-    if outcome != ShipOutcome::Shipped {
-        return Ok(outcome);
+    let bytes = fs::read(zip_path).with_context(|| format!("read {}", zip_path.display()))?;
+    let size_bytes = bytes.len() as u64;
+    guard_size(size_bytes, max_artifact_bytes)?;
+    let sha256 = sha256_hex(&bytes);
+    if size_bytes != candidate.artifact.size_bytes || sha256 != candidate.artifact.sha256 {
+        return Err(anyhow!(
+            "module artifact changed after release-candidate attestation (expected {}, {} bytes; current {sha256}, {size_bytes} bytes)",
+            candidate.artifact.sha256,
+            candidate.artifact.size_bytes,
+        ));
     }
 
-    match with_spinner("Finalizing artifact…", || {
+    // Only an explicit create-upload `artifact_storage_unconfigured` response
+    // may select the server-gated local simulator. Missing routes, legacy
+    // platforms, and a failure after upload all fail closed.
+    let prepared = with_spinner(
+        "Preparing artifact upload…",
+        || -> Result<PrepareOutcome> {
+            let upload = match api::create_module_artifact_upload(
+                api_client,
+                apps_base,
+                access_token,
+                module_id,
+                version_ref,
+            ) {
+                Ok(upload) => upload,
+                Err(error) if storage_unconfigured(&error) => {
+                    return Ok(PrepareOutcome::StorageUnconfigured);
+                }
+                // A prior invocation may have finalized these immutable bytes and
+                // crashed before deploy. Never issue another PUT: bodyless
+                // finalize's ready branch re-verifies the pinned destination and
+                // returns the same candidate-bound receipt.
+                Err(ApiError::Server { code, .. }) if code == CODE_ALREADY_READY => {
+                    return Ok(PrepareOutcome::AlreadyReady);
+                }
+                Err(error) => return Err(api_error(error)),
+            };
+            verify_artifact_upload_response(
+                &upload,
+                module_id,
+                version_id,
+                version_ref,
+                candidate,
+            )?;
+            // Presigned URLs carry their own auth, so this PUT goes out on a
+            // client with no bearer token and an upload-sized timeout.
+            let upload_client = http::client(UPLOAD_TIMEOUT)?;
+            upload_one(&upload_client, &upload, &bytes)?;
+            Ok(PrepareOutcome::Uploaded)
+        },
+    )?;
+    if prepared == PrepareOutcome::StorageUnconfigured {
+        return Ok(ShipOutcome::StorageUnconfigured);
+    }
+
+    let finalized = match with_spinner("Finalizing artifact…", || {
         api::finalize_module_artifact(api_client, apps_base, access_token, module_id, version_ref)
     }) {
-        Ok(_) => Ok(ShipOutcome::Shipped),
-        Err(error) if storage_unconfigured(&error) => Ok(ShipOutcome::StorageUnconfigured),
-        Err(error) if endpoints_missing(&error) => Ok(ShipOutcome::EndpointsMissing),
-        Err(error) => Err(api_error(error)),
+        Ok(finalized) => finalized,
+        Err(error) => return Err(api_error(error)),
+    };
+    verify_artifact_finalize_response(&finalized, module_id, version_id, version_ref, candidate)?;
+    Ok(ShipOutcome::Shipped)
+}
+
+fn verify_artifact_upload_response(
+    upload: &api::ModuleArtifactUpload,
+    module_id: &str,
+    version_id: &str,
+    version: &str,
+    candidate: &ReleaseCandidateReceipt,
+) -> Result<()> {
+    let mismatch = |field: &str| {
+        anyhow!(
+            "artifact create returned a {field} that does not match the immutable {}@{version} release candidate",
+            candidate.slug
+        )
+    };
+    if upload.module_id != module_id || upload.version_id != version_id {
+        return Err(mismatch("version identity"));
     }
+    if upload.url.is_empty() || upload.headers.is_empty() || upload.expires_at.is_empty() {
+        return Err(mismatch("usable presigned upload"));
+    }
+    verify_operation_release_receipt(
+        &upload.release_receipt,
+        candidate,
+        &candidate.slug,
+        version,
+        "artifact create",
+    )
+}
+
+fn verify_artifact_finalize_response(
+    artifact: &api::ModuleArtifact,
+    module_id: &str,
+    version_id: &str,
+    version: &str,
+    candidate: &ReleaseCandidateReceipt,
+) -> Result<()> {
+    let mismatch = |field: &str| {
+        anyhow!(
+            "artifact finalize returned a {field} that does not match the immutable {}@{version} release candidate",
+            candidate.slug
+        )
+    };
+    if artifact.module_id != module_id || artifact.version_id != version_id {
+        return Err(mismatch("version identity"));
+    }
+    if artifact.status != "ready"
+        || u64::try_from(artifact.size_bytes).ok() != Some(candidate.artifact.size_bytes)
+        || artifact.sha256 != candidate.artifact.sha256
+        || artifact.created_at.is_empty()
+        || artifact.updated_at.is_empty()
+        || artifact.finalized_at.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(mismatch("ready artifact evidence"));
+    }
+    verify_operation_release_receipt(
+        &artifact.release_receipt,
+        candidate,
+        &candidate.slug,
+        version,
+        "artifact finalize",
+    )
 }
 
 fn storage_unconfigured(error: &ApiError) -> bool {
     matches!(error, ApiError::Server { code, .. } if code == CODE_STORAGE_UNCONFIGURED)
-}
-
-/// A 404 that did **not** carry the platform's `{"error":{…}}` envelope —
-/// nothing routed the request at all.
-///
-/// That absence is the whole discriminator, and it is reliable: `httputil`
-/// writes the envelope on every response it produces, so the artifact routes'
-/// own 404s (module / version / pending-row not found) always arrive as
-/// `ApiError::Server { code: "not_found", .. }`. Only an unrouted path falls
-/// through to chi's default `404 page not found`, which fails to parse as an
-/// envelope and lands in `ApiError::Unexpected`.
-///
-/// Reading this as "the platform predates the artifact endpoints" rather than
-/// "the base URL is wrong" is safe because `module deploy` has already made
-/// authenticated calls to other `/v1/modules` routes on this same base (the
-/// module lookup and the version record) before it ever ships an artifact — a
-/// bad base URL fails long before here.
-fn endpoints_missing(error: &ApiError) -> bool {
-    matches!(error, ApiError::Unexpected { status, .. } if *status == 404)
 }
 
 fn guard_size(size: u64, max_artifact_bytes: u64) -> Result<()> {
@@ -281,9 +296,8 @@ fn api_error(error: ApiError) -> anyhow::Error {
 /// One presigned PUT: the body is the archive verbatim and the headers are
 /// exactly what the platform handed back — nothing added (no bearer token;
 /// the signature IS the auth).
-fn upload_one(client: &Client, upload: &api::ModuleArtifactUpload, path: &Path) -> Result<()> {
-    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let mut req = client.put(&upload.url).body(bytes);
+fn upload_one(client: &Client, upload: &api::ModuleArtifactUpload, bytes: &[u8]) -> Result<()> {
+    let mut req = client.put(&upload.url).body(bytes.to_vec());
     for (name, value) in &upload.headers {
         req = req.header(name.as_str(), value.as_str());
     }
@@ -295,19 +309,21 @@ fn upload_one(client: &Client, upload: &api::ModuleArtifactUpload, path: &Path) 
         .map_err(|error| anyhow!("presigned PUT failed: {}", error.without_url()))?;
     let status = resp.status();
     if !status.is_success() {
-        let body = http::read_capped(resp).unwrap_or_default();
-        return Err(anyhow!(
-            "presigned PUT failed: HTTP {} {}",
-            status.as_u16(),
-            String::from_utf8_lossy(&body).trim()
-        ));
+        // Storage bodies may echo the full signed request URI. Never expose
+        // bearer-like presign query parameters through a CLI error.
+        return Err(anyhow!("presigned PUT failed: HTTP {}", status.as_u16()));
     }
     Ok(())
 }
 
-/// Size of a file on disk, without reading it — the only artifact fact the
-/// CLI needs, since the platform HEADs the uploaded object for size and
-/// digest at finalize rather than trusting a caller declaration.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Size of a file on disk for the early packaging ceiling. The attested upload
+/// path separately reads and hashes one exact byte buffer before any request.
 fn file_size(path: &Path) -> Result<u64> {
     Ok(fs::metadata(path)
         .with_context(|| format!("stat {}", path.display()))?
@@ -317,7 +333,7 @@ fn file_size(path: &Path) -> Result<u64> {
 /// Refuse anything that isn't a 64-bit little-endian AArch64 ELF. A
 /// host-arch binary is a perfectly valid file that only fails at cold start
 /// in prod, so the check belongs here, next to the build that produced it.
-fn assert_aarch64_elf(path: &Path) -> Result<()> {
+pub(crate) fn assert_aarch64_elf(path: &Path) -> Result<()> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut header = Vec::with_capacity(ELF_HEADER_PREFIX);
     // `take` + `read_to_end` rather than one `read`: a single read is allowed
@@ -348,18 +364,6 @@ fn assert_aarch64_elf_header(header: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn set_executable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("chmod +x {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_executable(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
 /// `1023 B` / `4.2 KB` / `250.0 MB` — one decimal above bytes.
 pub(crate) fn human_bytes(n: u64) -> String {
     const KB: f64 = 1024.0;
@@ -385,6 +389,44 @@ mod tests {
     use serde_json::json;
 
     type UploadCapture = Arc<Mutex<(String, Vec<u8>)>>;
+
+    fn candidate(sha256: String, size_bytes: u64) -> ReleaseCandidateReceipt {
+        ReleaseCandidateReceipt {
+            protocol: crate::commands::release_candidate::CANDIDATE_PROTOCOL.to_string(),
+            module_id: "module-id".to_string(),
+            slug: "media".to_string(),
+            version: "1.2.3".to_string(),
+            source_sha256: "a".repeat(64),
+            manifest: crate::commands::release_candidate::ManifestEvidence {
+                sha256: "b".repeat(64),
+                base64: "e30K".to_string(),
+            },
+            web: None,
+            artifact: crate::commands::release_candidate::ArtifactEvidence {
+                sha256,
+                size_bytes,
+                os: "linux".to_string(),
+                arch: "arm64".to_string(),
+                format: "lambda-bootstrap-zip".to_string(),
+            },
+        }
+    }
+
+    fn operation_receipt(candidate: &ReleaseCandidateReceipt) -> serde_json::Value {
+        json!({
+            "protocol": candidate.protocol,
+            "source_sha256": candidate.source_sha256,
+            "manifest_sha256": candidate.manifest.sha256,
+            "artifact": {
+                "sha256": candidate.artifact.sha256,
+                "size_bytes": candidate.artifact.size_bytes,
+                "os": candidate.artifact.os,
+                "arch": candidate.artifact.arch,
+                "format": candidate.artifact.format
+            },
+            "web": null
+        })
+    }
 
     fn elf_header(machine: u16) -> [u8; ELF_HEADER_PREFIX] {
         let mut header = [0u8; ELF_HEADER_PREFIX];
@@ -427,6 +469,7 @@ mod tests {
         let path = dir.path().join("bootstrap.zip");
         fs::write(&path, b"xx").expect("write artifact");
         let client = http::client(Duration::from_secs(1)).expect("client");
+        let candidate = candidate(sha256_hex(b"xx"), 2);
         let error = ship_artifact_with_cap(
             &client,
             "http://127.0.0.1:1",
@@ -434,11 +477,39 @@ mod tests {
             "module-id",
             "1.0.0",
             &path,
+            &candidate,
+            "v-1",
             1,
         )
         .expect_err("oversize rejected");
         assert!(error.to_string().contains("too large"));
         assert!(error.to_string().contains("1 B"));
+    }
+
+    #[test]
+    fn ship_rehashes_exact_upload_bytes_against_candidate_evidence_before_network() {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("bootstrap.zip");
+        fs::write(&path, b"changed").expect("write artifact");
+        let client = http::client(Duration::from_secs(1)).expect("client");
+        let candidate = candidate(sha256_hex(b"original"), b"original".len() as u64);
+        let error = ship_artifact(
+            &client,
+            "http://127.0.0.1:1",
+            "AT",
+            "module-id",
+            "1.0.0",
+            &path,
+            &candidate,
+            "v-1",
+        )
+        .expect_err("candidate mismatch rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("changed after release-candidate"),
+            "{error:#}"
+        );
     }
 
     fn spawn_upload_capture() -> (String, UploadCapture) {
@@ -488,7 +559,10 @@ mod tests {
         let bootstrap = dir.path().join("bootstrap");
         fs::write(&bootstrap, b"lambda bootstrap").expect("write bootstrap");
         let zip_path = zip_bootstrap(&bootstrap).expect("zip bootstrap");
-        let size = fs::metadata(&zip_path).expect("artifact metadata").len();
+        let artifact_bytes = fs::read(&zip_path).expect("artifact bytes");
+        let size = artifact_bytes.len() as u64;
+        let sha256 = sha256_hex(&artifact_bytes);
+        let candidate = candidate(sha256, size);
         let (upload_url, captured) = spawn_upload_capture();
 
         let mut server = Server::new();
@@ -503,10 +577,10 @@ mod tests {
                 json!({
                     "version_id": "v-1",
                     "module_id": "module-id",
-                    "key": "modules/module-id/versions/v-1/artifact.zip",
                     "url": upload_url,
                     "headers": {"Content-Type": "application/zip"},
-                    "expires_at": "2026-08-02T00:00:00Z"
+                    "expires_at": "2026-08-02T00:00:00Z",
+                    "release_receipt": operation_receipt(&candidate)
                 })
                 .to_string(),
             )
@@ -522,11 +596,13 @@ mod tests {
                 json!({
                     "version_id": "v-1",
                     "module_id": "module-id",
-                    "key": "modules/module-id/versions/v-1/artifact.zip",
                     "status": "ready",
                     "size_bytes": size,
+                    "sha256": candidate.artifact.sha256,
                     "created_at": "2026-08-02T00:00:00Z",
-                    "updated_at": "2026-08-02T00:00:00Z"
+                    "updated_at": "2026-08-02T00:00:00Z",
+                    "finalized_at": "2026-08-02T00:00:00Z",
+                    "release_receipt": operation_receipt(&candidate)
                 })
                 .to_string(),
             )
@@ -539,6 +615,8 @@ mod tests {
             "module-id",
             "1.2.3",
             &zip_path,
+            &candidate,
+            "v-1",
         )
         .expect("ship artifact");
         create.assert();
@@ -562,6 +640,76 @@ mod tests {
         assert_eq!(archive.by_index(0).expect("entry").name(), "bootstrap");
     }
 
+    #[test]
+    fn create_receipt_mismatch_stops_before_the_presigned_put() {
+        let dir = TempDir::new().expect("temp dir");
+        let bootstrap = dir.path().join("bootstrap");
+        fs::write(&bootstrap, b"lambda bootstrap").expect("write bootstrap");
+        let zip_path = zip_bootstrap(&bootstrap).expect("zip bootstrap");
+        let bytes = fs::read(&zip_path).unwrap();
+        let candidate = candidate(sha256_hex(&bytes), bytes.len() as u64);
+        let mut wrong_receipt = operation_receipt(&candidate);
+        wrong_receipt["source_sha256"] = serde_json::Value::String("d".repeat(64));
+
+        let mut server = Server::new();
+        let create = server
+            .mock("POST", "/v1/modules/module-id/versions/1.2.3/artifact")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "version_id": "v-1",
+                    "module_id": "module-id",
+                    "url": "http://127.0.0.1:1/must-not-upload",
+                    "headers": {"Content-Type": "application/zip"},
+                    "expires_at": "2026-08-02T00:00:00Z",
+                    "release_receipt": wrong_receipt
+                })
+                .to_string(),
+            )
+            .create();
+        let client = http::client(Duration::from_secs(15)).unwrap();
+        let error = ship_artifact(
+            &client,
+            &server.url(),
+            "AT",
+            "module-id",
+            "1.2.3",
+            &zip_path,
+            &candidate,
+            "v-1",
+        )
+        .unwrap_err();
+        create.assert();
+        assert!(error.to_string().contains("source/manifest"), "{error:#}");
+    }
+
+    #[test]
+    fn finalize_requires_exact_ready_artifact_and_candidate_receipt() {
+        let candidate = candidate("c".repeat(64), 2048);
+        let mut body = json!({
+            "version_id": "v-1",
+            "module_id": "module-id",
+            "status": "ready",
+            "size_bytes": candidate.artifact.size_bytes,
+            "sha256": candidate.artifact.sha256,
+            "created_at": "2026-08-02T00:00:00Z",
+            "updated_at": "2026-08-02T00:00:01Z",
+            "finalized_at": "2026-08-02T00:00:01Z",
+            "release_receipt": operation_receipt(&candidate)
+        });
+        let exact: api::ModuleArtifact = serde_json::from_value(body.clone()).unwrap();
+        verify_artifact_finalize_response(&exact, "module-id", "v-1", "1.2.3", &candidate).unwrap();
+
+        body["status"] = serde_json::Value::String("pending".to_string());
+        let pending: api::ModuleArtifact = serde_json::from_value(body).unwrap();
+        assert!(
+            verify_artifact_finalize_response(&pending, "module-id", "v-1", "1.2.3", &candidate)
+                .unwrap_err()
+                .to_string()
+                .contains("ready artifact evidence")
+        );
+    }
+
     /// Drive the whole ship flow against a create-upload leg that answers
     /// `status` with `body` verbatim — the body shape is the point, since a
     /// platform error envelope and an unrouted 404 are told apart by nothing
@@ -571,6 +719,10 @@ mod tests {
         let bootstrap = dir.path().join("bootstrap");
         fs::write(&bootstrap, b"lambda bootstrap").expect("write bootstrap");
         let zip_path = zip_bootstrap(&bootstrap).expect("zip bootstrap");
+        let bytes = fs::read(&zip_path).expect("artifact bytes");
+        let sha256 = sha256_hex(&bytes);
+        let size = bytes.len() as u64;
+        let candidate = candidate(sha256, size);
         let mut server = Server::new();
         let create = server
             .mock("POST", "/v1/modules/module-id/versions/1.2.3/artifact")
@@ -585,6 +737,8 @@ mod tests {
             "module-id",
             "1.2.3",
             &zip_path,
+            &candidate,
+            "v-1",
         );
         create.assert();
         result
@@ -597,8 +751,9 @@ mod tests {
         )
     }
 
-    /// A platform with no artifact store (local prod-sim, bucket-less prod)
-    /// must not fail a deploy whose version record is already frozen.
+    /// The one non-fatal create response is handed to the caller, which may
+    /// request the server-gated local simulator. Remote bucketless platforms
+    /// will reject that deploy mode.
     #[test]
     fn storage_unconfigured_is_reported_not_fatal() {
         let outcome = ship_against_create_upload_error(503, "artifact_storage_unconfigured")
@@ -606,16 +761,13 @@ mod tests {
         assert_eq!(outcome, ShipOutcome::StorageUnconfigured);
     }
 
-    /// A platform build that predates the artifact routes doesn't answer
-    /// `artifact_storage_unconfigured` — it doesn't route the request at all,
-    /// and chi's default handler writes this exact plain-text body. Reported,
-    /// and distinctly from the 503, but not fatal: that platform has no
-    /// artifact gate on the deploy call either, so the deploy still lands.
+    /// A platform build that predates the attested artifact routes must not
+    /// receive an unsafe legacy deploy fallback.
     #[test]
-    fn missing_artifact_routes_are_reported_not_fatal() {
-        let outcome = ship_against_create_upload_body(404, "404 page not found\n")
-            .expect("a platform without the routes is not an error");
-        assert_eq!(outcome, ShipOutcome::EndpointsMissing);
+    fn missing_artifact_routes_fail_closed() {
+        let error = ship_against_create_upload_body(404, "404 page not found\n")
+            .expect_err("a platform without attested routes must fail");
+        assert!(error.to_string().contains("404"), "{error:#}");
     }
 
     /// …and the enveloped 404 the routes themselves emit (module, version or
@@ -636,14 +788,134 @@ mod tests {
         assert!(error.to_string().contains("artifact_invalid"), "{error}");
     }
 
-    /// Create can succeed against a new platform build while finalize lands
-    /// on an old one mid-rollout, so the finalize leg carries the same arm.
     #[test]
-    fn missing_finalize_route_is_reported_not_fatal() {
+    fn retry_after_finalize_reverifies_without_another_put() {
+        let dir = TempDir::new().expect("temp dir");
+        let bootstrap = dir.path().join("bootstrap");
+        fs::write(&bootstrap, b"lambda bootstrap").unwrap();
+        let zip_path = zip_bootstrap(&bootstrap).unwrap();
+        let bytes = fs::read(&zip_path).unwrap();
+        let candidate = candidate(sha256_hex(&bytes), bytes.len() as u64);
+        let mut server = Server::new();
+        let create = server
+            .mock("POST", "/v1/modules/module-id/versions/1.2.3/artifact")
+            .with_status(409)
+            .with_body(
+                json!({
+                    "error": {
+                        "code": "artifact_already_ready",
+                        "message": "artifact is already ready"
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+        let finalize = server
+            .mock(
+                "POST",
+                "/v1/modules/module-id/versions/1.2.3/artifact/finalize",
+            )
+            .with_status(200)
+            .with_body(
+                json!({
+                    "version_id": "v-1",
+                    "module_id": "module-id",
+                    "status": "ready",
+                    "size_bytes": candidate.artifact.size_bytes,
+                    "sha256": candidate.artifact.sha256,
+                    "created_at": "2026-08-02T00:00:00Z",
+                    "updated_at": "2026-08-02T00:00:01Z",
+                    "finalized_at": "2026-08-02T00:00:01Z",
+                    "release_receipt": operation_receipt(&candidate)
+                })
+                .to_string(),
+            )
+            .create();
+        let client = http::client(Duration::from_secs(15)).unwrap();
+        let outcome = ship_artifact(
+            &client,
+            &server.url(),
+            "AT",
+            "module-id",
+            "1.2.3",
+            &zip_path,
+            &candidate,
+            "v-1",
+        )
+        .unwrap();
+        create.assert();
+        finalize.assert();
+        assert_eq!(outcome, ShipOutcome::Shipped);
+    }
+
+    #[test]
+    fn retry_of_tampered_ready_artifact_fails_closed() {
+        let dir = TempDir::new().expect("temp dir");
+        let bootstrap = dir.path().join("bootstrap");
+        fs::write(&bootstrap, b"lambda bootstrap").unwrap();
+        let zip_path = zip_bootstrap(&bootstrap).unwrap();
+        let bytes = fs::read(&zip_path).unwrap();
+        let candidate = candidate(sha256_hex(&bytes), bytes.len() as u64);
+        let mut server = Server::new();
+        let create = server
+            .mock("POST", "/v1/modules/module-id/versions/1.2.3/artifact")
+            .with_status(409)
+            .with_body(
+                json!({
+                    "error": {
+                        "code": "artifact_already_ready",
+                        "message": "artifact is already ready"
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+        let finalize = server
+            .mock(
+                "POST",
+                "/v1/modules/module-id/versions/1.2.3/artifact/finalize",
+            )
+            .with_status(422)
+            .with_body(
+                json!({
+                    "error": {
+                        "code": "artifact_invalid",
+                        "message": "ready artifact no longer matches its immutable receipt"
+                    }
+                })
+                .to_string(),
+            )
+            .create();
+        let client = http::client(Duration::from_secs(15)).unwrap();
+        let error = ship_artifact(
+            &client,
+            &server.url(),
+            "AT",
+            "module-id",
+            "1.2.3",
+            &zip_path,
+            &candidate,
+            "v-1",
+        )
+        .unwrap_err();
+        create.assert();
+        finalize.assert();
+        assert!(error.to_string().contains("artifact_invalid"), "{error:#}");
+    }
+
+    /// Create can succeed against a new platform build while finalize lands
+    /// on an old one mid-rollout. That cannot safely select local simulation:
+    /// bytes were already uploaded and finalization did not prove them.
+    #[test]
+    fn missing_finalize_route_fails_closed() {
         let dir = TempDir::new().expect("temp dir");
         let bootstrap = dir.path().join("bootstrap");
         fs::write(&bootstrap, b"lambda bootstrap").expect("write bootstrap");
         let zip_path = zip_bootstrap(&bootstrap).expect("zip bootstrap");
+        let bytes = fs::read(&zip_path).expect("artifact bytes");
+        let sha256 = sha256_hex(&bytes);
+        let size = bytes.len() as u64;
+        let candidate = candidate(sha256, size);
         let (upload_url, _captured) = spawn_upload_capture();
 
         let mut server = Server::new();
@@ -654,10 +926,10 @@ mod tests {
                 json!({
                     "version_id": "v-1",
                     "module_id": "module-id",
-                    "key": "modules/module-id/versions/v-1/artifact.zip",
                     "url": upload_url,
                     "headers": {"Content-Type": "application/zip"},
-                    "expires_at": "2026-08-02T00:00:00Z"
+                    "expires_at": "2026-08-02T00:00:00Z",
+                    "release_receipt": operation_receipt(&candidate)
                 })
                 .to_string(),
             )
@@ -671,18 +943,20 @@ mod tests {
             .with_body("404 page not found\n")
             .create();
         let client = http::client(Duration::from_secs(15)).expect("client");
-        let outcome = ship_artifact(
+        let error = ship_artifact(
             &client,
             &server.url(),
             "AT",
             "module-id",
             "1.2.3",
             &zip_path,
+            &candidate,
+            "v-1",
         )
-        .expect("a platform without the finalize route is not an error");
+        .expect_err("a platform without the finalize route must fail");
         create.assert();
         finalize.assert();
-        assert_eq!(outcome, ShipOutcome::EndpointsMissing);
+        assert!(error.to_string().contains("404"), "{error:#}");
     }
 
     #[test]

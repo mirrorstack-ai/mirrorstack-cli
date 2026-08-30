@@ -21,7 +21,7 @@ use crate::commands::dev::module_meta::{self, ModuleMeta};
 use crate::credentials;
 use crate::http;
 
-mod artifact;
+pub(crate) mod artifact;
 pub(crate) mod capabilities;
 mod changelog;
 mod deploy;
@@ -33,9 +33,8 @@ mod scaffold;
 mod version_move;
 
 use super::{
-    DEFAULT_API_BASE, DEFAULT_APPS_API_BASE, DEFAULT_DISPATCH_BASE, DEFAULT_WEB_BASE, ENV_API_URL,
-    ENV_APPS_API_URL, ENV_DISPATCH_URL, ENV_WEB_URL, ok_mark, resolve_base, session_expired,
-    warn_prefix,
+    DEFAULT_API_BASE, DEFAULT_APPS_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_APPS_API_URL,
+    ENV_WEB_URL, ok_mark, resolve_base, session_expired, warn_prefix,
 };
 
 #[derive(Args)]
