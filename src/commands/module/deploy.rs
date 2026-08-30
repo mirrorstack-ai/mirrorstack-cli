@@ -234,11 +234,7 @@ pub(super) fn run(args: DeployArgs) -> Result<()> {
             style(format!("{slug}@{version}")).cyan().bold()
         );
     }
-    eprintln!(
-        "  {} sha256:{}",
-        style("artifact:").dim(),
-        candidate.receipt().artifact.sha256
-    );
+    eprintln!("  {} verified", style("artifact:").dim());
     if let Some(target) = remote
         .last_deploy
         .as_ref()
