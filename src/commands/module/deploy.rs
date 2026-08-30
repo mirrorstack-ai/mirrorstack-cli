@@ -90,14 +90,12 @@ pub(super) fn run(args: DeployArgs) -> Result<()> {
         })
     })?;
     let zip_path = candidate.artifact_path();
-    let artifact_size = candidate.receipt().artifact.size_bytes;
 
     eprintln!(
-        "  {} {} → {} (arm64 bundle, {})",
+        "  {} {} → {} (arm64 bundle)",
         style("Deploying:").dim(),
         style(dir.display()).bold(),
         style(format!("{slug}@{version}")).cyan().bold(),
-        artifact::human_bytes(artifact_size)
     );
 
     let recorded_state = ensure_version_recorded(
@@ -129,10 +127,9 @@ pub(super) fn run(args: DeployArgs) -> Result<()> {
     let deploy_mode = match shipped {
         artifact::ShipOutcome::Shipped => {
             eprintln!(
-                "{} uploaded {} ({})",
+                "{} uploaded {}",
                 ok_mark(),
                 style(format!("{slug}@{version}")).cyan().bold(),
-                artifact::human_bytes(artifact_size)
             );
             api::ModuleDeployMode::Artifact
         }
