@@ -32,6 +32,26 @@ struct ReleaseMetadata {
     readme_truncated: bool,
 }
 
+trait CandidateEvidence {
+    fn receipt(&self) -> &ReleaseCandidateReceipt;
+    fn verify_live_source(&self) -> Result<()>;
+    fn verify_artifact(&self) -> Result<()>;
+}
+
+impl CandidateEvidence for ReleaseCandidate {
+    fn receipt(&self) -> &ReleaseCandidateReceipt {
+        ReleaseCandidate::receipt(self)
+    }
+
+    fn verify_live_source(&self) -> Result<()> {
+        ReleaseCandidate::verify_live_source(self)
+    }
+
+    fn verify_artifact(&self) -> Result<()> {
+        ReleaseCandidate::verify_artifact(self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MutationOutcome {
     /// The endpoint returned success. The next owner-state read must prove the
@@ -426,7 +446,7 @@ struct ApiReleaseOperations<'a> {
     module: &'a api::Module,
     slug: &'a str,
     version: &'a str,
-    candidate: &'a ReleaseCandidate,
+    candidate: &'a dyn CandidateEvidence,
     metadata: &'a ReleaseMetadata,
     zip_path: &'a Path,
     desired_deploy_status: String,
@@ -864,118 +884,6 @@ fn verify_recorded_version_response(
     Ok(())
 }
 
-#[cfg(test)]
-fn verify_version_exists_candidate(
-    client: &reqwest::blocking::Client,
-    apps_base: &str,
-    access_token: &str,
-    module_id: &str,
-    slug: &str,
-    version: &str,
-    candidate: &ReleaseCandidateReceipt,
-) -> Result<api::ModuleReleaseState> {
-    let state = read_existing_release_state(
-        client,
-        apps_base,
-        access_token,
-        module_id,
-        version,
-    )?
-    .ok_or_else(|| {
-        anyhow!(
-            "version_exists: the platform reported {slug}@{version} already exists, but its owner release state could not be reread; no artifact or deploy write was attempted"
-        )
-    })?;
-    verify_existing_release_candidate(&state, module_id, slug, version, candidate)?;
-    Ok(state)
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn ensure_candidate_web_capture(
-    client: &reqwest::blocking::Client,
-    apps_base: &str,
-    access_token: &str,
-    module_id: &str,
-    slug: &str,
-    version: &str,
-    candidate: &ReleaseCandidateReceipt,
-    initial_state: Option<api::ModuleReleaseState>,
-) -> Result<api::ModuleReleaseState> {
-    let mut state = match initial_state {
-        Some(state) => state,
-        None => read_existing_release_state(client, apps_base, access_token, module_id, version)?
-            .ok_or_else(|| {
-                anyhow!(
-                    "recorded {slug}@{version}, but its owner release state could not be reread; no artifact or deploy write was attempted"
-                )
-            })?,
-    };
-    verify_existing_release_candidate(&state, module_id, slug, version, candidate)?;
-
-    let Some(local_web) = candidate.web.as_ref() else {
-        // The exact comparator already proved the stored receipt also has no
-        // web tuple. Backend-only versions never call the capture endpoint.
-        return Ok(state);
-    };
-    let stored_web = state
-        .release_receipt
-        .web
-        .as_ref()
-        .expect("exact candidate comparison proved web evidence");
-
-    // Capture is deliberately unconditional for web candidates. Its
-    // nonempty-URL branch is an idempotent VerifyPinned operation, so this
-    // proves the destination still contains the exact frozen bytes before an
-    // artifact upload begins instead of deferring corruption detection to
-    // deploy time.
-    let capture = with_spinner("Verifying pinned web bundle…", || {
-        api::capture_module_version_bundle(client, apps_base, access_token, module_id, version)
-    });
-    let capture = match capture {
-        Ok(capture) => capture,
-        Err(ApiError::Server { code, message, .. }) => {
-            return Err(anyhow!("{code}: {message}"));
-        }
-        Err(ApiError::Unauthenticated) => return Err(session_expired()),
-        Err(error) => return Err(error.into()),
-    };
-    if !release_candidate::module_ids_equal(&capture.module_id, module_id)
-        || capture.version_id != state.version.id
-        || capture.version != version
-        || capture.web_bundle_sha256 != local_web.sha256
-        || capture.web_bundle_size_bytes != local_web.size_bytes
-        || capture.web_bundle_url.is_empty()
-        || (!stored_web.url.is_empty() && capture.web_bundle_url != stored_web.url)
-    {
-        return Err(anyhow!(
-            "web bundle capture returned a descriptor that does not match the immutable {slug}@{version} candidate; no artifact or deploy write was attempted"
-        ));
-    }
-
-    // Never trust the mutation response as the postcondition. The owner state
-    // is the durable source of truth and must expose the same pinned URL and
-    // exact descriptor before artifact upload begins.
-    state = read_existing_release_state(client, apps_base, access_token, module_id, version)?
-        .ok_or_else(|| {
-            anyhow!(
-                "captured {slug}@{version} web bundle, but its owner release state disappeared on reread"
-            )
-        })?;
-    verify_existing_release_candidate(&state, module_id, slug, version, candidate)?;
-    let captured_web = state
-        .release_receipt
-        .web
-        .as_ref()
-        .expect("exact candidate comparison proved web evidence");
-    if captured_web.url.is_empty() || captured_web.url != capture.web_bundle_url {
-        return Err(anyhow!(
-            "web bundle capture for {slug}@{version} did not persist its pinned URL; no artifact or deploy write was attempted"
-        ));
-    }
-    Ok(state)
-}
-
 fn guard_version_create_size(input: &RecordModuleVersionInput<'_>) -> Result<()> {
     let size = serde_json::to_vec(input)
         .context("release candidate: encode bounded version-create request")?
@@ -986,30 +894,6 @@ fn guard_version_create_size(input: &RecordModuleVersionInput<'_>) -> Result<()>
         ));
     }
     Ok(())
-}
-
-/// Read an existing immutable row without turning the owner-hidden 404 into
-/// success. Callers decide whether absence means the original local lint
-/// error or a contradictory `version_exists` race.
-#[cfg(test)]
-fn read_existing_release_state(
-    client: &reqwest::blocking::Client,
-    apps_base: &str,
-    access_token: &str,
-    module_id: &str,
-    version: &str,
-) -> Result<Option<api::ModuleReleaseState>> {
-    let state = with_spinner("Checking recorded version receipt…", || {
-        api::get_module_release_state(client, apps_base, access_token, module_id, version)
-    });
-    match state {
-        Ok(state) => Ok(Some(state)),
-        Err(ApiError::Server {
-            status: 404, code, ..
-        }) if code == "not_found" => Ok(None),
-        Err(ApiError::Unauthenticated) => Err(session_expired()),
-        Err(e) => Err(e.into()),
-    }
 }
 
 fn verify_existing_release_candidate(
@@ -1436,6 +1320,70 @@ mod release_preparation_tests {
     const SDK_MODULE_ID: &str = "m11111111111111111111111111111111";
     const SLUG: &str = "media";
     const VERSION: &str = "1.2.3";
+
+    struct TestCandidate {
+        receipt: ReleaseCandidateReceipt,
+    }
+
+    impl CandidateEvidence for TestCandidate {
+        fn receipt(&self) -> &ReleaseCandidateReceipt {
+            &self.receipt
+        }
+
+        fn verify_live_source(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn verify_artifact(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_metadata() -> ReleaseMetadata {
+        ReleaseMetadata {
+            changelog: BTreeMap::new(),
+            readme: BTreeMap::new(),
+            migration_app: 0,
+            migration_module: 0,
+            changelog_warnings: Vec::new(),
+            readme_truncated: false,
+        }
+    }
+
+    fn test_module() -> api::Module {
+        api::Module {
+            id: MODULE_ID.to_string(),
+            name: "Media".to_string(),
+            slug: SLUG.to_string(),
+            owner_id: None,
+            created_at: None,
+        }
+    }
+
+    fn test_api_operations<'a>(
+        client: &'a reqwest::blocking::Client,
+        apps_base: &'a str,
+        module: &'a api::Module,
+        candidate: &'a dyn CandidateEvidence,
+        metadata: &'a ReleaseMetadata,
+    ) -> ApiReleaseOperations<'a> {
+        ApiReleaseOperations {
+            client,
+            apps_base,
+            access_token: "access-token",
+            module,
+            slug: SLUG,
+            version: VERSION,
+            candidate,
+            metadata,
+            zip_path: Path::new("unused-test-artifact.zip"),
+            desired_deploy_status: "active".to_string(),
+            last_version_id: None,
+            observed_web_url: None,
+            expected_capture_url: None,
+            last_deploy: None,
+        }
+    }
 
     struct FakeOperations {
         reads: VecDeque<RemoteRelease>,
@@ -2336,16 +2284,14 @@ mod release_preparation_tests {
             .with_body(matching_state_json(&stored_candidate).to_string())
             .create();
         let client = http::client(Duration::from_secs(15)).unwrap();
-        let error = verify_version_exists_candidate(
-            &client,
-            &server.url(),
-            "access-token",
-            MODULE_ID,
-            SLUG,
-            VERSION,
-            &local_candidate,
-        )
-        .unwrap_err();
+        let base = server.url();
+        let module = test_module();
+        let metadata = test_metadata();
+        let candidate = TestCandidate {
+            receipt: local_candidate,
+        };
+        let mut operations = test_api_operations(&client, &base, &module, &candidate, &metadata);
+        let error = operations.read_state().unwrap_err();
 
         reread.assert();
         assert!(
@@ -2356,204 +2302,141 @@ mod release_preparation_tests {
 
     #[test]
     fn fresh_version_rereads_then_recovers_web_before_artifact_writes() {
-        let candidate = candidate();
+        let receipt = candidate();
         let pinned = "https://cdn.example.test/media/index.js";
         let path = "/v1/modules/11111111-1111-1111-1111-111111111111/versions/1.2.3";
         let (base, server) = spawn_http_sequence(vec![
-            (
-                "GET",
-                path,
-                200,
-                matching_state_json(&candidate).to_string(),
-            ),
+            ("GET", path, 200, matching_state_json(&receipt).to_string()),
             (
                 "POST",
                 "/v1/modules/11111111-1111-1111-1111-111111111111/versions/1.2.3/bundle/capture",
                 200,
-                capture_json(&candidate, pinned).to_string(),
+                capture_json(&receipt, pinned).to_string(),
             ),
             (
                 "GET",
                 path,
                 200,
-                matching_state_json_with_url(&candidate, pinned).to_string(),
+                matching_state_json_with_url(&receipt, pinned).to_string(),
             ),
         ]);
         let client = http::client(Duration::from_secs(15)).unwrap();
-        let state = ensure_candidate_web_capture(
-            &client,
-            &base,
-            "access-token",
-            MODULE_ID,
-            SLUG,
-            VERSION,
-            &candidate,
-            None,
-        )
-        .unwrap();
-        server.join().unwrap();
+        let module = test_module();
+        let metadata = test_metadata();
+        let candidate = TestCandidate { receipt };
+        let mut operations = test_api_operations(&client, &base, &module, &candidate, &metadata);
+        assert!(matches!(
+            operations.read_state().unwrap(),
+            RemoteRelease::Present(_)
+        ));
         assert_eq!(
-            state.release_receipt.web.unwrap().url,
-            "https://cdn.example.test/media/index.js"
+            operations.capture_web_bundle().unwrap(),
+            MutationOutcome::Applied
         );
-    }
-
-    #[test]
-    fn version_exists_with_empty_web_url_recovers_and_rereads_exact_state() {
-        let candidate = candidate();
-        let mut initial = matching_state(&candidate);
-        initial.release_receipt.web.as_mut().unwrap().url.clear();
-        let pinned = "https://cdn.example.test/media/index.js";
-        let mut server = mockito::Server::new();
-        let capture = server
-            .mock(
-                "POST",
-                "/v1/modules/11111111-1111-1111-1111-111111111111/versions/1.2.3/bundle/capture",
-            )
-            .match_body("")
-            .with_status(200)
-            .with_body(capture_json(&candidate, pinned).to_string())
-            .create();
-        let reread = server
-            .mock(
-                "GET",
-                "/v1/modules/11111111-1111-1111-1111-111111111111/versions/1.2.3",
-            )
-            .with_status(200)
-            .with_body(matching_state_json_with_url(&candidate, pinned).to_string())
-            .create();
-        let client = http::client(Duration::from_secs(15)).unwrap();
-        let state = ensure_candidate_web_capture(
-            &client,
-            &server.url(),
-            "access-token",
-            MODULE_ID,
-            SLUG,
-            VERSION,
-            &candidate,
-            Some(initial),
-        )
-        .unwrap();
-        capture.assert();
-        reread.assert();
-        assert_eq!(state.release_receipt.web.unwrap().url, pinned);
+        let state = operations.read_state().unwrap();
+        server.join().unwrap();
+        let RemoteRelease::Present(state) = state else {
+            panic!("captured release disappeared")
+        };
+        assert_eq!(state.web_bundle_url, pinned);
     }
 
     #[test]
     fn existing_pinned_web_is_still_verified_before_artifact_writes() {
-        let candidate = candidate();
-        let initial = matching_state(&candidate);
-        let pinned = initial.release_receipt.web.as_ref().unwrap().url.clone();
-        let mut server = mockito::Server::new();
-        let capture = server
-            .mock(
+        let receipt = candidate();
+        let pinned = "https://cdn.example.test/media/index.js";
+        let state_path = "/v1/modules/11111111-1111-1111-1111-111111111111/versions/1.2.3";
+        let (base, server) = spawn_http_sequence(vec![
+            (
+                "GET",
+                state_path,
+                200,
+                matching_state_json_with_url(&receipt, pinned).to_string(),
+            ),
+            (
                 "POST",
                 "/v1/modules/11111111-1111-1111-1111-111111111111/versions/1.2.3/bundle/capture",
-            )
-            .with_status(200)
-            .with_body(capture_json(&candidate, &pinned).to_string())
-            .create();
-        let reread = server
-            .mock(
+                200,
+                capture_json(&receipt, pinned).to_string(),
+            ),
+            (
                 "GET",
-                "/v1/modules/11111111-1111-1111-1111-111111111111/versions/1.2.3",
-            )
-            .with_status(200)
-            .with_body(matching_state_json_with_url(&candidate, &pinned).to_string())
-            .create();
+                state_path,
+                200,
+                matching_state_json_with_url(&receipt, pinned).to_string(),
+            ),
+        ]);
         let client = http::client(Duration::from_secs(15)).unwrap();
-        ensure_candidate_web_capture(
-            &client,
-            &server.url(),
-            "access-token",
-            MODULE_ID,
-            SLUG,
-            VERSION,
-            &candidate,
-            Some(initial),
-        )
-        .unwrap();
-        capture.assert();
-        reread.assert();
+        let module = test_module();
+        let metadata = test_metadata();
+        let candidate = TestCandidate { receipt };
+        let mut operations = test_api_operations(&client, &base, &module, &candidate, &metadata);
+        operations.read_state().unwrap();
+        assert_eq!(
+            operations.capture_web_bundle().unwrap(),
+            MutationOutcome::Applied
+        );
+        operations.read_state().unwrap();
+        server.join().unwrap();
     }
 
     #[test]
     fn production_capture_validation_never_moves_an_observed_pinned_url() {
-        let candidate = candidate();
-        let local_web = candidate.web.as_ref().unwrap();
+        let receipt = candidate();
         let pinned = "https://cdn.example.test/media/index.js";
         let moved = "https://cdn.example.test/media/replacement.js";
-        let capture = api::ModuleBundleCapture {
-            module_id: MODULE_ID.to_string(),
-            version_id: "version-id".to_string(),
-            version: VERSION.to_string(),
-            web_bundle_url: moved.to_string(),
-            web_bundle_sha256: local_web.sha256.clone(),
-            web_bundle_size_bytes: local_web.size_bytes,
-        };
-
-        let error = verify_bundle_capture_response(
-            &capture,
-            MODULE_ID,
-            "version-id",
-            SLUG,
-            VERSION,
-            local_web,
-            Some(pinned),
-        )
-        .unwrap_err();
+        let (base, server) = spawn_http_sequence(vec![
+            (
+                "GET",
+                "/v1/modules/11111111-1111-1111-1111-111111111111/versions/1.2.3",
+                200,
+                matching_state_json_with_url(&receipt, pinned).to_string(),
+            ),
+            (
+                "POST",
+                "/v1/modules/11111111-1111-1111-1111-111111111111/versions/1.2.3/bundle/capture",
+                200,
+                capture_json(&receipt, moved).to_string(),
+            ),
+        ]);
+        let client = http::client(Duration::from_secs(15)).unwrap();
+        let module = test_module();
+        let metadata = test_metadata();
+        let candidate = TestCandidate { receipt };
+        let mut operations = test_api_operations(&client, &base, &module, &candidate, &metadata);
+        operations.read_state().unwrap();
+        let error = operations.capture_web_bundle().unwrap_err();
+        server.join().unwrap();
         assert!(error.to_string().contains("move the immutable pinned URL"));
     }
 
     #[test]
-    fn backend_only_candidate_never_calls_web_capture() {
-        let mut candidate = candidate();
-        candidate.web = None;
-        let state = matching_state(&candidate);
-        let client = http::client(Duration::from_secs(1)).unwrap();
-        let verified = ensure_candidate_web_capture(
-            &client,
-            "http://127.0.0.1:1",
-            "access-token",
-            MODULE_ID,
-            SLUG,
-            VERSION,
-            &candidate,
-            Some(state),
-        )
-        .unwrap();
-        assert!(verified.release_receipt.web.is_none());
-    }
-
-    #[test]
     fn mismatched_capture_response_fails_before_owner_reread_or_artifact_write() {
-        let candidate = candidate();
-        let mut initial = matching_state(&candidate);
-        initial.release_receipt.web.as_mut().unwrap().url.clear();
-        let mut wrong = capture_json(&candidate, "https://cdn.example.test/media/index.js");
+        let receipt = candidate();
+        let mut wrong = capture_json(&receipt, "https://cdn.example.test/media/index.js");
         wrong["web_bundle_sha256"] = serde_json::Value::String("d".repeat(64));
-        let mut server = mockito::Server::new();
-        let capture = server
-            .mock(
+        let (base, server) = spawn_http_sequence(vec![
+            (
+                "GET",
+                "/v1/modules/11111111-1111-1111-1111-111111111111/versions/1.2.3",
+                200,
+                matching_state_json(&receipt).to_string(),
+            ),
+            (
                 "POST",
                 "/v1/modules/11111111-1111-1111-1111-111111111111/versions/1.2.3/bundle/capture",
-            )
-            .with_status(200)
-            .with_body(wrong.to_string())
-            .create();
+                200,
+                wrong.to_string(),
+            ),
+        ]);
         let client = http::client(Duration::from_secs(15)).unwrap();
-        let error = ensure_candidate_web_capture(
-            &client,
-            &server.url(),
-            "access-token",
-            MODULE_ID,
-            SLUG,
-            VERSION,
-            &candidate,
-            Some(initial),
-        )
-        .unwrap_err();
-        capture.assert();
+        let module = test_module();
+        let metadata = test_metadata();
+        let candidate = TestCandidate { receipt };
+        let mut operations = test_api_operations(&client, &base, &module, &candidate, &metadata);
+        operations.read_state().unwrap();
+        let error = operations.capture_web_bundle().unwrap_err();
+        server.join().unwrap();
         assert!(error.to_string().contains("does not match"), "{error:#}");
     }
 
