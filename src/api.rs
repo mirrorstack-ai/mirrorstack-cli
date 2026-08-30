@@ -408,9 +408,18 @@ pub struct ModuleReleaseStateVersion {
     pub id: String,
     pub module_id: String,
     pub version: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub channel: String,
+    pub changelog: BTreeMap<String, String>,
+    pub readme: BTreeMap<String, String>,
+    pub migration_app: i64,
+    pub migration_module: i64,
     pub manifest: serde_json::Value,
+    pub published_at: String,
     #[serde(default)]
     pub yanked_at: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2975,8 +2984,17 @@ mod tests {
                         "id": "ver-uuid",
                         "module_id": "mod-uuid",
                         "version": "1.2.3",
+                        "title": "",
+                        "description": null,
+                        "channel": "stable",
+                        "changelog": {"default": "- ship it"},
+                        "readme": {"default": "# Media"},
+                        "migration_app": 1,
+                        "migration_module": 0,
                         "manifest": {"id": "m11111111111111111111111111111111", "slug": "media"},
-                        "yanked_at": null
+                        "published_at": "2026-08-31T00:00:00Z",
+                        "yanked_at": null,
+                        "created_at": "2026-08-31T00:00:00Z"
                     },
                     "release_receipt": {
                         "state": "bound",

@@ -78,13 +78,23 @@ pub(crate) enum ShipOutcome {
     /// the caller may make exactly one explicit server-gated local-simulator
     /// deploy attempt. Every other missing/failed artifact shape is fatal.
     StorageUnconfigured,
+    /// An ambiguous response or a server-confirmed artifact race requires an
+    /// authoritative reread and a fresh plan. The caller must not infer that
+    /// the attempted transition either committed or failed.
+    Replan,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PrepareOutcome {
     Uploaded,
-    AlreadyReady,
     StorageUnconfigured,
+    Replan,
+}
+
+#[derive(Debug)]
+enum UploadError {
+    Ambiguous,
+    Rejected(anyhow::Error),
 }
 
 /// Create the upload → PUT → finalize the packaged artifact against the
@@ -169,12 +179,16 @@ fn ship_artifact_with_cap(
                 Err(error) if storage_unconfigured(&error) => {
                     return Ok(PrepareOutcome::StorageUnconfigured);
                 }
-                // A prior invocation may have finalized these immutable bytes and
-                // crashed before deploy. Never issue another PUT: bodyless
-                // finalize's ready branch re-verifies the pinned destination and
-                // returns the same candidate-bound receipt.
-                Err(ApiError::Server { code, .. }) if code == CODE_ALREADY_READY => {
-                    return Ok(PrepareOutcome::AlreadyReady);
+                // A concurrent invocation finalized these immutable bytes
+                // after our owner-state read. Return to the authoritative
+                // planner; do not send PUT or finalize from stale state.
+                Err(ApiError::Server {
+                    status: 409, code, ..
+                }) if code == CODE_ALREADY_READY => {
+                    return Ok(PrepareOutcome::Replan);
+                }
+                Err(error) if ambiguous_api_error(&error) => {
+                    return Ok(PrepareOutcome::Replan);
                 }
                 Err(error) => return Err(api_error(error)),
             };
@@ -188,18 +202,28 @@ fn ship_artifact_with_cap(
             // Presigned URLs carry their own auth, so this PUT goes out on a
             // client with no bearer token and an upload-sized timeout.
             let upload_client = http::client(UPLOAD_TIMEOUT)?;
-            upload_one(&upload_client, &upload, &bytes)?;
+            match upload_one(&upload_client, &upload, &bytes) {
+                Ok(()) => {}
+                Err(UploadError::Ambiguous) => return Ok(PrepareOutcome::Replan),
+                Err(UploadError::Rejected(error)) => return Err(error),
+            }
             Ok(PrepareOutcome::Uploaded)
         },
     )?;
     if prepared == PrepareOutcome::StorageUnconfigured {
         return Ok(ShipOutcome::StorageUnconfigured);
     }
+    if prepared == PrepareOutcome::Replan {
+        return Ok(ShipOutcome::Replan);
+    }
 
     let finalized = match with_spinner("Finalizing artifact…", || {
         api::finalize_module_artifact(api_client, apps_base, access_token, module_id, version_ref)
     }) {
         Ok(finalized) => finalized,
+        Err(error) if ambiguous_api_error(&error) || artifact_race(&error) => {
+            return Ok(ShipOutcome::Replan);
+        }
         Err(error) => return Err(api_error(error)),
     };
     verify_artifact_finalize_response(&finalized, module_id, version_id, version_ref, candidate)?;
@@ -269,7 +293,43 @@ fn verify_artifact_finalize_response(
 }
 
 fn storage_unconfigured(error: &ApiError) -> bool {
-    matches!(error, ApiError::Server { code, .. } if code == CODE_STORAGE_UNCONFIGURED)
+    matches!(
+        error,
+        ApiError::Server {
+            status: 503,
+            code,
+            ..
+        } if code == CODE_STORAGE_UNCONFIGURED
+    )
+}
+
+fn ambiguous_api_error(error: &ApiError) -> bool {
+    match error {
+        ApiError::Http(_) | ApiError::Decode(_) | ApiError::Unexpected { status: 500.., .. } => {
+            true
+        }
+        ApiError::Server {
+            status: 500..,
+            code,
+            ..
+        } => code != CODE_STORAGE_UNCONFIGURED,
+        _ => false,
+    }
+}
+
+fn artifact_race(error: &ApiError) -> bool {
+    matches!(
+        error,
+        ApiError::Server { status: 409, code, .. }
+            if matches!(code.as_str(), "artifact_superseded" | "artifact_already_ready")
+    ) || matches!(
+        error,
+        ApiError::Server {
+            status: 422,
+            code,
+            ..
+        } if code == "artifact_missing"
+    )
 }
 
 fn guard_size(size: u64, max_artifact_bytes: u64) -> Result<()> {
@@ -296,7 +356,11 @@ fn api_error(error: ApiError) -> anyhow::Error {
 /// One presigned PUT: the body is the archive verbatim and the headers are
 /// exactly what the platform handed back — nothing added (no bearer token;
 /// the signature IS the auth).
-fn upload_one(client: &Client, upload: &api::ModuleArtifactUpload, bytes: &[u8]) -> Result<()> {
+fn upload_one(
+    client: &Client,
+    upload: &api::ModuleArtifactUpload,
+    bytes: &[u8],
+) -> std::result::Result<(), UploadError> {
     let mut req = client.put(&upload.url).body(bytes.to_vec());
     for (name, value) in &upload.headers {
         req = req.header(name.as_str(), value.as_str());
@@ -304,14 +368,23 @@ fn upload_one(client: &Client, upload: &api::ModuleArtifactUpload, bytes: &[u8])
     // `reqwest::Error` renders the URL it failed on, and this one carries a
     // live signature. In a CI log that is a usable write credential until it
     // expires, so strip the URL before the error can reach stderr.
-    let resp = req
-        .send()
-        .map_err(|error| anyhow!("presigned PUT failed: {}", error.without_url()))?;
+    let resp = req.send().map_err(|error| {
+        // Consume only the redacted rendering; the signed URL must never
+        // escape through an ambiguity diagnostic.
+        let _ = error.without_url();
+        UploadError::Ambiguous
+    })?;
     let status = resp.status();
+    if status.is_server_error() {
+        return Err(UploadError::Ambiguous);
+    }
     if !status.is_success() {
         // Storage bodies may echo the full signed request URI. Never expose
         // bearer-like presign query parameters through a CLI error.
-        return Err(anyhow!("presigned PUT failed: HTTP {}", status.as_u16()));
+        return Err(UploadError::Rejected(anyhow!(
+            "presigned PUT failed: HTTP {}",
+            status.as_u16()
+        )));
     }
     Ok(())
 }
@@ -789,7 +862,46 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_finalize_reverifies_without_another_put() {
+    fn ambiguous_create_response_requires_owner_state_replan() {
+        let outcome = ship_against_create_upload_error(500, "internal_error")
+            .expect("ambiguous server response is replanned");
+        assert_eq!(outcome, ShipOutcome::Replan);
+        let wrong_status = ship_against_create_upload_error(500, "artifact_already_ready")
+            .expect("a race code on 500 remains ambiguous");
+        assert_eq!(wrong_status, ShipOutcome::Replan);
+        assert!(
+            ship_against_create_upload_error(500, "artifact_storage_unconfigured").is_err(),
+            "only exact 503 storage-unconfigured may authorize local simulation"
+        );
+    }
+
+    #[test]
+    fn storage_server_error_is_ambiguous_but_client_rejection_is_final() {
+        for (status, ambiguous) in [(500, true), (400, false)] {
+            let mut server = Server::new();
+            let put = server.mock("PUT", "/upload").with_status(status).create();
+            let upload: api::ModuleArtifactUpload = serde_json::from_value(json!({
+                "url": format!("{}/upload", server.url()),
+                "headers": {"Content-Type": "application/zip"},
+                "version_id": "v-1",
+                "module_id": "module-id",
+                "expires_at": "2026-08-31T00:05:00Z",
+                "release_receipt": operation_receipt(&candidate("a".repeat(64), 1))
+            }))
+            .unwrap();
+            let error = upload_one(
+                &http::client(Duration::from_secs(5)).unwrap(),
+                &upload,
+                b"x",
+            )
+            .unwrap_err();
+            put.assert();
+            assert_eq!(matches!(error, UploadError::Ambiguous), ambiguous);
+        }
+    }
+
+    #[test]
+    fn ready_race_returns_to_owner_planner_without_put_or_finalize() {
         let dir = TempDir::new().expect("temp dir");
         let bootstrap = dir.path().join("bootstrap");
         fs::write(&bootstrap, b"lambda bootstrap").unwrap();
@@ -806,27 +918,6 @@ mod tests {
                         "code": "artifact_already_ready",
                         "message": "artifact is already ready"
                     }
-                })
-                .to_string(),
-            )
-            .create();
-        let finalize = server
-            .mock(
-                "POST",
-                "/v1/modules/module-id/versions/1.2.3/artifact/finalize",
-            )
-            .with_status(200)
-            .with_body(
-                json!({
-                    "version_id": "v-1",
-                    "module_id": "module-id",
-                    "status": "ready",
-                    "size_bytes": candidate.artifact.size_bytes,
-                    "sha256": candidate.artifact.sha256,
-                    "created_at": "2026-08-02T00:00:00Z",
-                    "updated_at": "2026-08-02T00:00:01Z",
-                    "finalized_at": "2026-08-02T00:00:01Z",
-                    "release_receipt": operation_receipt(&candidate)
                 })
                 .to_string(),
             )
@@ -844,63 +935,7 @@ mod tests {
         )
         .unwrap();
         create.assert();
-        finalize.assert();
-        assert_eq!(outcome, ShipOutcome::Shipped);
-    }
-
-    #[test]
-    fn retry_of_tampered_ready_artifact_fails_closed() {
-        let dir = TempDir::new().expect("temp dir");
-        let bootstrap = dir.path().join("bootstrap");
-        fs::write(&bootstrap, b"lambda bootstrap").unwrap();
-        let zip_path = zip_bootstrap(&bootstrap).unwrap();
-        let bytes = fs::read(&zip_path).unwrap();
-        let candidate = candidate(sha256_hex(&bytes), bytes.len() as u64);
-        let mut server = Server::new();
-        let create = server
-            .mock("POST", "/v1/modules/module-id/versions/1.2.3/artifact")
-            .with_status(409)
-            .with_body(
-                json!({
-                    "error": {
-                        "code": "artifact_already_ready",
-                        "message": "artifact is already ready"
-                    }
-                })
-                .to_string(),
-            )
-            .create();
-        let finalize = server
-            .mock(
-                "POST",
-                "/v1/modules/module-id/versions/1.2.3/artifact/finalize",
-            )
-            .with_status(422)
-            .with_body(
-                json!({
-                    "error": {
-                        "code": "artifact_invalid",
-                        "message": "ready artifact no longer matches its immutable receipt"
-                    }
-                })
-                .to_string(),
-            )
-            .create();
-        let client = http::client(Duration::from_secs(15)).unwrap();
-        let error = ship_artifact(
-            &client,
-            &server.url(),
-            "AT",
-            "module-id",
-            "1.2.3",
-            &zip_path,
-            &candidate,
-            "v-1",
-        )
-        .unwrap_err();
-        create.assert();
-        finalize.assert();
-        assert!(error.to_string().contains("artifact_invalid"), "{error:#}");
+        assert_eq!(outcome, ShipOutcome::Replan);
     }
 
     /// Create can succeed against a new platform build while finalize lands
