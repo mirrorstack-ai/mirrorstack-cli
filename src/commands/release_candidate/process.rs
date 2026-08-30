@@ -345,7 +345,7 @@ fn attach_containment(child: &std::process::Child) -> Result<ProcessContainment>
     if job.is_null() {
         return Err(std::io::Error::last_os_error()).context("create Windows job object");
     }
-    let mut information = MaybeUninit::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>::zeroed();
+    let information = MaybeUninit::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>::zeroed();
     // SAFETY: zero is a valid base for this POD Win32 structure.
     let mut information = unsafe { information.assume_init() };
     information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
