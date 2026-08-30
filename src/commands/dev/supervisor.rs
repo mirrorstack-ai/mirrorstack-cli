@@ -59,10 +59,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use console::style;
 use reqwest::blocking::Client;
 
+use super::release_session::ReleaseSessionStore;
 use super::tunnel;
 use super::{ok_mark, warn_prefix};
 use crate::{api, credentials, http};
@@ -119,6 +120,9 @@ pub(super) struct ReconnectCtx {
     /// Updated only after a reconnect is fully installed and its service
     /// token is durable on disk.
     pub clients: Arc<SessionTracker>,
+    /// Atomically published current-session receipt consumed by a separate
+    /// release-candidate command in this exact workspace.
+    pub releases: Arc<ReleaseSessionStore>,
 }
 
 /// The per-module facts a reconnect replays: who to register as, where the
@@ -127,6 +131,7 @@ pub(super) struct TunnelTarget {
     pub slug: String,
     pub module_id: String,
     pub local_url: String,
+    pub module_dir: PathBuf,
     pub token_file: PathBuf,
     /// Reused verbatim for this module on every re-register.
     pub internal_secret: String,
@@ -156,7 +161,7 @@ enum Publish {
     Refused,
     /// The token file could not be rewritten, so the session was closed. NOT
     /// a reconnect: see [`Supervisor::publish`].
-    TokenWriteFailed(anyhow::Error),
+    PublicationFailed(anyhow::Error),
 }
 
 impl Supervisor {
@@ -203,17 +208,29 @@ impl Supervisor {
     /// against this file — a stale file trades the loud `503 tunnel_offline`
     /// for a quiet `403 not_proxied` on the same pages. Closing the session is
     /// the only honest outcome: it keeps the failure loud.
-    fn publish(&self, handle: tunnel::TunnelHandle, token_file: &Path) -> Publish {
+    fn publish(
+        &self,
+        handle: tunnel::TunnelHandle,
+        token_file: &Path,
+        releases: &ReleaseSessionStore,
+    ) -> Publish {
         let mut slot = self.lock_handle();
         if self.stop.load(Ordering::SeqCst) {
             drop(slot);
             handle.shutdown();
             return Publish::Refused;
         }
-        if let Err(e) = write_platform_token(token_file, &handle.service_token, &self.slug) {
-            drop(slot);
+        if let Err(e) = releases.replace_session_with_token(
+            &self.slug,
+            &handle.session_id,
+            token_file,
+            &handle.service_token,
+        ) {
+            if let Some(previous) = slot.take() {
+                previous.shutdown();
+            }
             handle.shutdown();
-            return Publish::TokenWriteFailed(e);
+            return Publish::PublicationFailed(e);
         }
         *slot = Some(handle);
         Publish::Installed
@@ -282,13 +299,6 @@ impl SupervisorSet {
             thread::sleep(TICK);
         }
     }
-}
-
-/// Write a module's platform-token file. Shared by the first registration
-/// (`run_outer`) and every reconnect so the two can never drift.
-pub(super) fn write_platform_token(file: &Path, token: &str, slug: &str) -> Result<()> {
-    std::fs::write(file, token)
-        .with_context(|| format!("dev: write platform token file for {slug}"))
 }
 
 /// Start one supervisor thread per module. `sessions` and `targets` must be
@@ -444,11 +454,11 @@ fn reconnect(
                 // Install and rewrite the token file in one operation — see
                 // `Supervisor::publish` for why neither half can stand alone.
                 // Nothing may be announced as reconnected before it returns.
-                match sup.publish(handle, &target.token_file) {
+                match sup.publish(handle, &target.token_file, &ctx.releases) {
                     // Teardown won the race. It closed what we opened and
                     // touched nothing on disk, so leave quietly.
                     Publish::Refused => return None,
-                    Publish::TokenWriteFailed(e) => {
+                    Publish::PublicationFailed(e) => {
                         mark_dead(sup, target, &unusable_session_reason(target, &e));
                         return None;
                     }
@@ -933,9 +943,28 @@ mod tests {
             slug: slug.into(),
             module_id: "mod_abc".into(),
             local_url: "http://127.0.0.1:1".into(),
+            module_dir: dir.to_path_buf(),
             token_file: dir.join(format!("ms-platform-token-{slug}")),
             internal_secret: format!("secret-{slug}"),
         }
+    }
+
+    fn release_store(root: &Path, slug: &str) -> ReleaseSessionStore {
+        let module_dir = root.join(slug);
+        std::fs::create_dir_all(&module_dir).expect("create module dir");
+        let store = ReleaseSessionStore::new(root).expect("release store");
+        store
+            .install(super::super::release_session::SessionOpen {
+                slug,
+                module_id: "mod_abc",
+                session_id: "sess_old",
+                local_url: "http://127.0.0.1:1",
+                module_dir: &module_dir,
+                watch: false,
+                share: true,
+            })
+            .expect("install release receipt");
+        store
     }
 
     fn creds(access: &str, refresh: &str) -> credentials::Credentials {
@@ -1134,6 +1163,7 @@ mod tests {
         // else holds it — and the token file must be left exactly as
         // `run_outer`'s cleanup expects to find it.
         let dir = tempfile::tempdir().expect("tempdir");
+        let releases = ReleaseSessionStore::new(dir.path()).expect("release store");
         let token_file = dir.path().join("ms-platform-token-oauth-core");
         std::fs::write(&token_file, "stk_old").expect("seed token file");
 
@@ -1146,7 +1176,10 @@ mod tests {
         );
 
         let (fresh, fresh_notify) = tunnel::TunnelHandle::detached("sess_new", "stk_new");
-        assert!(matches!(sup.publish(fresh, &token_file), Publish::Refused));
+        assert!(matches!(
+            sup.publish(fresh, &token_file, &releases),
+            Publish::Refused
+        ));
         assert!(
             was_closed(&fresh_notify),
             "a session opened after teardown began must not be left running"
@@ -1169,7 +1202,8 @@ mod tests {
         // closed.
         let dir = tempfile::tempdir().expect("tempdir");
         for i in 0..100 {
-            let token_file = dir.path().join(format!("ms-platform-token-{i}"));
+            let releases = release_store(dir.path(), "oauth-core");
+            let token_file = dir.path().join(".secret/ms-platform-token-oauth-core");
             let (old, _old_notify) = tunnel::TunnelHandle::detached("sess_old", "stk_old");
             let sup = Arc::new(supervisor("oauth-core", Some(old)));
             let (fresh, fresh_notify) = tunnel::TunnelHandle::detached("sess_new", "stk_new");
@@ -1178,13 +1212,13 @@ mod tests {
                 let sup = sup.clone();
                 thread::spawn(move || sup.begin_stop())
             };
-            let outcome = sup.publish(fresh, &token_file);
+            let outcome = sup.publish(fresh, &token_file, &releases);
             stopper.join().expect("teardown thread");
 
             // Either order is legal — teardown first (Refused, we closed our
             // own) or publish first (Installed, teardown closed it for us,
             // because the flag and the handle move under the same lock).
-            if let Publish::TokenWriteFailed(e) = &outcome {
+            if let Publish::PublicationFailed(e) = &outcome {
                 panic!("iteration {i}: unexpected write failure: {e:#}");
             }
             assert!(
@@ -1201,16 +1235,17 @@ mod tests {
         // A directory where the file belongs makes `write` fail on every
         // platform without faking permissions.
         let dir = tempfile::tempdir().expect("tempdir");
-        let token_file = dir.path().join("ms-platform-token-oauth-core");
+        let releases = release_store(dir.path(), "oauth-core");
+        let token_file = dir.path().join(".secret/ms-platform-token-oauth-core");
         std::fs::create_dir(&token_file).expect("occupy the token path");
 
         let (old, _old_notify) = tunnel::TunnelHandle::detached("sess_old", "stk_old");
         let sup = supervisor("oauth-core", Some(old));
         let (fresh, fresh_notify) = tunnel::TunnelHandle::detached("sess_new", "stk_new");
 
-        let outcome = sup.publish(fresh, &token_file);
+        let outcome = sup.publish(fresh, &token_file, &releases);
         assert!(
-            matches!(outcome, Publish::TokenWriteFailed(_)),
+            matches!(outcome, Publish::PublicationFailed(_)),
             "got {outcome:?}"
         );
         // Keeping it would hand dispatch stk_new while the module still
@@ -1222,8 +1257,8 @@ mod tests {
         );
         assert_eq!(
             sup.service_token(),
-            "stk_old",
-            "an unusable session must not become the live one"
+            "",
+            "a failed token/receipt transition closes both sessions and leaves no live local half"
         );
     }
 

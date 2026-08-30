@@ -58,6 +58,7 @@ mod client;
 mod log_shipper;
 pub(crate) mod module_meta;
 mod proxy;
+pub(crate) mod release_session;
 mod reload;
 mod share;
 mod supervisor;
@@ -197,7 +198,9 @@ pub(crate) fn resolve_internal_secret(
     legacy.map(str::to_string)
 }
 
-/// Write one module's internal-secret file before its tunnel is registered.
+/// Test helper for the per-module internal-secret file contract. Production
+/// tunnel startup publishes this file atomically with its token and receipt.
+#[cfg(test)]
 fn write_internal_secret(file: &Path, secret: &str, slug: &str) -> Result<()> {
     std::fs::write(file, secret)
         .with_context(|| format!("dev: write internal secret file for {slug}"))
@@ -205,6 +208,91 @@ fn write_internal_secret(file: &Path, secret: &str, slug: &str) -> Result<()> {
 
 fn capability_skip_file(root: &Path) -> PathBuf {
     root.join(".secret").join("ms-skip-capability-check")
+}
+
+/// Owns every background task and durable file published by one outer dev
+/// run after tunnel registration starts.
+///
+/// This guard is installed before the first per-module credential/receipt is
+/// written. Consequently every `?` after that point follows the same teardown
+/// order: stop publishers/watchers, close raw or supervised tunnels, then let
+/// the ownership-aware release store remove this run's receipt and credentials.
+/// The capability marker is removed last. `shutdown` is explicit on the happy
+/// path so its tunnel verdict can be reported; `Drop` is the fail-safe for
+/// partial install, marker, compose-spawn, and compose-wait failures.
+struct OuterSessionTeardown {
+    opened_tunnels: Option<OpenedTunnels>,
+    supervisors: Option<supervisor::SupervisorSet>,
+    share: Option<(Arc<AtomicBool>, thread::JoinHandle<()>)>,
+    publisher: Option<client::PublisherHandle>,
+    releases: Option<Arc<release_session::ReleaseSessionStore>>,
+    capability_marker: Option<PathBuf>,
+}
+
+impl OuterSessionTeardown {
+    fn new(releases: Option<Arc<release_session::ReleaseSessionStore>>) -> Self {
+        Self {
+            opened_tunnels: None,
+            supervisors: None,
+            share: None,
+            publisher: None,
+            releases,
+            capability_marker: None,
+        }
+    }
+
+    fn releases(&self) -> Option<&Arc<release_session::ReleaseSessionStore>> {
+        self.releases.as_ref()
+    }
+
+    fn tunnel_verdict(&self) -> (Vec<String>, usize) {
+        match &self.supervisors {
+            Some(set) => (set.dead_slugs(), set.len()),
+            None => (Vec::new(), 0),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(publisher) = self.publisher.take() {
+            publisher.shutdown();
+        }
+        if let Some((stop, handle)) = self.share.take() {
+            stop.store(true, Ordering::SeqCst);
+            let _ = handle.join();
+        }
+
+        // `opened_tunnels` is populated during the credential/receipt install
+        // loop and moved into `supervisors` only after every module succeeds.
+        // An error midway through that loop must explicitly close all already
+        // registered sockets before their runtime is dropped.
+        if let Some(opened) = self.opened_tunnels.take() {
+            for session in &opened.sessions {
+                session.handle.shutdown();
+            }
+            opened.runtime.block_on(async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            });
+        }
+        if let Some(set) = self.supervisors.take() {
+            set.shutdown();
+        }
+
+        // The watcher and supervisors carry Arc clones of this store. Stop
+        // them first so no reconnect/share write can race the final
+        // ownership-aware compare/delete.
+        if let Some(store) = self.releases.take() {
+            store.close_all();
+        }
+        if let Some(path) = self.capability_marker.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl Drop for OuterSessionTeardown {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 /// How often the supervisor polls module sources for changes — matches the
@@ -362,12 +450,9 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     // API). The files land in `root/.secret/` and reach the runner through
     // the `.:/modules` bind mount; the inner runner (`run_inner`) points
     // each module's MS_PLATFORM_TOKEN_FILE at `.secret/ms-platform-token-<slug>`.
-    let mut token_files: Vec<PathBuf> = Vec::new();
-    let mut internal_secret_files: Vec<PathBuf> = Vec::new();
-
     // One MS_INTERNAL_SECRET per module, minted only in tunnel mode. The files
-    // must exist before compose starts because the inner runner reads them
-    // while constructing each module process's environment at boot.
+    // are published with the matching tunnel token and release receipt after
+    // registration, before compose starts and reads them.
     let internal_secrets = if args.tunnel {
         std::fs::create_dir_all(root.join(".secret"))
             .context("dev: create .secret directory for tunnel credentials")?;
@@ -375,13 +460,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
             .iter()
             .map(|m| m.dir.file_name().unwrap().to_string_lossy())
             .collect();
-        let secrets = mint_internal_secrets(slugs.iter().map(|slug| slug.as_ref()))?;
-        for (slug, secret) in &secrets {
-            let file = internal_secret_file(root, slug);
-            write_internal_secret(&file, secret, slug)?;
-            internal_secret_files.push(file);
-        }
-        secrets
+        mint_internal_secrets(slugs.iter().map(|slug| slug.as_ref()))?
     } else {
         HashMap::new()
     };
@@ -393,56 +472,109 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     // slugs.
     let share_invalidator = Arc::new(supervisor::ShareInvalidator::default());
     let client_sessions = Arc::new(supervisor::SessionTracker::default());
-
-    // Register tunnels before compose so auth failures surface early.
-    let tunnel_state = if args.tunnel {
-        let opened = open_tunnels(root, &ready, args.local_url.as_deref(), &internal_secrets)?;
-        // `open_tunnels` builds sessions and targets together, so zip is aligned.
-        for (target, session) in opened.targets.iter().zip(opened.sessions.iter()) {
-            client_sessions.seed(&target.slug, &session.handle.session_id);
-            supervisor::write_platform_token(
-                &target.token_file,
-                &session.handle.service_token,
-                &target.slug,
-            )?;
-            eprintln!(
-                "{} wrote platform token for {} → {}",
-                ok_mark(),
-                style(&target.slug).cyan(),
-                style(target.token_file.display()).dim()
-            );
-            token_files.push(target.token_file.clone());
-        }
-        // From here on each module's tunnel is supervised: a server close no
-        // longer ends the session for good, and a module that cannot be
-        // brought back says so instead of idling quietly.
-        Some(supervisor::spawn(
-            opened.runtime,
-            opened.sessions,
-            opened.targets,
-            supervisor::ReconnectCtx {
-                dispatch_base: opened.dispatch_base,
-                // One copy for every supervisor: the platform rotates the
-                // refresh token, so parallel refreshes would invalidate each
-                // other's.
-                creds: supervisor::SharedCredentials::new(opened.creds),
-                share: share_invalidator.clone(),
-                clients: client_sessions.clone(),
-            },
-        ))
+    let release_sessions = if args.tunnel {
+        Some(Arc::new(release_session::ReleaseSessionStore::new(root)?))
     } else {
         None
     };
+    let mut teardown = OuterSessionTeardown::new(release_sessions);
+
+    // Register tunnels before compose so auth failures surface early.
+    if args.tunnel {
+        let opened = open_tunnels(root, &ready, args.local_url.as_deref(), &internal_secrets)?;
+        teardown.opened_tunnels = Some(opened);
+
+        // `open_tunnels` builds sessions and targets together, so zip is aligned.
+        {
+            let opened = teardown
+                .opened_tunnels
+                .as_ref()
+                .expect("newly opened tunnel set");
+            let releases = teardown.releases().expect("tunnel release-session store");
+            for (target, session) in opened.targets.iter().zip(opened.sessions.iter()) {
+                client_sessions.seed(&target.slug, &session.handle.session_id);
+                let internal_secret = internal_secrets
+                    .get(&target.slug)
+                    .expect("opened tunnel has its minted internal secret");
+                let internal_secret_path = internal_secret_file(root, &target.slug);
+                releases.install_with_token(
+                    release_session::SessionOpen {
+                        slug: &target.slug,
+                        module_id: &target.module_id,
+                        session_id: &session.handle.session_id,
+                        local_url: &target.local_url,
+                        module_dir: &target.module_dir,
+                        watch: args.watch,
+                        share: args.share,
+                    },
+                    release_session::SessionCredentials {
+                        token_file: &target.token_file,
+                        platform_token: &session.handle.service_token,
+                        internal_secret_file: &internal_secret_path,
+                        internal_secret,
+                    },
+                )?;
+                eprintln!(
+                    "{} published tunnel credentials for {} → {}",
+                    ok_mark(),
+                    style(&target.slug).cyan(),
+                    style(target.token_file.display()).dim()
+                );
+            }
+        }
+
+        // From here on each module's tunnel is supervised: a server close no
+        // longer ends the session for good, and a module that cannot be
+        // brought back says so instead of idling quietly.
+        let releases = teardown
+            .releases()
+            .expect("tunnel release-session store")
+            .clone();
+        let OpenedTunnels {
+            sessions,
+            targets,
+            runtime,
+            dispatch_base,
+            creds,
+        } = teardown
+            .opened_tunnels
+            .take()
+            .expect("published tunnel set");
+        teardown.supervisors = Some(supervisor::spawn(
+            runtime,
+            sessions,
+            targets,
+            supervisor::ReconnectCtx {
+                dispatch_base,
+                // One copy for every supervisor: the platform rotates the
+                // refresh token, so parallel refreshes would invalidate each
+                // other's.
+                creds: supervisor::SharedCredentials::new(creds),
+                share: share_invalidator.clone(),
+                clients: client_sessions.clone(),
+                releases,
+            },
+        ));
+    }
 
     // Compose files in existing module workspaces predate this flag and do
     // not forward arbitrary host env. A bind-mounted marker crosses the same
     // host→runner boundary as platform tokens without rewriting user compose.
     let skip_file = capability_skip_file(root);
     if args.skip_capability_check {
+        // Register ownership before the first fallible filesystem operation;
+        // even a partial marker write is removed by the lifecycle guard.
+        teardown.capability_marker = Some(skip_file);
         std::fs::create_dir_all(root.join(".secret"))
             .context("dev: create .secret directory for capability-check marker")?;
-        std::fs::write(&skip_file, b"1")
-            .context("dev: write capability-check marker for inner runner")?;
+        std::fs::write(
+            teardown
+                .capability_marker
+                .as_ref()
+                .expect("owned capability marker"),
+            b"1",
+        )
+        .context("dev: write capability-check marker for inner runner")?;
     }
 
     // With --share on a live tunnel, spin up the host-side bundle watcher.
@@ -452,7 +584,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     // session registration whose bundleUrl the confirm step updates — so the
     // upload belongs here, not in the container (see share.rs). Best-effort:
     // a share failure never blocks the tunnel.
-    let share_state = if args.tunnel && args.share {
+    teardown.share = if args.tunnel && args.share {
         let targets = build_share_targets(root, &ready, args.watch);
         if targets.is_empty() {
             eprintln!(
@@ -463,8 +595,17 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         } else {
             let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
             let stop = Arc::new(AtomicBool::new(false));
-            let handle =
-                share::spawn_watcher(apps_base, targets, stop.clone(), share_invalidator.clone());
+            let handle = share::spawn_watcher(
+                apps_base,
+                targets,
+                stop.clone(),
+                share_invalidator.clone(),
+                client_sessions.clone(),
+                teardown
+                    .releases()
+                    .expect("tunnel release-session store")
+                    .clone(),
+            );
             Some((stop, handle))
         }
     } else {
@@ -542,43 +683,16 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         }
         None => None,
     };
+    teardown.publisher = client_publisher;
 
     let compose_status = compose_child
         .wait()
         .context("dev: wait for docker compose")?;
 
-    if let Some(publisher) = client_publisher {
-        publisher.shutdown();
-    }
-
-    // Stop the share watcher and let its current scan drain before we return.
-    if let Some((stop, handle)) = share_state {
-        stop.store(true, Ordering::SeqCst);
-        let _ = handle.join();
-    }
-
     // Snapshot the supervision verdict before tearing it down — `shutdown`
     // consumes the set.
-    let (dead_slugs, tunnel_count) = match &tunnel_state {
-        Some(set) => (set.dead_slugs(), set.len()),
-        None => (Vec::new(), 0),
-    };
-    // Stop supervising and close the live sessions BEFORE removing the token
-    // files, so a reconnect in flight can't rewrite a file we just deleted.
-    if let Some(set) = tunnel_state {
-        set.shutdown();
-    }
-
-    // Cleanup per-module credential files.
-    for f in &token_files {
-        let _ = std::fs::remove_file(f);
-    }
-    for f in &internal_secret_files {
-        let _ = std::fs::remove_file(f);
-    }
-    if args.skip_capability_check {
-        let _ = std::fs::remove_file(skip_file);
-    }
+    let (dead_slugs, tunnel_count) = teardown.tunnel_verdict();
+    teardown.shutdown();
 
     if let Some(error) = client_error {
         return Err(error);
@@ -1310,7 +1424,7 @@ const WEB_BUILD_ARGS: [&str; 1] = ["esbuild.config.mjs"];
 const WEB_WATCH_ARGS: [&str; 2] = ["esbuild.config.mjs", "--watch"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WebPipeline {
+pub(crate) enum WebPipeline {
     DeclaredScript(&'static str),
     LegacyEsbuild,
 }
@@ -1361,7 +1475,7 @@ fn declared_web_script(web_dir: &Path, watch: bool) -> Option<&'static str> {
 /// the outer `--share` watcher use this function, so neither can classify a
 /// module differently from the process that is expected to produce its
 /// bundle.
-fn web_pipeline(web_dir: &Path, watch: bool) -> Option<WebPipeline> {
+pub(crate) fn web_pipeline(web_dir: &Path, watch: bool) -> Option<WebPipeline> {
     if let Some(script) = declared_web_script(web_dir, watch) {
         return Some(WebPipeline::DeclaredScript(script));
     }
@@ -1626,6 +1740,7 @@ fn open_tunnels(
             slug: slug.to_string(),
             module_id,
             local_url: module_local_url,
+            module_dir: m.abs_dir.clone(),
             token_file: platform_token_file(root, &slug),
             internal_secret: internal_secret.clone(),
         });
@@ -1726,6 +1841,173 @@ fn mint_internal_secrets<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn install_test_publication(
+        root: &Path,
+    ) -> (
+        Arc<release_session::ReleaseSessionStore>,
+        PathBuf,
+        PathBuf,
+        PathBuf,
+    ) {
+        let module = root.join("user-core");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::create_dir_all(root.join(".secret")).unwrap();
+        let token = platform_token_file(root, "user-core");
+        let secret = internal_secret_file(root, "user-core");
+        let store = Arc::new(release_session::ReleaseSessionStore::new(root).unwrap());
+        store
+            .install_with_token(
+                release_session::SessionOpen {
+                    slug: "user-core",
+                    module_id: "m11111111111111111111111111111111",
+                    session_id: "session-one",
+                    local_url: "http://localhost:9080/_m/user-core",
+                    module_dir: &module,
+                    watch: false,
+                    share: true,
+                },
+                release_session::SessionCredentials {
+                    token_file: &token,
+                    platform_token: "platform-token",
+                    internal_secret_file: &secret,
+                    internal_secret: "internal-secret",
+                },
+            )
+            .unwrap();
+        (store, module, token, secret)
+    }
+
+    fn detached_opened_tunnels() -> (OpenedTunnels, Arc<tokio::sync::Notify>) {
+        let (handle, shutdown) = tunnel::TunnelHandle::detached("session-one", "token-one");
+        let (_exit_sender, exit) = tokio::sync::oneshot::channel();
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap(),
+        );
+        (
+            OpenedTunnels {
+                sessions: vec![tunnel::TunnelSession { handle, exit }],
+                targets: Vec::new(),
+                runtime,
+                dispatch_base: "https://dispatch.example.test".into(),
+                creds: credentials::Credentials {
+                    access_token: "access".into(),
+                    refresh_token: "refresh".into(),
+                    expires_at: std::time::SystemTime::now(),
+                },
+            },
+            shutdown,
+        )
+    }
+
+    fn assert_publication_removed(module: &Path, token: &Path, secret: &Path) {
+        assert!(
+            release_session::load_for_module(module, "user-core").is_err(),
+            "release receipt survived lifecycle teardown"
+        );
+        assert!(
+            !token.exists(),
+            "platform token survived lifecycle teardown"
+        );
+        assert!(
+            !secret.exists(),
+            "internal secret survived lifecycle teardown"
+        );
+    }
+
+    #[test]
+    fn partial_install_loop_error_closes_raw_tunnels_and_publication() {
+        use futures_util::FutureExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let (store, module, token, secret) = install_test_publication(root.path());
+        let (opened, shutdown) = detached_opened_tunnels();
+
+        let result: Result<()> = {
+            let mut teardown = OuterSessionTeardown::new(Some(store));
+            teardown.opened_tunnels = Some(opened);
+            Err(anyhow!("injected second-module install failure"))
+        };
+        let error = result.unwrap_err();
+
+        assert!(error.to_string().contains("second-module install"));
+        assert!(
+            shutdown.notified().now_or_never().is_some(),
+            "raw tunnel was not explicitly shut down"
+        );
+        assert_publication_removed(&module, &token, &secret);
+    }
+
+    #[test]
+    fn capability_marker_error_removes_marker_and_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, module, token, secret) = install_test_publication(root.path());
+        let marker = capability_skip_file(root.path());
+
+        let result: Result<()> = {
+            let mut teardown = OuterSessionTeardown::new(Some(store));
+            teardown.capability_marker = Some(marker.clone());
+            std::fs::write(&marker, b"partial").unwrap();
+            Err(anyhow!("injected capability-marker failure"))
+        };
+        let error = result.unwrap_err();
+
+        assert!(error.to_string().contains("capability-marker"));
+        assert!(!marker.exists(), "capability marker survived teardown");
+        assert_publication_removed(&module, &token, &secret);
+    }
+
+    #[test]
+    fn compose_spawn_error_drops_post_publication_resources() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, module, token, secret) = install_test_publication(root.path());
+
+        let result: Result<()> = {
+            let _teardown = OuterSessionTeardown::new(Some(store));
+            Err(anyhow!("injected compose spawn failure"))
+        };
+        let error = result.unwrap_err();
+
+        assert!(error.to_string().contains("compose spawn"));
+        assert_publication_removed(&module, &token, &secret);
+    }
+
+    #[test]
+    fn compose_wait_error_stops_and_joins_watcher_before_publication_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let (store, module, token, secret) = install_test_publication(root.path());
+        let stop = Arc::new(AtomicBool::new(false));
+        let (observed_sender, observed_receiver) = mpsc::channel();
+        let watcher = {
+            let stop = stop.clone();
+            let module = module.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    thread::yield_now();
+                }
+                observed_sender
+                    .send(release_session::load_for_module(&module, "user-core").is_ok())
+                    .unwrap();
+            })
+        };
+
+        let result: Result<()> = {
+            let mut teardown = OuterSessionTeardown::new(Some(store));
+            teardown.share = Some((stop, watcher));
+            Err(anyhow!("injected compose wait failure"))
+        };
+        let error = result.unwrap_err();
+
+        assert!(error.to_string().contains("compose wait"));
+        assert!(
+            observed_receiver.recv().unwrap(),
+            "release publication was removed before the watcher joined"
+        );
+        assert_publication_removed(&module, &token, &secret);
+    }
 
     fn workspace_module(root: &Path, slug: &str, source: &str) -> workspace::WorkspaceModule {
         let dir = root.join(slug);

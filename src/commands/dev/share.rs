@@ -41,7 +41,8 @@ use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 
 use super::module_meta::catalog_uuid;
-use super::supervisor::ShareInvalidator;
+use super::release_session::ReleaseSessionStore;
+use super::supervisor::{SessionTracker, ShareInvalidator};
 use super::{ok_mark, warn_prefix, web_pipeline};
 use crate::api::{self, ApiError, DevBundlePresignInput};
 use crate::credentials::{self, Credentials};
@@ -121,66 +122,164 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+#[derive(Clone, Copy)]
+struct ShareHttp<'a> {
+    api_client: &'a Client,
+    upload_client: &'a Client,
+    apps_base: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct BundleUpload<'a> {
+    module_id: &'a str,
+    session_id: &'a str,
+    bytes: &'a [u8],
+    sha256: &'a str,
+}
+
 /// Per-module upload flow: presign → PUT → confirm. Returns the confirmed CDN
 /// URL on success. `sha256` is precomputed by the caller (it's also the
 /// hash-gate key) and declared to presign; the raw bytes go to the presigned
 /// S3 URL with the JavaScript content type (no auth header — the URL's
 /// signature IS the auth), then confirm hands back the live `bundleUrl`.
 fn upload_bundle(
-    api_client: &Client,
-    upload_client: &Client,
-    apps_base: &str,
+    http: ShareHttp<'_>,
     creds: &mut Credentials,
-    module_id: &str,
-    bytes: &[u8],
-    sha256: &str,
-) -> Result<String, ApiError> {
+    upload: BundleUpload<'_>,
+) -> Result<api::DevBundleConfirmed, ApiError> {
     // The REST endpoints key on the dashed catalog UUID, not the tunnel's
     // m<hex> form that `module_id` carries here.
-    let module_id = &catalog_uuid(module_id);
+    let module_id = &catalog_uuid(upload.module_id);
     let presign = credentials::with_refresh_retry(creds, |tok| {
         api::presign_dev_bundle(
-            api_client,
-            apps_base,
+            http.api_client,
+            http.apps_base,
             tok,
             module_id,
             &DevBundlePresignInput {
                 content_type: BUNDLE_CONTENT_TYPE,
-                size_bytes: bytes.len() as u64,
-                sha256,
+                size_bytes: upload.bytes.len() as u64,
+                sha256: upload.sha256,
             },
         )
     })?;
+    if presign.upload_url.is_empty() || presign.key.is_empty() || presign.expires_at.is_empty() {
+        return Err(invalid_presign("upload URL, key, or expiry was missing"));
+    }
 
-    put_bundle(upload_client, &presign.upload_url, bytes)?;
+    put_bundle(
+        http.upload_client,
+        &presign.upload_url,
+        &presign.headers,
+        upload.bytes,
+    )?;
 
     let confirmed = credentials::with_refresh_retry(creds, |tok| {
-        api::confirm_dev_bundle(api_client, apps_base, tok, module_id, &presign.key)
+        api::confirm_dev_bundle(
+            http.api_client,
+            http.apps_base,
+            tok,
+            module_id,
+            &presign.key,
+            upload.session_id,
+        )
     })?;
-    Ok(confirmed.url)
+    if confirmed.url.is_empty()
+        || confirmed.session_id != upload.session_id
+        || confirmed.sha256 != upload.sha256
+        || confirmed.size_bytes != upload.bytes.len() as u64
+    {
+        return Err(ApiError::Unexpected {
+            status: 200,
+            body: format!(
+                "dev-bundle confirmation did not echo the current exact descriptor (expected session {}, sha256 {}, size {}; got session {}, sha256 {}, size {})",
+                upload.session_id,
+                upload.sha256,
+                upload.bytes.len(),
+                confirmed.session_id,
+                confirmed.sha256,
+                confirmed.size_bytes
+            ),
+        });
+    }
+    Ok(confirmed)
 }
 
 /// PUT the bundle bytes to the presigned S3 URL with the pinned content type.
-/// A non-2xx is surfaced as `ApiError::Unexpected` (with the S3 body) so the
-/// watcher logs it and retries on the next tick.
-fn put_bundle(upload_client: &Client, url: &str, bytes: &[u8]) -> Result<(), ApiError> {
+/// A non-2xx is surfaced without the storage body, which may echo the signed
+/// URL; the watcher logs the redacted failure and retries on the next tick.
+fn put_bundle(
+    upload_client: &Client,
+    url: &str,
+    signed_headers: &std::collections::BTreeMap<String, String>,
+    bytes: &[u8],
+) -> Result<(), ApiError> {
+    let headers = validated_upload_headers(signed_headers, bytes.len())?;
     let resp = upload_client
         .put(url)
-        .header("Content-Type", BUNDLE_CONTENT_TYPE)
+        .headers(headers)
         .body(bytes.to_vec())
-        .send()?;
+        .send()
+        .map_err(|error| ApiError::Http(error.without_url()))?;
     let status = resp.status();
     if status.is_success() {
         return Ok(());
     }
-    let body = http::read_capped(resp).unwrap_or_default();
+    // Storage errors may echo the request URI, whose query string is the
+    // bearer-like upload credential. Never surface that response body.
     Err(ApiError::Unexpected {
         status: status.as_u16(),
-        body: format!(
-            "presigned PUT failed: {}",
-            String::from_utf8_lossy(&body).trim()
-        ),
+        body: "presigned dev-bundle upload failed".to_string(),
     })
+}
+
+fn validated_upload_headers(
+    signed: &std::collections::BTreeMap<String, String>,
+    size_bytes: usize,
+) -> Result<reqwest::header::HeaderMap, ApiError> {
+    if signed.is_empty() {
+        return Err(invalid_presign("signed upload headers were missing"));
+    }
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in signed {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| invalid_presign("a signed upload header name was invalid"))?;
+        let value = reqwest::header::HeaderValue::from_str(value)
+            .map_err(|_| invalid_presign("a signed upload header value was invalid"))?;
+        if headers.insert(name, value).is_some() {
+            return Err(invalid_presign(
+                "signed upload headers contained a duplicate name",
+            ));
+        }
+    }
+
+    let expected_length = size_bytes.to_string();
+    if headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        != Some(expected_length.as_str())
+    {
+        return Err(invalid_presign(
+            "signed Content-Length did not match the exact bundle size",
+        ));
+    }
+    if headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        != Some(BUNDLE_CONTENT_TYPE)
+    {
+        return Err(invalid_presign(
+            "signed Content-Type did not match application/javascript",
+        ));
+    }
+    Ok(headers)
+}
+
+fn invalid_presign(message: &str) -> ApiError {
+    ApiError::Unexpected {
+        status: 200,
+        body: format!("invalid dev-bundle presign response: {message}"),
+    }
 }
 
 /// Mutable per-target bookkeeping: the hash we last confirmed live, and the
@@ -194,6 +293,12 @@ struct TargetState {
     /// moment one appears. A bundle that DISAPPEARS therefore starts a fresh
     /// grace period instead of warning instantly off a stale timestamp.
     missing_since: Option<Instant>,
+}
+
+struct ShareContext<'a> {
+    http: ShareHttp<'a>,
+    sessions: &'a SessionTracker,
+    releases: &'a ReleaseSessionStore,
 }
 
 /// Spawn the host-side share watcher. Owns its own credentials (loaded fresh
@@ -214,8 +319,19 @@ pub(super) fn spawn_watcher(
     targets: Vec<ShareTarget>,
     stop: Arc<AtomicBool>,
     invalidator: Arc<ShareInvalidator>,
+    sessions: Arc<SessionTracker>,
+    releases: Arc<ReleaseSessionStore>,
 ) -> thread::JoinHandle<()> {
-    thread::spawn(move || run_watcher(&apps_base, &targets, &stop, &invalidator))
+    thread::spawn(move || {
+        run_watcher(
+            &apps_base,
+            &targets,
+            &stop,
+            &invalidator,
+            &sessions,
+            &releases,
+        )
+    })
 }
 
 fn run_watcher(
@@ -223,6 +339,8 @@ fn run_watcher(
     targets: &[ShareTarget],
     stop: &AtomicBool,
     invalidator: &ShareInvalidator,
+    sessions: &SessionTracker,
+    releases: &ReleaseSessionStore,
 ) {
     if targets.is_empty() {
         return;
@@ -262,6 +380,15 @@ fn run_watcher(
     };
 
     let mut states: Vec<TargetState> = targets.iter().map(|_| TargetState::default()).collect();
+    let context = ShareContext {
+        http: ShareHttp {
+            api_client: &api_client,
+            upload_client: &upload_client,
+            apps_base,
+        },
+        sessions,
+        releases,
+    };
 
     eprintln!(
         "{} sharing {} web {} to the CDN on change",
@@ -293,14 +420,7 @@ fn run_watcher(
                 }
             }
             for (target, state) in targets.iter().zip(states.iter_mut()) {
-                share_once(
-                    &api_client,
-                    &upload_client,
-                    apps_base,
-                    &mut creds,
-                    target,
-                    state,
-                );
+                share_once(&context, &mut creds, target, state);
             }
         }
         thread::sleep(TICK);
@@ -312,9 +432,7 @@ fn run_watcher(
 /// failure is a scoped warning + continue — never a panic or early return
 /// that would stall the other targets.
 fn share_once(
-    api_client: &Client,
-    upload_client: &Client,
-    apps_base: &str,
+    context: &ShareContext<'_>,
     creds: &mut Credentials,
     target: &ShareTarget,
     state: &mut TargetState,
@@ -387,23 +505,63 @@ fn share_once(
         return;
     }
 
+    let Some(session) = context.sessions.current(&target.slug) else {
+        if state.last_warned.as_deref() != Some("__missing-session__") {
+            eprintln!(
+                "{} [{}] no current tunnel session — web bundle cannot be confirmed",
+                warn_prefix(),
+                target.slug
+            );
+            state.last_warned = Some("__missing-session__".to_string());
+        }
+        return;
+    };
+
     match upload_bundle(
-        api_client,
-        upload_client,
-        apps_base,
+        context.http,
         creds,
-        &target.module_id,
-        &bytes,
-        &hash,
+        BundleUpload {
+            module_id: &target.module_id,
+            session_id: &session.session_id,
+            bytes: &bytes,
+            sha256: &hash,
+        },
     ) {
-        Ok(url) => {
+        Ok(confirmed) => {
+            let current = context.sessions.current(&target.slug);
+            if current.as_ref() != Some(&session) {
+                // The server-side #663 precondition also rejects this race;
+                // this local gate keeps an old response out of the durable
+                // receipt even while the API rollout is in progress.
+                state.last_warned = Some("__session-changed__".to_string());
+                eprintln!(
+                    "{} [{}] tunnel reconnected while web confirmation was in flight; discarding the old-session result and retrying",
+                    warn_prefix(),
+                    target.slug
+                );
+                return;
+            }
+            if let Err(error) = context.releases.confirm_web(
+                &target.slug,
+                &confirmed.session_id,
+                &confirmed.sha256,
+                confirmed.size_bytes,
+            ) {
+                state.last_warned = Some("__receipt-failed__".to_string());
+                eprintln!(
+                    "{} [{}] shared web bundle but could not publish current-session release evidence ({error:#}); will retry",
+                    warn_prefix(),
+                    target.slug
+                );
+                return;
+            }
             state.last_uploaded = Some(hash);
             state.last_warned = None;
             eprintln!(
                 "{} [{}] shared web bundle → {}",
                 ok_mark(),
                 style(&target.slug).cyan(),
-                style(url).dim()
+                style(confirmed.url).dim()
             );
         }
         Err(e) => {
@@ -437,6 +595,47 @@ fn share_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn share_once_test(
+        api_client: &Client,
+        upload_client: &Client,
+        apps_base: &str,
+        creds: &mut Credentials,
+        target: &ShareTarget,
+        state: &mut TargetState,
+    ) {
+        let workspace = tempfile::tempdir().unwrap();
+        let module_dir = workspace.path().join(&target.slug);
+        std::fs::create_dir_all(&module_dir).unwrap();
+        let sessions = SessionTracker::default();
+        sessions.seed(&target.slug, "session-test");
+        let releases = ReleaseSessionStore::new(workspace.path()).unwrap();
+        releases
+            .install(super::super::release_session::SessionOpen {
+                slug: &target.slug,
+                module_id: &target.module_id,
+                session_id: "session-test",
+                local_url: "http://127.0.0.1:1",
+                module_dir: &module_dir,
+                watch: false,
+                share: true,
+            })
+            .unwrap();
+        share_once(
+            &ShareContext {
+                http: ShareHttp {
+                    api_client,
+                    upload_client,
+                    apps_base,
+                },
+                sessions: &sessions,
+                releases: &releases,
+            },
+            creds,
+            target,
+            state,
+        );
+    }
 
     /// SHA-256 of "hello" — pins the hex encoding (lowercase, 64 chars).
     const HELLO_SHA256: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
@@ -552,7 +751,7 @@ mod tests {
         };
         // apps_base points nowhere reachable; if it tried to upload this would
         // error, but an absent bundle must return before any network call.
-        share_once(
+        share_once_test(
             &api_client,
             &upload_client,
             "http://127.0.0.1:1",
@@ -590,7 +789,7 @@ mod tests {
         };
         let mut state = TargetState::default();
         let call = |state: &mut TargetState| {
-            share_once(
+            share_once_test(
                 &api_client,
                 &upload_client,
                 "http://127.0.0.1:1",
@@ -657,6 +856,11 @@ mod tests {
                 serde_json::json!({
                     "upload_url": format!("{}/s3-put", server.url()),
                     "key": "modules/m-1/dev/u-1/hash/web/index.js",
+                    "headers": {
+                        "Content-Length": bytes.len().to_string(),
+                        "Content-Type": "application/javascript",
+                        "X-MirrorStack-Signed": "exact"
+                    },
                     "expires_at": "2026-07-14T00:15:00Z"
                 })
                 .to_string(),
@@ -665,17 +869,25 @@ mod tests {
         let put = server
             .mock("PUT", "/s3-put")
             .match_header("content-type", "application/javascript")
+            .match_header("content-length", bytes.len().to_string().as_str())
+            .match_header("x-mirrorstack-signed", "exact")
             .with_status(200)
             .create();
         let confirm = server
             .mock("POST", "/v1/modules/m-1/dev-bundle/confirm")
             .match_body(mockito::Matcher::JsonString(
-                r#"{"key":"modules/m-1/dev/u-1/hash/web/index.js"}"#.into(),
+                r#"{"key":"modules/m-1/dev/u-1/hash/web/index.js","session_id":"session-1"}"#
+                    .into(),
             ))
             .with_status(200)
             .with_body(
-                serde_json::json!({ "url": "https://cdn.mirrorstack.ai/modules/m-1/dev/u-1/hash/web/index.js" })
-                    .to_string(),
+                serde_json::json!({
+                    "url": "https://cdn.mirrorstack.ai/modules/m-1/dev/u-1/hash/web/index.js",
+                    "session_id": "session-1",
+                    "sha256": hash,
+                    "size_bytes": bytes.len()
+                })
+                .to_string(),
             )
             .create();
 
@@ -687,22 +899,159 @@ mod tests {
             expires_at: std::time::SystemTime::now() + Duration::from_secs(3600),
         };
         let url = upload_bundle(
-            &api_client,
-            &upload_client,
-            &server.url(),
+            ShareHttp {
+                api_client: &api_client,
+                upload_client: &upload_client,
+                apps_base: &server.url(),
+            },
             &mut creds,
-            "m-1",
-            bytes,
-            &hash,
+            BundleUpload {
+                module_id: "m-1",
+                session_id: "session-1",
+                bytes,
+                sha256: &hash,
+            },
         )
         .expect("upload ok");
         assert_eq!(
-            url,
+            url.url,
             "https://cdn.mirrorstack.ai/modules/m-1/dev/u-1/hash/web/index.js"
         );
         presign.assert();
         put.assert();
         confirm.assert();
+    }
+
+    #[test]
+    fn signed_upload_headers_are_complete_exact_and_case_unique() {
+        let valid = std::collections::BTreeMap::from([
+            ("Content-Length".to_string(), "5".to_string()),
+            ("Content-Type".to_string(), BUNDLE_CONTENT_TYPE.to_string()),
+            ("X-MirrorStack-Signed".to_string(), "exact".to_string()),
+        ]);
+        let parsed = validated_upload_headers(&valid, 5).unwrap();
+        assert_eq!(parsed.get("x-mirrorstack-signed").unwrap(), "exact");
+
+        for invalid in [
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::from([
+                ("Content-Length".to_string(), "4".to_string()),
+                ("Content-Type".to_string(), BUNDLE_CONTENT_TYPE.to_string()),
+            ]),
+            std::collections::BTreeMap::from([
+                ("Content-Length".to_string(), "5".to_string()),
+                ("Content-Type".to_string(), "text/plain".to_string()),
+            ]),
+            std::collections::BTreeMap::from([
+                ("Content-Length".to_string(), "5".to_string()),
+                ("Content-Type".to_string(), BUNDLE_CONTENT_TYPE.to_string()),
+                ("content-type".to_string(), BUNDLE_CONTENT_TYPE.to_string()),
+            ]),
+        ] {
+            assert!(validated_upload_headers(&invalid, 5).is_err());
+        }
+    }
+
+    #[test]
+    fn dev_bundle_upload_errors_never_expose_the_presigned_url() {
+        let mut server = mockito::Server::new();
+        let upload = server
+            .mock("PUT", "/upload")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "X-Amz-Signature".into(),
+                "top-secret".into(),
+            ))
+            .with_status(500)
+            .with_body("failed /upload?X-Amz-Signature=top-secret")
+            .create();
+        let url = format!("{}/upload?X-Amz-Signature=top-secret", server.url());
+        let headers = std::collections::BTreeMap::from([
+            ("Content-Length".to_string(), "5".to_string()),
+            ("Content-Type".to_string(), BUNDLE_CONTENT_TYPE.to_string()),
+        ]);
+        let client = http::client(Duration::from_secs(2)).unwrap();
+        let error = put_bundle(&client, &url, &headers, b"hello")
+            .expect_err("storage failure")
+            .to_string();
+        assert!(error.contains("dev-bundle upload failed"), "{error}");
+        assert!(!error.contains("top-secret"), "{error}");
+        assert!(!error.contains(&url), "{error}");
+        upload.assert();
+
+        let closed_url = {
+            let closed = mockito::Server::new();
+            format!("{}/gone?X-Amz-Signature=transport-secret", closed.url())
+        };
+        let error = put_bundle(&client, &closed_url, &headers, b"hello")
+            .expect_err("transport failure")
+            .to_string();
+        assert!(!error.contains("transport-secret"), "{error}");
+        assert!(!error.contains(&closed_url), "{error}");
+    }
+
+    #[test]
+    fn upload_bundle_rejects_mismatched_confirmed_descriptor() {
+        let mut server = mockito::Server::new();
+        let bytes = b"hello";
+        let hash = sha256_hex(bytes);
+        let _presign = server
+            .mock("POST", "/v1/modules/m-1/dev-bundle/presign")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "upload_url": format!("{}/s3-put", server.url()),
+                    "key": "modules/m-1/dev/u-1/hash/web/index.js",
+                    "headers": {
+                        "Content-Length": bytes.len().to_string(),
+                        "Content-Type": BUNDLE_CONTENT_TYPE
+                    },
+                    "expires_at": "2026-07-14T00:15:00Z"
+                })
+                .to_string(),
+            )
+            .create();
+        let _put = server.mock("PUT", "/s3-put").with_status(200).create();
+        let _confirm = server
+            .mock("POST", "/v1/modules/m-1/dev-bundle/confirm")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "url": "https://cdn.example/bundle.js",
+                    "session_id": "stale-session",
+                    "sha256": hash,
+                    "size_bytes": bytes.len()
+                })
+                .to_string(),
+            )
+            .create();
+        let api_client = http::client(Duration::from_secs(2)).unwrap();
+        let upload_client = http::client(Duration::from_secs(2)).unwrap();
+        let mut creds = Credentials {
+            access_token: "AT".into(),
+            refresh_token: "RT".into(),
+            expires_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+        };
+        let error = upload_bundle(
+            ShareHttp {
+                api_client: &api_client,
+                upload_client: &upload_client,
+                apps_base: &server.url(),
+            },
+            &mut creds,
+            BundleUpload {
+                module_id: "m-1",
+                session_id: "current-session",
+                bytes,
+                sha256: &hash,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("did not echo the current exact descriptor"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -732,7 +1081,7 @@ mod tests {
             last_uploaded: Some(sha256_hex(bytes)),
             ..Default::default()
         };
-        share_once(
+        share_once_test(
             &api_client,
             &upload_client,
             "http://127.0.0.1:1",
@@ -772,7 +1121,7 @@ mod tests {
             last_uploaded: None,
             ..Default::default()
         };
-        share_once(
+        share_once_test(
             &api_client,
             &upload_client,
             "http://127.0.0.1:1",

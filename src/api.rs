@@ -116,64 +116,6 @@ pub fn tunnel_token(
     Err(unexpected_body_error(resp))
 }
 
-/// GET /v1/dispatch/tunnel/manifest/{moduleId} — the module's live manifest, proxied
-/// off its `mirrorstack dev` tunnel by the dispatch service. `module_id` is
-/// the raw platform UUID. The 200 body is the manifest object itself (no
-/// envelope), returned as opaque JSON. Owner-gated: someone else's (or an
-/// unknown) module is a 404 `not_found`, and a module without a live tunnel
-/// is a 503 `tunnel_offline` — callers branch on those codes to tell "start
-/// `mirrorstack dev`" apart from real failures.
-pub fn get_tunnel_manifest(
-    http: &Client,
-    dispatch_base: &str,
-    access_token: &str,
-    module_id: &str,
-) -> Result<serde_json::Value, ApiError> {
-    let endpoint = format!(
-        "{}/v1/dispatch/tunnel/manifest/{}",
-        dispatch_base.trim_end_matches('/'),
-        module_id
-    );
-
-    let resp = http
-        .get(&endpoint)
-        .bearer_auth(access_token)
-        .header("Accept", "application/json")
-        .send()?;
-
-    let status = resp.status();
-    if status.is_success() {
-        return Ok(resp.json::<serde_json::Value>()?);
-    }
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(ApiError::Unauthenticated);
-    }
-
-    // Error envelope: surface code + message so callers can branch on
-    // `tunnel_offline` / `not_found` without re-parsing the body.
-    let status_u16 = status.as_u16();
-    let body = match http::read_capped(resp) {
-        Ok(b) => b,
-        Err(e) => {
-            return Err(ApiError::Unexpected {
-                status: status_u16,
-                body: format!("(read body failed: {e})"),
-            });
-        }
-    };
-    if let Ok(env) = serde_json::from_slice::<ErrorEnvelope>(&body) {
-        return Err(ApiError::Server {
-            status: status_u16,
-            code: env.error.code,
-            message: env.error.message,
-        });
-    }
-    Err(ApiError::Unexpected {
-        status: status_u16,
-        body: String::from_utf8_lossy(&body).into_owned(),
-    })
-}
-
 pub fn me(http: &Client, api_base: &str, access_token: &str) -> Result<Identity, ApiError> {
     let endpoint = format!("{}/v1/auth/me", api_base.trim_end_matches('/'));
 
@@ -334,11 +276,36 @@ pub struct RecordModuleVersionInput<'a> {
     /// to match the platform (`readme_too_large`).
     #[serde(skip_serializing_if = "map_is_empty")]
     pub readme: &'a BTreeMap<String, String>,
-    /// The module's full live manifest as read off the dev tunnel
-    /// (`get_tunnel_manifest`), passed through as opaque JSON. The platform
-    /// stores it verbatim on the version row and the web console mounts the
-    /// installed version's UI from it — a stub here loses the module's pages.
-    pub manifest: &'a serde_json::Value,
+    /// Exactly one immutable module declaration. Existing callers may still
+    /// send a legacy semantic manifest; attested deploys send the complete
+    /// release-candidate receipt so the API can decode/hash the SDK's exact
+    /// manifest bytes and bind artifact evidence before inserting the row.
+    #[serde(flatten)]
+    pub declaration: ModuleVersionDeclaration<'a>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+#[allow(dead_code)] // retained for legacy manifest callers; safe deploy uses ReleaseCandidate
+pub enum ModuleVersionDeclaration<'a> {
+    Manifest {
+        manifest: &'a serde_json::Value,
+        /// Exact server-confirmed dev-session web descriptor for legacy
+        /// manifest callers. It deliberately lives inside this variant so a
+        /// release candidate plus a legacy top-level tuple is unrepresentable.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        web_bundle: Option<WebBundleExpectation<'a>>,
+    },
+    ReleaseCandidate {
+        release_candidate: &'a serde_json::Value,
+    },
+}
+
+#[derive(Debug, Serialize)]
+pub struct WebBundleExpectation<'a> {
+    pub session_id: &'a str,
+    pub sha256: &'a str,
+    pub size_bytes: u64,
 }
 
 /// `skip_serializing_if` predicate for the borrowed changelog / readme maps.
@@ -358,6 +325,12 @@ pub struct ModuleVersion {
     pub channel: Option<String>,
     #[serde(default)]
     pub published_at: Option<String>,
+    #[serde(default)]
+    pub web_bundle_url: String,
+    #[serde(default)]
+    pub web_bundle_sha256: String,
+    #[serde(default)]
+    pub web_bundle_size_bytes: u64,
 }
 
 /// POST /v1/modules/{moduleId}/versions — record an immutable module
@@ -419,50 +392,216 @@ pub fn record_module_version(
     })
 }
 
-/// Envelope for GET /v1/modules/{moduleId}/versions.
+/// Owner-only immutable release state for one module version. The attested
+/// receipt is exposed even before an artifact row exists, so a CLI that races
+/// a concurrent `version_exists` can prove it found the exact candidate it
+/// prepared before making any artifact or deploy write.
 #[derive(Debug, Deserialize)]
-struct ModuleVersionList {
-    versions: Vec<ModuleVersion>,
+pub struct ModuleReleaseState {
+    pub version: ModuleReleaseStateVersion,
+    pub release_receipt: ModuleReleaseReceipt,
 }
 
-/// GET /v1/modules/{moduleId}/versions — the module's recorded versions,
-/// newest first (changelogs included, manifests omitted). Owner-scoped;
-/// someone else's module is a 404, surfaced as `Unexpected` since deploy
-/// resolves ownership via `get_module` before calling this.
-pub fn list_module_versions(
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // the exact owner-state version is shared with safe deploy planning
+pub struct ModuleReleaseStateVersion {
+    pub id: String,
+    pub module_id: String,
+    pub version: String,
+    pub manifest: serde_json::Value,
+    #[serde(default)]
+    pub yanked_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // ready/deploy are consumed by the follow-on state planner
+pub struct ModuleReleaseReceipt {
+    pub state: String,
+    pub protocol: Option<String>,
+    pub source_sha256: Option<String>,
+    pub manifest: Option<ModuleReleaseManifestEvidence>,
+    pub web: Option<ModuleReleaseWebEvidence>,
+    pub artifact: Option<ModuleReleaseArtifactEvidence>,
+    pub deploy: Option<ModuleReleaseDeployEvidence>,
+    pub coherent: bool,
+    pub ready: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModuleReleaseManifestEvidence {
+    pub sha256: String,
+    pub base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // URL is capture state, not immutable candidate input
+pub struct ModuleReleaseWebEvidence {
+    pub sha256: String,
+    pub size_bytes: u64,
+    /// Empty while post-commit bundle promotion still needs recovery.
+    pub url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // lifecycle timestamps are part of the owner API surface
+pub struct ModuleReleaseArtifactEvidence {
+    pub status: String,
+    pub source_sha256: Option<String>,
+    pub manifest_sha256: Option<String>,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub os: String,
+    pub arch: String,
+    pub format: String,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub finalized_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // decoded now so the exact wire is ready for the state planner
+pub struct ModuleReleaseDeployEvidence {
+    pub mode: String,
+    pub status: String,
+    pub source_sha256: Option<String>,
+    pub manifest_sha256: Option<String>,
+    pub artifact_sha256: Option<String>,
+    pub lambda_version: Option<String>,
+    pub lambda_code_sha256: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+/// GET /v1/modules/{moduleId}/versions/{versionRef} — owner-only exact state
+/// for an immutable version. UUID and canonical SemVer refs are accepted by
+/// the platform. Missing, foreign-owner, and cross-module refs all return the
+/// same structured `not_found` error.
+pub fn get_module_release_state(
     http: &Client,
     apps_base: &str,
     access_token: &str,
     module_id: &str,
-) -> Result<Vec<ModuleVersion>, ApiError> {
+    version_ref: &str,
+) -> Result<ModuleReleaseState, ApiError> {
     let endpoint = format!(
-        "{}/v1/modules/{}/versions",
+        "{}/v1/modules/{}/versions/{}",
         apps_base.trim_end_matches('/'),
-        module_id
+        module_id,
+        version_ref
     );
-
     let resp = http
-        .get(&endpoint)
+        .get(endpoint)
         .bearer_auth(access_token)
         .header("Accept", "application/json")
         .send()?;
-
     let status = resp.status();
     if status.is_success() {
-        return Ok(resp.json::<ModuleVersionList>()?.versions);
+        return Ok(resp.json::<ModuleReleaseState>()?);
     }
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(ApiError::Unauthenticated);
     }
-    Err(unexpected_body_error(resp))
+    Err(envelope_error(resp))
+}
+
+/// Result of idempotently promoting the web bundle descriptor frozen on an
+/// immutable module version. Recovery never accepts caller-supplied source
+/// coordinates; the platform replays only its stored release receipt.
+#[derive(Debug, Deserialize)]
+pub struct ModuleBundleCapture {
+    pub module_id: String,
+    pub version_id: String,
+    pub version: String,
+    pub web_bundle_url: String,
+    pub web_bundle_sha256: String,
+    pub web_bundle_size_bytes: u64,
+}
+
+/// POST /v1/modules/{moduleId}/versions/{versionRef}/bundle/capture — bodyless
+/// owner-only recovery for a bound version whose post-commit initial web
+/// promotion failed. Idempotent when the pinned destination already exists;
+/// legacy-unbound versions fail closed on the platform.
+pub fn capture_module_version_bundle(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+    version_ref: &str,
+) -> Result<ModuleBundleCapture, ApiError> {
+    let endpoint = format!(
+        "{}/v1/modules/{}/versions/{}/bundle/capture",
+        apps_base.trim_end_matches('/'),
+        module_id,
+        version_ref
+    );
+    let resp = http
+        .post(endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<ModuleBundleCapture>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
 }
 
 #[derive(Debug, Serialize)]
 pub struct SetModuleDeployInput<'a> {
-    pub invoke_target: &'a str,
+    /// Attested deploys are explicit: artifact-backed production, or the
+    /// narrowly server-gated local simulator fallback after artifact storage
+    /// explicitly reported itself unconfigured.
+    pub mode: ModuleDeployMode,
     /// Omitted → server default `active`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleDeployMode {
+    Artifact,
+    LocalSimulation,
+}
+
+impl ModuleDeployMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Artifact => "artifact",
+            Self::LocalSimulation => "local_simulation",
+        }
+    }
+}
+
+/// Redacted immutable candidate evidence returned with every operational
+/// release mutation. Exact manifest bytes and the web session stay private to
+/// version creation/owner state, while this receipt is sufficient to prove
+/// that create-upload, finalize, and deploy all acted on the same tuple.
+#[derive(Debug, Deserialize)]
+pub struct ModuleOperationReleaseReceipt {
+    pub protocol: String,
+    pub source_sha256: String,
+    pub manifest_sha256: String,
+    pub artifact: ModuleOperationArtifactReceipt,
+    pub web: Option<ModuleOperationWebReceipt>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModuleOperationArtifactReceipt {
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub os: String,
+    pub arch: String,
+    pub format: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ModuleOperationWebReceipt {
+    pub sha256: String,
+    pub size_bytes: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -472,10 +611,15 @@ pub struct ModuleDeploy {
     pub module_id: String,
     pub invoke_target: String,
     pub status: String,
-    #[serde(default)]
-    pub created_at: Option<String>,
-    #[serde(default)]
-    pub updated_at: Option<String>,
+    pub mode: String,
+    pub source_sha256: String,
+    pub manifest_sha256: String,
+    pub artifact_sha256: Option<String>,
+    pub lambda_version: Option<String>,
+    pub lambda_code_sha256: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub release_receipt: ModuleOperationReleaseReceipt,
 }
 
 /// POST /v1/modules/{moduleId}/versions/{versionRef}/deploy — point a module
@@ -541,31 +685,43 @@ pub fn set_module_deploy(
 }
 
 /// One-time PUT instruction for a version's Lambda artifact, returned by
-/// [`create_module_artifact_upload`]. The platform owns the key outright —
-/// the CLI never proposes one, and nothing is echoed back at finalize.
-#[derive(Debug, Deserialize)]
+/// [`create_module_artifact_upload`]. The platform owns the storage key
+/// outright and deliberately never exposes it to the CLI.
+#[derive(Deserialize)]
 #[allow(dead_code)] // version_id / module_id / expires_at are part of the API surface
 pub struct ModuleArtifactUpload {
     pub url: String,
-    pub key: String,
     /// Headers the presigned URL expects — sent verbatim on the PUT, exactly
     /// like an app deploy's `UploadTarget`.
-    #[serde(default)]
     pub headers: BTreeMap<String, String>,
-    #[serde(default)]
     pub version_id: String,
-    #[serde(default)]
     pub module_id: String,
     /// RFC3339 presign expiry — informational only (the PUT follows
     /// immediately, so the CLI never acts on it).
-    #[serde(default)]
     pub expires_at: String,
+    pub release_receipt: ModuleOperationReleaseReceipt,
+}
+
+impl std::fmt::Debug for ModuleArtifactUpload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModuleArtifactUpload")
+            .field("url", &"<redacted>")
+            .field("headers", &"<redacted>")
+            .field("version_id", &self.version_id)
+            .field("module_id", &self.module_id)
+            .field("expires_at", &self.expires_at)
+            .field("release_receipt", &self.release_receipt)
+            .finish()
+    }
 }
 
 /// POST /v1/modules/{moduleId}/versions/{versionRef}/artifact — record a
 /// pending artifact for the version and mint its presigned PUT. Takes no
-/// body: size and digest are read off object storage at finalize, never
-/// declared by the caller. `version_ref` is the version UUID or the
+/// body: exact size/digest are derived from the release candidate already
+/// frozen on the version, then proved against object storage at finalize.
+/// The response contains upload instructions but no storage key.
+/// `version_ref` is the version UUID or the
 /// canonical SemVer string — path-safe verbatim ([0-9A-Za-z.+-] only), same
 /// as [`set_module_deploy`]. Owner-scoped; a module the caller doesn't own
 /// collapses to 404.
@@ -596,26 +752,23 @@ pub fn create_module_artifact_upload(
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)] // the whole row is the API surface; deploy only needs success
 pub struct ModuleArtifact {
-    pub key: String,
-    #[serde(default)]
     pub status: String,
-    #[serde(default)]
-    pub size_bytes: u64,
-    #[serde(default)]
+    pub size_bytes: i64,
+    pub sha256: String,
     pub version_id: String,
-    #[serde(default)]
     pub module_id: String,
-    #[serde(default)]
     pub created_at: String,
-    #[serde(default)]
     pub updated_at: String,
+    pub finalized_at: Option<String>,
+    pub release_receipt: ModuleOperationReleaseReceipt,
 }
 
 /// POST /v1/modules/{moduleId}/versions/{versionRef}/artifact/finalize —
 /// HEAD-verify the uploaded object and mark it deployable. Also takes no
-/// body: the pending row from [`create_module_artifact_upload`] already
-/// holds the key, so there is nothing for the caller to supply (and nothing
-/// to spoof). `artifact_missing` / `artifact_invalid` /
+/// body: the version receipt and pending row already hold the expected tuple
+/// and private storage identity, so there is nothing for the caller to supply,
+/// spoof, or learn from the response.
+/// `artifact_missing` / `artifact_invalid` /
 /// `artifact_storage_unconfigured` come back as `ApiError::Server`.
 pub fn finalize_module_artifact(
     http: &Client,
@@ -1337,14 +1490,31 @@ pub struct DevBundlePresignInput<'a> {
 
 /// Response from the dev-bundle presign step: a short-lived presigned S3 PUT
 /// plus the server-derived key the CLI echoes back on confirm.
-#[derive(Debug, Deserialize)]
+// Do not derive Debug: upload_url is a bearer-like presigned credential and
+// must never become printable through an otherwise harmless debug log.
+#[derive(Deserialize)]
 pub struct DevBundlePresign {
     pub upload_url: String,
     pub key: String,
+    /// Authoritative signed request headers. Callers must apply the complete
+    /// map rather than reconstructing storage-provider signing behavior.
+    pub headers: BTreeMap<String, String>,
     /// RFC3339 presign expiry — informational only (the PUT follows
     /// immediately, so the CLI never acts on it).
     #[allow(dead_code)]
     pub expires_at: String,
+}
+
+impl std::fmt::Debug for DevBundlePresign {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DevBundlePresign")
+            .field("upload_url", &"<redacted>")
+            .field("key", &self.key)
+            .field("headers", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// POST /v1/modules/{moduleId}/dev-bundle/presign — mint a presigned S3 PUT
@@ -1391,6 +1561,7 @@ pub fn presign_dev_bundle(
 #[derive(Debug, Serialize)]
 pub struct DevBundleConfirmInput<'a> {
     pub key: &'a str,
+    pub session_id: &'a str,
 }
 
 /// Response from the dev-bundle confirm step: the CDN URL now served as the
@@ -1398,20 +1569,24 @@ pub struct DevBundleConfirmInput<'a> {
 #[derive(Debug, Deserialize)]
 pub struct DevBundleConfirmed {
     pub url: String,
+    pub session_id: String,
+    pub sha256: String,
+    pub size_bytes: u64,
 }
 
 /// POST /v1/modules/{moduleId}/dev-bundle/confirm — finalize a dev-bundle
 /// upload. The platform HEAD-verifies the object (content-type,
 /// size ≤ 32 MiB, declared sha256) and points the live tunnel session at the
 /// resulting CDN URL. `403` (IDOR: key outside the caller's own prefix),
-/// `410` (upload missing), and `422` (`confirm_mismatch`) come back as
-/// `ApiError::Server`.
+/// `409` (session superseded), `410` (session expired/upload missing), and
+/// `422` (`confirm_mismatch`) come back as `ApiError::Server`.
 pub fn confirm_dev_bundle(
     http: &Client,
     apps_base: &str,
     access_token: &str,
     module_id: &str,
     key: &str,
+    session_id: &str,
 ) -> Result<DevBundleConfirmed, ApiError> {
     let endpoint = format!(
         "{}/v1/modules/{}/dev-bundle/confirm",
@@ -1423,7 +1598,7 @@ pub fn confirm_dev_bundle(
         .post(&endpoint)
         .bearer_auth(access_token)
         .header("Accept", "application/json")
-        .json(&DevBundleConfirmInput { key })
+        .json(&DevBundleConfirmInput { key, session_id })
         .send()?;
 
     let status = resp.status();
@@ -1704,6 +1879,22 @@ mod tests {
 
     fn test_client() -> Client {
         http::client(Duration::from_secs(15)).expect("client")
+    }
+
+    fn operation_receipt() -> serde_json::Value {
+        json!({
+            "protocol": "mirrorstack.release-candidate/v1",
+            "source_sha256": "a".repeat(64),
+            "manifest_sha256": "b".repeat(64),
+            "artifact": {
+                "sha256": "c".repeat(64),
+                "size_bytes": 2048,
+                "os": "linux",
+                "arch": "arm64",
+                "format": "lambda-bootstrap-zip"
+            },
+            "web": null
+        })
     }
 
     fn deploy_grant_exchange_error(status: usize, body: serde_json::Value) -> DeployGrantError {
@@ -2261,7 +2452,7 @@ mod tests {
             .mock("POST", "/v1/modules/mod-uuid/versions/ver-uuid/deploy")
             .match_header("authorization", "Bearer AT")
             .match_body(mockito::Matcher::JsonString(
-                r#"{"invoke_target":"my-fn","status":"active"}"#.into(),
+                r#"{"mode":"artifact","status":"active"}"#.into(),
             ))
             .with_status(200)
             .with_body(
@@ -2270,8 +2461,15 @@ mod tests {
                     "module_id": "mod-uuid",
                     "invoke_target": "my-fn",
                     "status": "active",
+                    "mode": "artifact",
+                    "source_sha256": "a".repeat(64),
+                    "manifest_sha256": "b".repeat(64),
+                    "artifact_sha256": "c".repeat(64),
+                    "lambda_version": "7",
+                    "lambda_code_sha256": "lambda-code",
                     "created_at": "2026-07-01T00:00:00Z",
-                    "updated_at": "2026-07-02T00:00:00Z"
+                    "updated_at": "2026-07-02T00:00:00Z",
+                    "release_receipt": operation_receipt()
                 })
                 .to_string(),
             )
@@ -2284,7 +2482,7 @@ mod tests {
             "mod-uuid",
             "ver-uuid",
             &SetModuleDeployInput {
-                invoke_target: "my-fn",
+                mode: ModuleDeployMode::Artifact,
                 status: Some("active"),
             },
         )
@@ -2300,7 +2498,7 @@ mod tests {
         let _m = server
             .mock("POST", "/v1/modules/mod-uuid/versions/ver-uuid/deploy")
             .match_body(mockito::Matcher::JsonString(
-                r#"{"invoke_target":"my-fn"}"#.into(),
+                r#"{"mode":"local_simulation"}"#.into(),
             ))
             .with_status(200)
             .with_body(
@@ -2308,7 +2506,16 @@ mod tests {
                     "version_id": "ver-uuid",
                     "module_id": "mod-uuid",
                     "invoke_target": "my-fn",
-                    "status": "active"
+                    "status": "active",
+                    "mode": "local_simulation",
+                    "source_sha256": "a".repeat(64),
+                    "manifest_sha256": "b".repeat(64),
+                    "artifact_sha256": null,
+                    "lambda_version": null,
+                    "lambda_code_sha256": null,
+                    "created_at": "2026-07-01T00:00:00Z",
+                    "updated_at": "2026-07-02T00:00:00Z",
+                    "release_receipt": operation_receipt()
                 })
                 .to_string(),
             )
@@ -2321,7 +2528,7 @@ mod tests {
             "mod-uuid",
             "ver-uuid",
             &SetModuleDeployInput {
-                invoke_target: "my-fn",
+                mode: ModuleDeployMode::LocalSimulation,
                 status: None,
             },
         )
@@ -2347,7 +2554,7 @@ mod tests {
             "mod-uuid",
             "ver-uuid",
             &SetModuleDeployInput {
-                invoke_target: "my-fn",
+                mode: ModuleDeployMode::Artifact,
                 status: None,
             },
         )
@@ -2379,7 +2586,7 @@ mod tests {
             "mod-uuid",
             "ver-uuid",
             &SetModuleDeployInput {
-                invoke_target: "not a lambda!",
+                mode: ModuleDeployMode::Artifact,
                 status: None,
             },
         )
@@ -2409,7 +2616,7 @@ mod tests {
             "mod-uuid",
             "ver-uuid",
             &SetModuleDeployInput {
-                invoke_target: "my-fn",
+                mode: ModuleDeployMode::Artifact,
                 status: None,
             },
         )
@@ -2428,7 +2635,16 @@ mod tests {
                     "version_id": "ver-uuid",
                     "module_id": "mod-uuid",
                     "invoke_target": "my-fn",
-                    "status": "active"
+                    "status": "active",
+                    "mode": "artifact",
+                    "source_sha256": "a".repeat(64),
+                    "manifest_sha256": "b".repeat(64),
+                    "artifact_sha256": "c".repeat(64),
+                    "lambda_version": "7",
+                    "lambda_code_sha256": "lambda-code",
+                    "created_at": "2026-07-01T00:00:00Z",
+                    "updated_at": "2026-07-02T00:00:00Z",
+                    "release_receipt": operation_receipt()
                 })
                 .to_string(),
             )
@@ -2441,7 +2657,7 @@ mod tests {
             "mod-uuid",
             "1.2.0",
             &SetModuleDeployInput {
-                invoke_target: "my-fn",
+                mode: ModuleDeployMode::Artifact,
                 status: None,
             },
         )
@@ -2506,13 +2722,106 @@ mod tests {
                 version: "0.1.0",
                 changelog: &changelog,
                 readme: &readme,
-                manifest: &manifest,
+                declaration: ModuleVersionDeclaration::Manifest {
+                    manifest: &manifest,
+                    web_bundle: None,
+                },
             },
         )
         .expect("ok");
         assert_eq!(v.id, "ver-uuid");
         assert_eq!(v.version, "0.1.0");
         assert_eq!(v.channel.as_deref(), Some("stable"));
+    }
+
+    #[test]
+    fn record_module_version_binds_exact_confirmed_web_descriptor() {
+        let mut server = Server::new();
+        let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/versions")
+            .match_body(mockito::Matcher::JsonString(
+                format!(
+                    r#"{{"version":"0.1.0","manifest":{{"id":"mabc123","slug":"media"}},"web_bundle":{{"session_id":"session-1","sha256":"{sha}","size_bytes":422}}}}"#
+                ),
+            ))
+            .with_status(201)
+            .with_body(
+                json!({
+                    "id": "ver-uuid",
+                    "module_id": "mod-uuid",
+                    "version": "0.1.0",
+                    "web_bundle_url": "",
+                    "web_bundle_sha256": sha,
+                    "web_bundle_size_bytes": 422
+                })
+                .to_string(),
+            )
+            .create();
+
+        let manifest = stub_manifest();
+        let version = record_module_version(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            &RecordModuleVersionInput {
+                version: "0.1.0",
+                changelog: &BTreeMap::new(),
+                readme: &BTreeMap::new(),
+                declaration: ModuleVersionDeclaration::Manifest {
+                    manifest: &manifest,
+                    web_bundle: Some(WebBundleExpectation {
+                        session_id: "session-1",
+                        sha256: sha,
+                        size_bytes: 422,
+                    }),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(version.web_bundle_sha256, sha);
+        assert_eq!(version.web_bundle_size_bytes, 422);
+    }
+
+    #[test]
+    fn attested_version_create_sends_the_receipt_without_legacy_manifest_or_web_tuple() {
+        let receipt = json!({
+            "protocol": "mirrorstack.release-candidate/v1",
+            "module_id": "mod-uuid",
+            "slug": "media",
+            "version": "0.1.0",
+            "source_sha256": "a".repeat(64),
+            "manifest": {
+                "sha256": "b".repeat(64),
+                "base64": "e30K"
+            },
+            "web": {
+                "session_id": "session-1",
+                "sha256": "c".repeat(64),
+                "size_bytes": 422
+            },
+            "artifact": {
+                "sha256": "d".repeat(64),
+                "size_bytes": 2048,
+                "os": "linux",
+                "arch": "arm64",
+                "format": "lambda-bootstrap-zip"
+            }
+        });
+        let empty = BTreeMap::new();
+        let input = RecordModuleVersionInput {
+            version: "0.1.0",
+            changelog: &empty,
+            readme: &empty,
+            declaration: ModuleVersionDeclaration::ReleaseCandidate {
+                release_candidate: &receipt,
+            },
+        };
+        let encoded = serde_json::to_value(input).unwrap();
+        assert_eq!(encoded.get("release_candidate"), Some(&receipt));
+        assert!(encoded.get("manifest").is_none());
+        assert!(encoded.get("web_bundle").is_none());
     }
 
     #[test]
@@ -2543,7 +2852,10 @@ mod tests {
                 version: "0.1.0",
                 changelog: &BTreeMap::new(),
                 readme: &BTreeMap::new(),
-                manifest: &stub_manifest(),
+                declaration: ModuleVersionDeclaration::Manifest {
+                    manifest: &stub_manifest(),
+                    web_bundle: None,
+                },
             },
         )
         .expect("ok");
@@ -2570,7 +2882,10 @@ mod tests {
                 version: "0.1.0",
                 changelog: &BTreeMap::new(),
                 readme: &BTreeMap::new(),
-                manifest: &stub_manifest(),
+                declaration: ModuleVersionDeclaration::Manifest {
+                    manifest: &stub_manifest(),
+                    web_bundle: None,
+                },
             },
         )
         .unwrap_err();
@@ -2603,7 +2918,10 @@ mod tests {
                 version: "0.1.0",
                 changelog: &BTreeMap::from([("default".to_string(), "huge".to_string())]),
                 readme: &BTreeMap::new(),
-                manifest: &stub_manifest(),
+                declaration: ModuleVersionDeclaration::Manifest {
+                    manifest: &stub_manifest(),
+                    web_bundle: None,
+                },
             },
         )
         .unwrap_err();
@@ -2634,7 +2952,10 @@ mod tests {
                 version: "0.1.0",
                 changelog: &BTreeMap::new(),
                 readme: &BTreeMap::new(),
-                manifest: &stub_manifest(),
+                declaration: ModuleVersionDeclaration::Manifest {
+                    manifest: &stub_manifest(),
+                    web_bundle: None,
+                },
             },
         )
         .unwrap_err();
@@ -2642,130 +2963,132 @@ mod tests {
     }
 
     #[test]
-    fn list_module_versions_success() {
+    fn get_module_release_state_decodes_bound_missing_artifact_receipt() {
         let mut server = Server::new();
         let _m = server
-            .mock("GET", "/v1/modules/mod-uuid/versions")
+            .mock("GET", "/v1/modules/mod-uuid/versions/1.2.3")
             .match_header("authorization", "Bearer AT")
             .with_status(200)
             .with_body(
                 json!({
-                    "versions": [
-                        {"id": "ver-2", "module_id": "mod-uuid", "version": "0.2.0"},
-                        {"id": "ver-1", "module_id": "mod-uuid", "version": "0.1.0"}
-                    ]
+                    "version": {
+                        "id": "ver-uuid",
+                        "module_id": "mod-uuid",
+                        "version": "1.2.3",
+                        "manifest": {"id": "m11111111111111111111111111111111", "slug": "media"},
+                        "yanked_at": null
+                    },
+                    "release_receipt": {
+                        "state": "bound",
+                        "protocol": "mirrorstack.release-candidate/v1",
+                        "source_sha256": "a".repeat(64),
+                        "manifest": {"sha256": "b".repeat(64), "base64": "e30K"},
+                        "web": {"sha256": "c".repeat(64), "size_bytes": 422, "url": ""},
+                        "artifact": {
+                            "status": "missing",
+                            "source_sha256": "a".repeat(64),
+                            "manifest_sha256": "b".repeat(64),
+                            "sha256": "d".repeat(64),
+                            "size_bytes": 2048,
+                            "os": "linux",
+                            "arch": "arm64",
+                            "format": "lambda-bootstrap-zip",
+                            "created_at": null,
+                            "updated_at": null,
+                            "finalized_at": null
+                        },
+                        "deploy": null,
+                        "coherent": true,
+                        "ready": false
+                    }
                 })
                 .to_string(),
             )
             .create();
 
-        let vs = list_module_versions(&test_client(), &server.url(), "AT", "mod-uuid").expect("ok");
-        assert_eq!(vs.len(), 2);
-        assert_eq!(vs[0].version, "0.2.0");
-        assert_eq!(vs[1].id, "ver-1");
+        let state =
+            get_module_release_state(&test_client(), &server.url(), "AT", "mod-uuid", "1.2.3")
+                .unwrap();
+        assert_eq!(state.version.id, "ver-uuid");
+        assert_eq!(state.release_receipt.state, "bound");
+        assert_eq!(
+            state.release_receipt.artifact.as_ref().unwrap().status,
+            "missing"
+        );
+        assert!(!state.release_receipt.ready);
     }
 
     #[test]
-    fn list_module_versions_empty() {
+    fn get_module_release_state_preserves_owner_hidden_not_found() {
         let mut server = Server::new();
         let _m = server
-            .mock("GET", "/v1/modules/mod-uuid/versions")
-            .with_status(200)
-            .with_body(json!({"versions": []}).to_string())
-            .create();
-
-        let vs = list_module_versions(&test_client(), &server.url(), "AT", "mod-uuid").expect("ok");
-        assert!(vs.is_empty());
-    }
-
-    #[test]
-    fn list_module_versions_401_is_unauthenticated() {
-        let mut server = Server::new();
-        let _m = server
-            .mock("GET", "/v1/modules/mod-uuid/versions")
-            .with_status(401)
-            .create();
-
-        let err =
-            list_module_versions(&test_client(), &server.url(), "expired", "mod-uuid").unwrap_err();
-        assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
-    }
-
-    #[test]
-    fn get_tunnel_manifest_success() {
-        let mut server = Server::new();
-        let _m = server
-            .mock("GET", "/v1/dispatch/tunnel/manifest/mod-uuid")
-            .match_header("authorization", "Bearer AT")
-            .with_status(200)
-            .with_body(
-                json!({
-                    "id": "mabc123",
-                    "slug": "media",
-                    "ui": {"defaultPages": [{"path": "/"}, {"path": "/settings"}]},
-                    "routes": {"public": []}
-                })
-                .to_string(),
-            )
-            .create();
-
-        let m = get_tunnel_manifest(&test_client(), &server.url(), "AT", "mod-uuid").expect("ok");
-        assert_eq!(m["slug"], "media");
-        assert_eq!(m["ui"]["defaultPages"].as_array().map(Vec::len), Some(2));
-    }
-
-    #[test]
-    fn get_tunnel_manifest_401_is_unauthenticated() {
-        let mut server = Server::new();
-        let _m = server
-            .mock("GET", "/v1/dispatch/tunnel/manifest/mod-uuid")
-            .with_status(401)
-            .with_body(r#"{"error":{"code":"token_expired","message":"token expired"}}"#)
-            .create();
-
-        let err =
-            get_tunnel_manifest(&test_client(), &server.url(), "expired", "mod-uuid").unwrap_err();
-        assert!(matches!(err, ApiError::Unauthenticated), "got {err:?}");
-    }
-
-    #[test]
-    fn get_tunnel_manifest_404_surfaces_code() {
-        let mut server = Server::new();
-        let _m = server
-            .mock("GET", "/v1/dispatch/tunnel/manifest/mod-uuid")
+            .mock("GET", "/v1/modules/mod-uuid/versions/1.2.3")
             .with_status(404)
-            .with_body(r#"{"error":{"code":"not_found","message":"module not found"}}"#)
+            .with_body(r#"{"error":{"code":"not_found","message":"module version not found"}}"#)
             .create();
 
-        let err = get_tunnel_manifest(&test_client(), &server.url(), "AT", "mod-uuid").unwrap_err();
-        match err {
-            ApiError::Server { status, code, .. } => {
-                assert_eq!(status, 404);
-                assert_eq!(code, "not_found");
-            }
-            other => panic!("expected Server, got {other:?}"),
-        }
+        let error =
+            get_module_release_state(&test_client(), &server.url(), "AT", "mod-uuid", "1.2.3")
+                .unwrap_err();
+        assert!(
+            matches!(error, ApiError::Server { status: 404, ref code, .. } if code == "not_found"),
+            "got {error:?}"
+        );
     }
 
     #[test]
-    fn get_tunnel_manifest_503_tunnel_offline_surfaces_code() {
+    fn capture_module_version_bundle_is_bodyless_and_decodes_exact_receipt() {
         let mut server = Server::new();
-        let _m = server
-            .mock("GET", "/v1/dispatch/tunnel/manifest/mod-uuid")
-            .with_status(503)
+        let sha = "c".repeat(64);
+        let capture = server
+            .mock("POST", "/v1/modules/mod-uuid/versions/1.2.3/bundle/capture")
+            .match_header("authorization", "Bearer AT")
+            .match_body("")
+            .with_status(200)
             .with_body(
-                r#"{"error":{"code":"tunnel_offline","message":"no live dev tunnel for this module"}}"#,
+                json!({
+                    "module_id": "mod-uuid",
+                    "version_id": "ver-uuid",
+                    "version": "1.2.3",
+                    "web_bundle_url": "https://cdn.example.test/index.js",
+                    "web_bundle_sha256": sha,
+                    "web_bundle_size_bytes": 422
+                })
+                .to_string(),
             )
             .create();
 
-        let err = get_tunnel_manifest(&test_client(), &server.url(), "AT", "mod-uuid").unwrap_err();
-        match err {
-            ApiError::Server { status, code, .. } => {
-                assert_eq!(status, 503);
-                assert_eq!(code, "tunnel_offline");
-            }
-            other => panic!("expected Server, got {other:?}"),
-        }
+        let result =
+            capture_module_version_bundle(&test_client(), &server.url(), "AT", "mod-uuid", "1.2.3")
+                .unwrap();
+        capture.assert();
+        assert_eq!(result.version_id, "ver-uuid");
+        assert_eq!(result.web_bundle_sha256, sha);
+        assert_eq!(result.web_bundle_size_bytes, 422);
+        assert!(!result.web_bundle_url.is_empty());
+    }
+
+    #[test]
+    fn capture_module_version_bundle_preserves_structured_recovery_error() {
+        let mut server = Server::new();
+        let _capture = server
+            .mock(
+                "POST",
+                "/v1/modules/mod-uuid/versions/1.2.3/bundle/capture",
+            )
+            .with_status(409)
+            .with_body(
+                r#"{"error":{"code":"bundle_capture_conflict","message":"pinned destination differs"}}"#,
+            )
+            .create();
+
+        let error =
+            capture_module_version_bundle(&test_client(), &server.url(), "AT", "mod-uuid", "1.2.3")
+                .unwrap_err();
+        assert!(
+            matches!(error, ApiError::Server { status: 409, ref code, .. } if code == "bundle_capture_conflict"),
+            "got {error:?}"
+        );
     }
 
     #[test]
@@ -3002,6 +3325,10 @@ mod tests {
                 json!({
                     "upload_url": "https://s3.example/put?sig=1",
                     "key": "modules/mod-uuid/dev/u-1/abc123/web/index.js",
+                    "headers": {
+                        "Content-Length": "422",
+                        "Content-Type": "application/javascript"
+                    },
                     "expires_at": "2026-07-14T00:15:00Z"
                 })
                 .to_string(),
@@ -3022,6 +3349,41 @@ mod tests {
         .expect("ok");
         assert_eq!(p.upload_url, "https://s3.example/put?sig=1");
         assert_eq!(p.key, "modules/mod-uuid/dev/u-1/abc123/web/index.js");
+        assert_eq!(
+            p.headers.get("Content-Length").map(String::as_str),
+            Some("422")
+        );
+    }
+
+    #[test]
+    fn presign_dev_bundle_rejects_legacy_success_without_signed_headers() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/dev-bundle/presign")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "upload_url": "https://s3.example/put?secret=redacted",
+                    "key": "modules/mod-uuid/dev/u-1/abc123/web/index.js",
+                    "expires_at": "2026-07-14T00:15:00Z"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let error = presign_dev_bundle(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            &DevBundlePresignInput {
+                content_type: "application/javascript",
+                size_bytes: 422,
+                sha256: "abc123",
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, ApiError::Http(_)), "got {error:?}");
     }
 
     #[test]
@@ -3114,12 +3476,15 @@ mod tests {
             .mock("POST", "/v1/modules/mod-uuid/dev-bundle/confirm")
             .match_header("authorization", "Bearer AT")
             .match_body(mockito::Matcher::JsonString(
-                r#"{"key":"modules/mod-uuid/dev/u-1/abc123/web/index.js"}"#.into(),
+                r#"{"key":"modules/mod-uuid/dev/u-1/abc123/web/index.js","session_id":"session-1"}"#.into(),
             ))
             .with_status(200)
             .with_body(
                 json!({
-                    "url": "https://cdn.mirrorstack.ai/modules/mod-uuid/dev/u-1/abc123/web/index.js"
+                    "url": "https://cdn.mirrorstack.ai/modules/mod-uuid/dev/u-1/abc123/web/index.js",
+                    "session_id": "session-1",
+                    "sha256": "abc123",
+                    "size_bytes": 422
                 })
                 .to_string(),
             )
@@ -3131,6 +3496,7 @@ mod tests {
             "AT",
             "mod-uuid",
             "modules/mod-uuid/dev/u-1/abc123/web/index.js",
+            "session-1",
         )
         .expect("ok");
         assert_eq!(
@@ -3150,8 +3516,15 @@ mod tests {
             )
             .create();
 
-        let err = confirm_dev_bundle(&test_client(), &server.url(), "AT", "mod-uuid", "some/key")
-            .unwrap_err();
+        let err = confirm_dev_bundle(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            "some/key",
+            "session-1",
+        )
+        .unwrap_err();
         match err {
             ApiError::Server { status, code, .. } => {
                 assert_eq!(status, 422);
@@ -3176,6 +3549,7 @@ mod tests {
             "AT",
             "mod-uuid",
             "modules/other/dev/u-2/x/web/index.js",
+            "session-1",
         )
         .unwrap_err();
         match err {
@@ -3185,6 +3559,27 @@ mod tests {
             }
             other => panic!("expected Server, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn confirm_dev_bundle_rejects_legacy_url_only_success() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/modules/mod-uuid/dev-bundle/confirm")
+            .with_status(200)
+            .with_body(r#"{"url":"https://cdn.example/legacy.js"}"#)
+            .create();
+
+        let error = confirm_dev_bundle(
+            &test_client(),
+            &server.url(),
+            "AT",
+            "mod-uuid",
+            "some/key",
+            "session-1",
+        )
+        .unwrap_err();
+        assert!(matches!(error, ApiError::Http(_)), "got {error:?}");
     }
 
     #[test]

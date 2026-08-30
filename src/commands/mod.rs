@@ -10,6 +10,7 @@ mod dev;
 mod login;
 mod logout;
 mod module;
+pub(crate) mod release_candidate;
 mod whoami;
 
 /// Default api-platform account-service base. Prod path-routes each service
