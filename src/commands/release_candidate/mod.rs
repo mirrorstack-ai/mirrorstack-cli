@@ -23,6 +23,7 @@ use super::module::artifact;
 
 mod process;
 pub(crate) mod source;
+mod web_dependencies;
 
 use process::{ProcessOutput, ProcessRunner, ProcessSpec, SystemRunner};
 use source::{BuildView, SourceSnapshot};
@@ -425,7 +426,8 @@ fn build_web(
     };
 
     let manager = package_manager(&web_dir)?;
-    let install = web_spec(manager.program(), &web_dir)
+    web_dependencies::validate(view, &web_dir, manager)?;
+    let install = web_spec(manager.program(), &web_dir, manager)
         // Dependency installation needs the module's devDependencies (the
         // shared CSS compiler and esbuild live there), independent of an
         // ambient production shell.
@@ -436,10 +438,10 @@ fn build_web(
     run_checked(runner, &install, "frozen web dependency install")?;
 
     let build = match pipeline {
-        WebPipeline::DeclaredScript(script) => web_spec(manager.program(), &web_dir)
+        WebPipeline::DeclaredScript(script) => web_spec(manager.program(), &web_dir, manager)
             .env("NODE_ENV", "production")
             .args(manager.run_args(script)),
-        WebPipeline::LegacyEsbuild => web_spec("node", &web_dir)
+        WebPipeline::LegacyEsbuild => web_spec("node", &web_dir, manager)
             .env("NODE_ENV", "production")
             .args([OsString::from("esbuild.config.mjs")]),
     }
@@ -502,17 +504,23 @@ fn build_web(
     }))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PackageManager {
     Pnpm,
-    Npm,
+    Npm(NpmLockfile),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NpmLockfile {
+    PackageLock,
+    Shrinkwrap,
 }
 
 impl PackageManager {
     fn program(self) -> &'static str {
         match self {
             Self::Pnpm => "pnpm",
-            Self::Npm => "npm",
+            Self::Npm(_) => "npm",
         }
     }
 
@@ -523,34 +531,63 @@ impl PackageManager {
                 "--frozen-lockfile",
                 "--prod=false",
                 "--ignore-scripts=false",
+                "--ignore-workspace",
+                "--ignore-pnpmfile",
+                "--lockfile=true",
+                "--lockfile-dir=.",
+                "--merge-git-branch-lockfiles=false",
+                "--fix-lockfile=false",
+                "--modules-dir=node_modules",
+                "--virtual-store-dir=node_modules/.pnpm",
+                "--store-dir=.tmp/release-pnpm-store",
+                "--package-import-method=copy",
+                "--verify-store-integrity=true",
+                "--side-effects-cache=false",
             ]
             .into_iter()
             .map(Into::into)
             .collect(),
-            Self::Npm => vec![
+            Self::Npm(_) => vec![
                 "ci".into(),
                 "--include=dev".into(),
                 "--ignore-scripts=false".into(),
+                "--workspaces=false".into(),
+                "--package-lock=true".into(),
             ],
         }
     }
 
     fn run_args(self, script: &str) -> Vec<OsString> {
-        vec!["run".into(), script.into()]
+        match self {
+            // `--ignore-pnpmfile` is install-only in pnpm 10. The equivalent
+            // forced environment setting remains active for run commands.
+            Self::Pnpm => vec!["--ignore-workspace".into(), "run".into(), script.into()],
+            Self::Npm(_) => vec!["--workspaces=false".into(), "run".into(), script.into()],
+        }
+    }
+
+    fn lockfile(self) -> &'static str {
+        match self {
+            Self::Pnpm => "pnpm-lock.yaml",
+            Self::Npm(NpmLockfile::PackageLock) => "package-lock.json",
+            Self::Npm(NpmLockfile::Shrinkwrap) => "npm-shrinkwrap.json",
+        }
     }
 }
 
 fn package_manager(web_dir: &Path) -> Result<PackageManager> {
     let pnpm = web_dir.join("pnpm-lock.yaml").is_file();
-    let npm = web_dir.join("package-lock.json").is_file();
-    match (pnpm, npm) {
-        (true, false) => Ok(PackageManager::Pnpm),
-        (false, true) => Ok(PackageManager::Npm),
-        (false, false) => Err(anyhow!(
-            "release candidate: web module needs pnpm-lock.yaml or package-lock.json for a frozen one-shot build"
+    let package_lock = web_dir.join("package-lock.json").is_file();
+    let shrinkwrap = web_dir.join("npm-shrinkwrap.json").is_file();
+    match (pnpm, package_lock, shrinkwrap) {
+        (true, false, false) => Ok(PackageManager::Pnpm),
+        (false, true, false) => Ok(PackageManager::Npm(NpmLockfile::PackageLock)),
+        (false, false, true) => Ok(PackageManager::Npm(NpmLockfile::Shrinkwrap)),
+        (false, false, false) => Err(anyhow!(
+            "release candidate: web module needs pnpm-lock.yaml, package-lock.json, or npm-shrinkwrap.json for a frozen one-shot build"
         )),
-        (true, true) => Err(anyhow!(
-            "release candidate: web module has both pnpm-lock.yaml and package-lock.json; keep exactly one lockfile"
+        _ => Err(anyhow!(
+            "release candidate: web module has conflicting package-manager lockfiles; keep exactly one of pnpm-lock.yaml, package-lock.json, or npm-shrinkwrap.json"
         )),
     }
 }
@@ -674,10 +711,78 @@ fn go_spec(program: &str, cwd: PathBuf, go: &GoEnvironment) -> ProcessSpec {
     .fold(spec, ProcessSpec::env_remove)
 }
 
-fn web_spec(program: &str, cwd: &Path) -> ProcessSpec {
-    let spec = ProcessSpec::new(program, cwd).env("CI", "true");
+fn web_spec(program: &str, cwd: &Path, manager: PackageManager) -> ProcessSpec {
+    let isolated_config_home = cwd.join(".tmp/release-package-config");
+    let isolated_user_config = isolated_config_home.join("npm-user.rc");
+    let isolated_global_config = isolated_config_home.join("npm-global.rc");
+    let disabled_pnpmfile = isolated_config_home.join("disabled-pnpmfile.cjs");
+    let spec = ProcessSpec::new(program, cwd)
+        .env("CI", "true")
+        // Do not consult a publisher's mutable user/global npm or pnpm
+        // configuration. Project .npmrc files inside the snapshot are
+        // separately checked for provenance-affecting selectors.
+        .env("npm_config_userconfig", isolated_user_config.as_os_str())
+        .env("NPM_CONFIG_USERCONFIG", isolated_user_config.as_os_str())
+        .env(
+            "npm_config_globalconfig",
+            isolated_global_config.as_os_str(),
+        )
+        .env(
+            "NPM_CONFIG_GLOBALCONFIG",
+            isolated_global_config.as_os_str(),
+        )
+        // Pnpm reads its own global rc independently of npm's user/global
+        // config selectors. XDG_CONFIG_HOME is its highest-priority config
+        // root on every supported platform, including Windows.
+        .env("XDG_CONFIG_HOME", isolated_config_home.as_os_str())
+        // Keep both the top-level command and ordinary nested package-manager
+        // calls in lifecycle scripts out of any ambient/ancestor workspace.
+        .env("npm_config_workspaces", "false")
+        .env("NPM_CONFIG_WORKSPACES", "false")
+        .env("npm_config_package_lock", "true")
+        .env("NPM_CONFIG_PACKAGE_LOCK", "true");
+    let spec = match manager {
+        PackageManager::Pnpm => spec
+            .env("npm_config_pnpmfile", disabled_pnpmfile.as_os_str())
+            .env("NPM_CONFIG_PNPMFILE", disabled_pnpmfile.as_os_str())
+            .env("npm_config_global_pnpmfile", disabled_pnpmfile.as_os_str())
+            .env("NPM_CONFIG_GLOBAL_PNPMFILE", disabled_pnpmfile.as_os_str())
+            .env("npm_config_ignore_workspace", "true")
+            .env("NPM_CONFIG_IGNORE_WORKSPACE", "true")
+            .env("npm_config_ignore_pnpmfile", "true")
+            .env("NPM_CONFIG_IGNORE_PNPMFILE", "true")
+            .env("npm_config_lockfile", "true")
+            .env("NPM_CONFIG_LOCKFILE", "true")
+            .env("npm_config_lockfile_dir", ".")
+            .env("NPM_CONFIG_LOCKFILE_DIR", ".")
+            .env("npm_config_git_branch_lockfile", "false")
+            .env("NPM_CONFIG_GIT_BRANCH_LOCKFILE", "false")
+            .env("npm_config_merge_git_branch_lockfiles", "false")
+            .env("NPM_CONFIG_MERGE_GIT_BRANCH_LOCKFILES", "false")
+            .env("npm_config_modules_dir", "node_modules")
+            .env("NPM_CONFIG_MODULES_DIR", "node_modules")
+            .env("npm_config_virtual_store_dir", "node_modules/.pnpm")
+            .env("NPM_CONFIG_VIRTUAL_STORE_DIR", "node_modules/.pnpm")
+            .env("npm_config_store_dir", ".tmp/release-pnpm-store")
+            .env("NPM_CONFIG_STORE_DIR", ".tmp/release-pnpm-store")
+            .env("npm_config_package_import_method", "copy")
+            .env("NPM_CONFIG_PACKAGE_IMPORT_METHOD", "copy")
+            .env("npm_config_verify_store_integrity", "true")
+            .env("NPM_CONFIG_VERIFY_STORE_INTEGRITY", "true")
+            .env("npm_config_side_effects_cache", "false")
+            .env("NPM_CONFIG_SIDE_EFFECTS_CACHE", "false"),
+        PackageManager::Npm(_) => spec,
+    };
     [
         "NODE_OPTIONS",
+        "npm_config_node_options",
+        "NPM_CONFIG_NODE_OPTIONS",
+        "pnpm_config_node_options",
+        "PNPM_CONFIG_NODE_OPTIONS",
+        "npm_config_script_shell",
+        "NPM_CONFIG_SCRIPT_SHELL",
+        "pnpm_config_script_shell",
+        "PNPM_CONFIG_SCRIPT_SHELL",
         "NODE_PATH",
         "ESBUILD_BINARY_PATH",
         "INIT_CWD",
@@ -995,7 +1100,7 @@ mod tests {
                 return success(Vec::new());
             }
             if matches!(program.as_str(), "pnpm" | "npm") {
-                if args.first().is_some_and(|arg| arg == "run") {
+                if args.iter().any(|arg| arg == "run") {
                     let dist = spec.cwd.join("dist/index.js");
                     fs::create_dir_all(dist.parent().unwrap()).unwrap();
                     fs::write(dist, WEB_BYTES).unwrap();
@@ -1366,7 +1471,7 @@ mod tests {
         }));
         assert!(seen.iter().any(|spec| {
             spec.program == "pnpm"
-                && spec.args == ["run", "build"]
+                && spec.args == ["--ignore-workspace", "run", "build"]
                 && spec.env.get("NODE_ENV").map(String::as_str) == Some("production")
                 && spec
                     .removed
@@ -1380,6 +1485,18 @@ mod tests {
                         "--frozen-lockfile",
                         "--prod=false",
                         "--ignore-scripts=false",
+                        "--ignore-workspace",
+                        "--ignore-pnpmfile",
+                        "--lockfile=true",
+                        "--lockfile-dir=.",
+                        "--merge-git-branch-lockfiles=false",
+                        "--fix-lockfile=false",
+                        "--modules-dir=node_modules",
+                        "--virtual-store-dir=node_modules/.pnpm",
+                        "--store-dir=.tmp/release-pnpm-store",
+                        "--package-import-method=copy",
+                        "--verify-store-integrity=true",
+                        "--side-effects-cache=false",
                     ]
                 && spec.env.get("NODE_ENV").map(String::as_str) == Some("development")
         }));
@@ -1415,6 +1532,19 @@ mod tests {
             ("npm_config_omit", "dev"),
             ("NPM_CONFIG_PRODUCTION", "true"),
             ("npm_config_ignore_scripts", "true"),
+            (
+                "npm_config_node_options",
+                "--require=/mirrorstack-missing/inject.cjs",
+            ),
+            (
+                "NPM_CONFIG_NODE_OPTIONS",
+                "--require=/mirrorstack-missing/upper.cjs",
+            ),
+            ("npm_config_script_shell", "/mirrorstack-missing/shell"),
+            (
+                "NPM_CONFIG_SCRIPT_SHELL",
+                "/mirrorstack-missing/upper-shell",
+            ),
         ]);
         let (root, module) = npm_dev_dependency_fixture();
         let _session = session(root.path(), &module, false);
@@ -1562,14 +1692,48 @@ mod tests {
             );
         }
 
-        let web = web_spec("pnpm", Path::new(".")).env("NODE_ENV", "production");
+        let web =
+            web_spec("pnpm", Path::new("."), PackageManager::Pnpm).env("NODE_ENV", "production");
         assert_eq!(
             web.env.get(std::ffi::OsStr::new("NODE_ENV")).unwrap(),
             "production"
         );
+        for (name, relative) in [
+            ("npm_config_userconfig", "npm-user.rc"),
+            ("NPM_CONFIG_USERCONFIG", "npm-user.rc"),
+            ("npm_config_globalconfig", "npm-global.rc"),
+            ("NPM_CONFIG_GLOBALCONFIG", "npm-global.rc"),
+            ("npm_config_global_pnpmfile", "disabled-pnpmfile.cjs"),
+            ("NPM_CONFIG_GLOBAL_PNPMFILE", "disabled-pnpmfile.cjs"),
+        ] {
+            assert_eq!(
+                web.env.get(std::ffi::OsStr::new(name)).unwrap(),
+                Path::new(".")
+                    .join(".tmp/release-package-config")
+                    .join(relative)
+                    .as_os_str(),
+                "{name}"
+            );
+            assert!(
+                !web.env_remove.contains(std::ffi::OsStr::new(name)),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            web.env
+                .get(std::ffi::OsStr::new("XDG_CONFIG_HOME"))
+                .unwrap(),
+            Path::new(".")
+                .join(".tmp/release-package-config")
+                .as_os_str()
+        );
         for name in [
             "NODE_PATH",
             "ESBUILD_BINARY_PATH",
+            "npm_config_node_options",
+            "NPM_CONFIG_NODE_OPTIONS",
+            "npm_config_script_shell",
+            "NPM_CONFIG_SCRIPT_SHELL",
             "npm_config_omit",
             "npm_config_ignore_scripts",
             "PNPM_CONFIG_IGNORE_SCRIPTS",

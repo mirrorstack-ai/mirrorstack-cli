@@ -243,6 +243,50 @@ impl BuildView {
         self.root.join(&self.module_relative)
     }
 
+    /// Read a file only when its path is one of the exact canonical inputs
+    /// copied into this phase view. Package-manager metadata uses this rather
+    /// than ordinary path reads so a local dependency cannot name generated,
+    /// ignored, or external bytes that are absent from `source_sha256`.
+    pub(crate) fn read_snapshotted_file(
+        &self,
+        path: &Path,
+        limit: u64,
+        label: &str,
+    ) -> Result<Vec<u8>> {
+        let relative = path.strip_prefix(&self.root).map_err(|_| {
+            anyhow!(
+                "release candidate: {label} escaped the frozen source view: {}",
+                path.display()
+            )
+        })?;
+        let normalized = normalized_relative(relative)?;
+        let key = stage_alias_key(&normalized);
+        if !self
+            .entries
+            .iter()
+            .any(|entry| stage_alias_key(&entry.normalized) == key)
+        {
+            return Err(anyhow!(
+                "release candidate: {label} is not a snapshotted source input: {normalized}"
+            ));
+        }
+        read_regular_bounded(&self.root, relative, limit, label)
+    }
+
+    pub(crate) fn is_snapshotted_file(&self, path: &Path) -> Result<bool> {
+        let relative = path.strip_prefix(&self.root).map_err(|_| {
+            anyhow!(
+                "release candidate: path escaped the frozen source view: {}",
+                path.display()
+            )
+        })?;
+        let key = stage_alias_key(&normalized_relative(relative)?);
+        Ok(self
+            .entries
+            .iter()
+            .any(|entry| stage_alias_key(&entry.normalized) == key))
+    }
+
     /// Prove that a phase neither changed canonical source nor added a new
     /// build input. Known output/cache directories are ignored deliberately.
     pub(crate) fn verify_inputs(&self) -> Result<()> {
