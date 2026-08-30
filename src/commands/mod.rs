@@ -13,18 +13,18 @@ mod module;
 pub(crate) mod release_candidate;
 mod whoami;
 
-/// Default api-platform account-service base. Prod path-routes each service
-/// under an API-Gateway mapping key (`/account`, `/apps`, `/dispatch`) — a
-/// bare-host request 403s at the edge. Override per-invocation with
+/// Default api-platform account-service base. Account remains under its
+/// `/account` mapping while Applications is exposed on root `/v1/*` routes and
+/// Dispatch remains under `/dispatch`. Override per-invocation with
 /// `MIRRORSTACK_API_URL` (or via `.env`).
 pub(crate) const DEFAULT_API_BASE: &str = "https://api.mirrorstack.ai/account";
 
 /// Default api-platform applications-service host. Modules and apps live
 /// on a separate Lambda from the account service, but in prod both are
-/// exposed under the same `api.mirrorstack.ai` hostname (path-routed at
-/// the ingress). Local dev uses port 8082 — set via `.env`. Override
-/// with `MIRRORSTACK_APPS_API_URL`.
-pub(crate) const DEFAULT_APPS_API_BASE: &str = "https://api.mirrorstack.ai/apps";
+/// exposed under the same `api.mirrorstack.ai` hostname through bare `/v1/*`
+/// ingress routes. Local dev uses port 8082 — set via `.env`. Override with
+/// `MIRRORSTACK_APPS_API_URL`.
+pub(crate) const DEFAULT_APPS_API_BASE: &str = "https://api.mirrorstack.ai";
 
 /// Default web-account host. Override with `MIRRORSTACK_WEB_URL`.
 pub(crate) const DEFAULT_WEB_BASE: &str = "https://account.mirrorstack.ai";

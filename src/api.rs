@@ -1642,6 +1642,14 @@ pub struct DevClientPresign {
     pub expires_at: String,
 }
 
+fn dev_client_presign_endpoint(apps_base: &str, module_id: &str) -> String {
+    format!(
+        "{}/v1/modules/{}/dev-client/presign",
+        apps_base.trim_end_matches('/'),
+        module_id
+    )
+}
+
 pub fn presign_dev_client(
     http: &Client,
     apps_base: &str,
@@ -1649,11 +1657,7 @@ pub fn presign_dev_client(
     module_id: &str,
     input: &DevClientPresignInput<'_>,
 ) -> Result<DevClientPresign, ApiError> {
-    let endpoint = format!(
-        "{}/v1/modules/{}/dev-client/presign",
-        apps_base.trim_end_matches('/'),
-        module_id
-    );
+    let endpoint = dev_client_presign_endpoint(apps_base, module_id);
     let resp = http
         .post(&endpoint)
         .bearer_auth(access_token)
@@ -3598,6 +3602,18 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, ApiError::Http(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn default_apps_base_builds_bare_dev_client_presign_route() {
+        let endpoint =
+            dev_client_presign_endpoint(crate::commands::DEFAULT_APPS_API_BASE, "mod-uuid");
+
+        assert_eq!(
+            endpoint,
+            "https://api.mirrorstack.ai/v1/modules/mod-uuid/dev-client/presign"
+        );
+        assert!(!endpoint.contains("/apps/v1/"));
     }
 
     #[test]
