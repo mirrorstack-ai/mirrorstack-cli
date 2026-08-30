@@ -99,9 +99,9 @@ impl<'a> Validator<'a> {
                 manifest.display()
             )
         })?;
-        let mut key = relative.to_string_lossy().replace('\\', "/");
+        let key = relative.to_string_lossy().replace('\\', "/");
         #[cfg(any(windows, target_os = "macos"))]
-        key.make_ascii_lowercase();
+        let key = key.to_ascii_lowercase();
         if self.seen_manifests.insert(key) {
             self.pending_manifests.push((manifest, origin));
         }
