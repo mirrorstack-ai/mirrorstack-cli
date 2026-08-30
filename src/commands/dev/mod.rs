@@ -1485,6 +1485,13 @@ pub(crate) fn web_pipeline(web_dir: &Path, watch: bool) -> Option<WebPipeline> {
         .then_some(WebPipeline::LegacyEsbuild)
 }
 
+/// Whether a module declares a one-shot web build through the exact discovery
+/// rule used by dev's inner builder and outer `--share` publisher. Release
+/// planning only needs the classification, so the pipeline enum stays private.
+pub(crate) fn has_web_build_pipeline(web_dir: &Path) -> bool {
+    web_pipeline(web_dir, false).is_some()
+}
+
 /// `npm install --silent` then the discovered module-owned script or legacy
 /// esbuild config. Watch mode selects the declared `watch` script (or adds
 /// `--watch` to the legacy config); one-shot mode selects `build`. Output is
