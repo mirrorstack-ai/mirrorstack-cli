@@ -471,6 +471,7 @@ mod tests {
         assert!(!invalid.contains("bootstrap"), "{invalid}");
         assert!(deploy_error_hint("artifact_storage_unconfigured").contains("platform"));
         assert!(deploy_error_hint("artifact_already_ready").contains("reread"));
+        assert!(deploy_error_hint("artifact_not_ready").contains("reread"));
         assert!(deploy_error_hint("conflict").contains("finalized"));
         assert!(deploy_error_hint("artifact_superseded").contains("another deploy"));
         assert!(deploy_error_hint("artifact_code_mismatch").contains("Lambda"));
@@ -491,6 +492,7 @@ mod tests {
             "artifact_invalid",              // 422 — finalize, empty/oversize/non-ZIP
             "artifact_superseded",           // 409 — finalize lost the compare-and-set
             "artifact_already_ready",        // 409 — create raced a ready artifact
+            "artifact_not_ready",            // 409 — deploy raced artifact readiness
             "artifact_storage_unconfigured", // 503 — both artifact legs, no store wired
             "artifact_code_mismatch",        // 409 — provisioned Lambda bytes differ
             "invoke_target_invalid",         // 422 — deploy

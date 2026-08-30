@@ -8,12 +8,64 @@ use super::*;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
+use super::release_plan::{
+    self, Action, LocalRelease, RemoteArtifact, RemoteDeploy, RemoteRelease, RemoteVersion,
+};
 use crate::commands::release_candidate::{
     self, CandidateRequest, ReleaseCandidate, ReleaseCandidateReceipt,
 };
 
 const MAX_VERSION_CREATE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_RELEASE_TRANSITIONS: usize = 16;
+const AMBIGUOUS_DEPLOY_SETTLE_POLLS: usize = 5;
+const VERSION_TITLE: &str = "";
+const VERSION_CHANNEL: &str = "stable";
+
+struct ReleaseMetadata {
+    changelog: BTreeMap<String, String>,
+    readme: BTreeMap<String, String>,
+    migration_app: i64,
+    migration_module: i64,
+    changelog_warnings: Vec<String>,
+    readme_truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationOutcome {
+    /// The endpoint returned success. The next owner-state read must prove the
+    /// complete postcondition before another write is allowed.
+    Applied,
+    /// A server-confirmed atomic race, or an ambiguous non-deploy action that
+    /// is safe to retry only after an authoritative reread and fresh plan.
+    Replan,
+    /// Version create returned the exact atomic `409 version_exists`. The
+    /// next owner-state read must prove a present immutable row; absence is a
+    /// contradiction and must not trigger another create POST.
+    VersionExists,
+    /// A deploy may still commit after its response was lost. Only bounded
+    /// reads may follow; this process must never issue a second deploy POST.
+    AmbiguousDeploy,
+    /// Artifact create explicitly proved that storage is not configured.
+    /// This authorizes one server-gated local-simulation attempt in this run.
+    StorageUnconfigured,
+}
+
+trait ReleaseOperations {
+    fn read_state(&mut self) -> Result<RemoteRelease>;
+    fn record_version(&mut self) -> Result<MutationOutcome>;
+    fn capture_web_bundle(&mut self) -> Result<MutationOutcome>;
+    fn upload_artifact(&mut self) -> Result<MutationOutcome>;
+    fn deploy(&mut self, mode: api::ModuleDeployMode) -> Result<MutationOutcome>;
+    fn wait_before_deploy_settlement_read(&mut self, _poll: usize) {}
+}
+
+#[derive(Debug)]
+struct DriveResult {
+    release: RemoteVersion,
+    attempts: Vec<Action>,
+}
 
 pub(super) fn run(args: DeployArgs) -> Result<()> {
     let dir = args
@@ -90,6 +142,7 @@ pub(super) fn run(args: DeployArgs) -> Result<()> {
         })
     })?;
     let zip_path = candidate.artifact_path();
+    let metadata = collect_release_metadata(&candidate, &version)?;
 
     eprintln!(
         "  {} {} → {} (arm64 bundle)",
@@ -98,115 +151,82 @@ pub(super) fn run(args: DeployArgs) -> Result<()> {
         style(format!("{slug}@{version}")).cyan().bold(),
     );
 
-    let recorded_state = ensure_version_recorded(
-        &client,
-        &apps_base,
-        &creds.access_token,
-        &module,
-        &slug,
-        &version,
-        &candidate,
-    )?;
-
-    // The candidate owns the temporary archive until this function returns,
-    // so the exact bytes attested on version-create remain available for the
-    // upload. Only an explicit create-upload storage-unconfigured response may
-    // select the server-gated local simulator; missing legacy routes and every
-    // later artifact failure remain fatal.
+    // The candidate owns the temporary archive until this function returns.
+    // Recheck it before the first owner-state read so even the no-op path is
+    // based on the exact attested bytes, then let the pure planner select one
+    // mutation at a time from authoritative state.
     candidate.verify_artifact()?;
-    let shipped = artifact::ship_artifact(
-        &client,
-        &apps_base,
-        &creds.access_token,
-        &module.id,
-        &version,
+    let local = LocalRelease {
+        source_sha256: candidate.receipt().source_sha256.clone(),
+        manifest_sha256: candidate.receipt().manifest.sha256.clone(),
+        artifact_sha256: candidate.receipt().artifact.sha256.clone(),
+        artifact_size_bytes: candidate.receipt().artifact.size_bytes,
+        web_required: candidate.receipt().web.is_some(),
+        web_verified: false,
+        local_simulation_authorized: false,
+        desired_deploy_status: args.status.as_deref().unwrap_or("active").to_string(),
+    };
+    let mut remote = ApiReleaseOperations {
+        client: &client,
+        apps_base: &apps_base,
+        access_token: &creds.access_token,
+        module: &module,
+        slug: &slug,
+        version: &version,
+        candidate: &candidate,
+        metadata: &metadata,
         zip_path,
-        candidate.receipt(),
-        &recorded_state.version.id,
-    )?;
-    let deploy_mode = match shipped {
-        artifact::ShipOutcome::Shipped => {
-            eprintln!(
-                "{} uploaded {}",
-                ok_mark(),
-                style(format!("{slug}@{version}")).cyan().bold(),
-            );
-            api::ModuleDeployMode::Artifact
-        }
-        artifact::ShipOutcome::StorageUnconfigured => {
-            eprintln!(
-                "{} artifact storage is explicitly unconfigured for {}; requesting the server-gated local simulator only.",
-                warn_prefix(),
-                style(format!("{slug}@{version}")).cyan().bold(),
-            );
-            api::ModuleDeployMode::LocalSimulation
-        }
+        desired_deploy_status: local.desired_deploy_status.clone(),
+        last_version_id: None,
+        observed_web_url: None,
+        expected_capture_url: None,
+        last_deploy: None,
     };
+    let completed = drive_release(&mut remote, local)?;
+    let deploy = completed
+        .release
+        .deploy
+        .as_ref()
+        .expect("planner Done always includes a proven deploy");
 
-    let result = with_spinner("Deploying…", || {
-        api::set_module_deploy(
-            &client,
-            &apps_base,
-            &creds.access_token,
-            &module.id,
-            &version,
-            &SetModuleDeployInput {
-                mode: deploy_mode,
-                status: args.status.as_deref(),
-            },
-        )
-    });
-
-    let deploy = match result {
-        Ok(d) => d,
-        Err(ApiError::Server { code, message, .. }) => {
-            return Err(anyhow!(
-                "{code}: {message}{hint}",
-                hint = deploy_error_hint(&code)
-            ));
-        }
-        Err(ApiError::Unauthenticated) => return Err(session_expired()),
-        Err(e) => return Err(e.into()),
-    };
-
-    verify_deploy_response(
-        &deploy,
-        &recorded_state.version.id,
-        &module.id,
-        &slug,
-        &version,
-        candidate.receipt(),
-        deploy_mode,
-        args.status.as_deref().unwrap_or("active"),
-    )?;
-    let final_state = read_existing_release_state(
-        &client,
-        &apps_base,
-        &creds.access_token,
-        &module.id,
-        &version,
-    )?
-    .ok_or_else(|| {
-        anyhow!(
-            "deployed {slug}@{version}, but its owner release state disappeared on final reread"
-        )
-    })?;
-    verify_final_release_state(
-        &final_state,
-        &module.id,
-        &slug,
-        &version,
-        candidate.receipt(),
-        deploy_mode,
-        &deploy,
-    )?;
-
+    if completed.attempts.is_empty() {
+        eprintln!(
+            "{} {} already has the exact source, manifest, web, artifact, and deploy receipt — no POST was sent",
+            ok_mark(),
+            style(format!("{slug}@{version}")).cyan().bold()
+        );
+    } else {
+        let steps = completed
+            .attempts
+            .iter()
+            .map(|action| match action {
+                Action::RecordVersion => "record",
+                Action::CaptureWebBundle => "capture-web",
+                Action::UploadArtifact => "upload",
+                Action::Deploy => "deploy",
+                Action::Done => unreachable!("Done is never a mutation attempt"),
+            })
+            .collect::<Vec<_>>()
+            .join(" → ");
+        eprintln!(
+            "{} deployed {} ({steps})",
+            ok_mark(),
+            style(format!("{slug}@{version}")).cyan().bold()
+        );
+    }
     eprintln!(
-        "{} deployed {}",
-        ok_mark(),
-        style(format!("{slug}@{version}")).cyan().bold()
+        "  {} sha256:{}",
+        style("artifact:").dim(),
+        candidate.receipt().artifact.sha256
     );
-    eprintln!("  {} {}", style("target:").dim(), deploy.invoke_target);
+    if let Some(target) = remote
+        .last_deploy
+        .as_ref()
+        .map(|deploy| &deploy.invoke_target)
+    {
+        eprintln!("  {} {}", style("target:").dim(), target);
+    }
+    eprintln!("  {} {}", style("mode:").dim(), deploy.mode);
     eprintln!("  {} {}", style("status:").dim(), deploy.status);
     Ok(())
 }
@@ -223,154 +243,598 @@ fn promotion_target(raw: &str, non_interactive: bool) -> Result<Option<&str>> {
     Ok(Some(promoted))
 }
 
-/// Make sure `version` exists as a recorded module_versions row before the
-/// deploy row is written. Recording is just that — an immutable snapshot +
-/// changelog with no visibility semantics ("publish" is the future
-/// marketplace listing act, not a prerequisite to run).
-///
-/// The record attempt is 409-tolerant so no pre-flight existence check is
-/// needed and concurrent deploys can't race. A `version_exists` response is
-/// success only after an owner-state reread proves the immutable stored
-/// source, exact manifest bytes, web descriptor, and expected artifact tuple
-/// equal this local candidate. A legacy or merely same-artifact row fails
-/// closed before artifact/deploy mutation.
-#[allow(clippy::too_many_arguments)]
-fn ensure_version_recorded(
-    client: &reqwest::blocking::Client,
-    apps_base: &str,
-    access_token: &str,
-    module: &api::Module,
-    slug: &str,
-    version: &str,
+fn collect_release_metadata(
     candidate: &ReleaseCandidate,
-) -> Result<api::ModuleReleaseState> {
+    version: &str,
+) -> Result<ReleaseMetadata> {
     let dir = candidate.source_module_dir();
-    let entry = match changelog::lint(&dir, version) {
-        Ok(entry) => entry,
-        Err(lint_err) => {
-            if let Some(state) =
-                read_existing_release_state(client, apps_base, access_token, &module.id, version)?
-            {
-                let state = ensure_candidate_web_capture(
-                    client,
-                    apps_base,
-                    access_token,
-                    &module.id,
-                    slug,
-                    version,
-                    candidate.receipt(),
-                    Some(state),
-                )?;
-                print_already_recorded(slug, version);
-                return Ok(state);
-            }
-            return Err(lint_err);
-        }
-    };
-
-    // README files are the module's long-form description — optional and
-    // free-form (no lint). `README.md` is the `default`; `README.<tag>.md`
-    // adds a locale translation. They're frozen on the version row alongside
-    // the changelog, so they're read here on the fresh-record path only; an
-    // empty map (no README files) is omitted from the request.
+    let changelog = changelog::lint(&dir, version)?;
     let readme = readme::read(&dir)?;
-    candidate
-        .verify_live_source()
-        .context("release candidate: live source changed before immutable version recording")?;
-    let release_candidate = serde_json::to_value(candidate.receipt())
-        .context("release candidate: encode immutable version-create receipt")?;
-    let input = RecordModuleVersionInput {
-        version,
-        changelog: &entry.map,
-        readme: &readme.map,
-        // Candidate web evidence lives inside the immutable receipt; the
-        // request type cannot represent a duplicate legacy tuple.
-        declaration: api::ModuleVersionDeclaration::ReleaseCandidate {
-            release_candidate: &release_candidate,
-        },
+    let manifest = decode_manifest_evidence(
+        &candidate.receipt().manifest.sha256,
+        &candidate.receipt().manifest.base64,
+        "local manifest",
+    )?;
+    Ok(ReleaseMetadata {
+        changelog: normalize_locale_map(changelog.map),
+        readme: normalize_locale_map(readme.map),
+        migration_app: manifest_migration_counter(&manifest, "app")?,
+        migration_module: manifest_migration_counter(&manifest, "module")?,
+        changelog_warnings: changelog.warnings,
+        readme_truncated: readme.truncated,
+    })
+}
+
+fn normalize_locale_map(input: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    input
+        .into_iter()
+        .filter_map(|(locale, body)| {
+            let body = body.trim().to_string();
+            (!body.is_empty()).then_some((locale, body))
+        })
+        .collect()
+}
+
+fn manifest_migration_counter(manifest: &serde_json::Value, scope: &str) -> Result<i64> {
+    let Some(value) = manifest.get("migration").and_then(|value| value.get(scope)) else {
+        return Ok(0);
     };
-    guard_version_create_size(&input)?;
+    let Some(raw) = value.as_str() else {
+        return Err(anyhow!(
+            "manifest.migration.{scope} must be a non-negative integer string"
+        ));
+    };
+    if raw.is_empty() {
+        return Ok(0);
+    }
+    raw.parse::<i64>()
+        .ok()
+        .filter(|counter| *counter >= 0)
+        .ok_or_else(|| anyhow!("manifest.migration.{scope} must be a non-negative integer string"))
+}
 
-    let result = with_spinner("Recording version…", || {
-        api::record_module_version(client, apps_base, access_token, &module.id, &input)
-    });
+fn drive_release(
+    operations: &mut impl ReleaseOperations,
+    mut local: LocalRelease,
+) -> Result<DriveResult> {
+    let mut state = operations.read_state()?;
+    let mut attempts = Vec::new();
+    for _ in 0..MAX_RELEASE_TRANSITIONS {
+        let action = release_plan::plan(&local, &state)?;
+        if action == Action::Done {
+            let RemoteRelease::Present(release) = state else {
+                unreachable!("Done requires a present release")
+            };
+            return Ok(DriveResult {
+                release: *release,
+                attempts,
+            });
+        }
 
-    let (initial_state, created_id) = match result {
-        Ok(recorded) => {
-            verify_recorded_version_response(
-                &recorded,
-                &module.id,
-                slug,
-                version,
-                candidate.receipt(),
-            )?;
-            // Warnings describe the changelog/readme just frozen; on the
-            // already-recorded path they'd be noise about files the platform
-            // no longer reads.
-            for w in &entry.warnings {
-                eprintln!("{} {w}", warn_prefix());
+        attempts.push(action);
+        let outcome = match action {
+            Action::RecordVersion => operations.record_version()?,
+            Action::CaptureWebBundle => operations.capture_web_bundle()?,
+            Action::UploadArtifact => operations.upload_artifact()?,
+            Action::Deploy => {
+                let mode = deploy_mode_for(&state, local.local_simulation_authorized)?;
+                operations.deploy(mode)?
             }
-            if readme.truncated {
-                eprintln!(
-                    "{} a README file exceeded {} bytes and was truncated for the version record",
-                    warn_prefix(),
-                    readme::MAX_README_BYTES
-                );
-            }
-            eprintln!(
-                "{} recorded {}",
-                ok_mark(),
-                style(format!("{slug}@{version}")).cyan().bold()
-            );
-            eprintln!("  {} {}", style("id:").dim(), recorded.id);
-            // `default` (CHANGELOG.md) is always present after a clean lint.
-            for line in changelog_preview(&entry.map["default"], 3) {
-                eprintln!("  {} {line}", style("│").dim());
-            }
-            (None, Some(recorded.id))
+            Action::Done => unreachable!(),
+        };
+        if action == Action::CaptureWebBundle && outcome == MutationOutcome::Applied {
+            local.web_verified = true;
         }
-        Err(ApiError::Server { code, .. }) if code == "version_exists" => {
-            let state = verify_version_exists_candidate(
-                client,
-                apps_base,
-                access_token,
-                &module.id,
-                slug,
-                version,
-                candidate.receipt(),
-            )?;
-            print_already_recorded(slug, version);
-            (Some(state), None)
+        if outcome == MutationOutcome::StorageUnconfigured {
+            local.local_simulation_authorized = true;
         }
-        Err(ApiError::Server { code, message, .. }) => {
+
+        let mut reread = operations.read_state()?;
+        if action != Action::RecordVersion && matches!(reread, RemoteRelease::Absent) {
             return Err(anyhow!(
-                "{code}: {message}{hint}",
-                hint = record_error_hint(&code)
+                "owner release state disappeared after {action:?}; an immutable version cannot become absent, so refusing any follow-up write"
             ));
         }
-        Err(ApiError::Unauthenticated) => return Err(session_expired()),
-        Err(e) => return Err(e.into()),
-    };
+        if action == Action::Deploy && outcome == MutationOutcome::AmbiguousDeploy {
+            reread = settle_ambiguous_deploy(operations, &local, reread)?;
+        }
+        if matches!(
+            outcome,
+            MutationOutcome::Applied
+                | MutationOutcome::VersionExists
+                | MutationOutcome::StorageUnconfigured
+        ) {
+            let next = release_plan::plan(&local, &reread)?;
+            let postcondition_holds = match action {
+                Action::RecordVersion => next != Action::RecordVersion,
+                Action::CaptureWebBundle => {
+                    matches!(&reread, RemoteRelease::Present(_)) && next != Action::CaptureWebBundle
+                }
+                Action::UploadArtifact => matches!(next, Action::Deploy | Action::Done),
+                Action::Deploy => next == Action::Done,
+                Action::Done => unreachable!(),
+            };
+            if !postcondition_holds {
+                return Err(anyhow!(
+                    "platform accepted {action:?}, but the owner release-state reread did not prove its complete postcondition (next action remained {next:?}); refusing another write"
+                ));
+            }
+        }
+        state = reread;
+    }
+    Err(anyhow!(
+        "release state did not converge after {MAX_RELEASE_TRANSITIONS} authoritative rereads; refusing further writes"
+    ))
+}
 
-    let state = ensure_candidate_web_capture(
-        client,
-        apps_base,
-        access_token,
-        &module.id,
-        slug,
-        version,
-        candidate.receipt(),
-        initial_state,
-    )?;
-    if created_id
+fn deploy_mode_for(
+    state: &RemoteRelease,
+    local_simulation_authorized: bool,
+) -> Result<api::ModuleDeployMode> {
+    let RemoteRelease::Present(version) = state else {
+        return Err(anyhow!("cannot deploy an absent version"));
+    };
+    if version
+        .artifact
+        .as_ref()
+        .is_some_and(|artifact| artifact.status == "ready")
+    {
+        return Ok(api::ModuleDeployMode::Artifact);
+    }
+    if local_simulation_authorized {
+        return Ok(api::ModuleDeployMode::LocalSimulation);
+    }
+    Err(anyhow!(
+        "planner selected deploy without a ready artifact or a current storage-unconfigured authorization"
+    ))
+}
+
+/// A deploy POST can continue provisioning after the client loses its
+/// response. An old snapshot therefore never authorizes another POST: only
+/// bounded owner-state reads may prove completion in this process.
+fn settle_ambiguous_deploy(
+    operations: &mut impl ReleaseOperations,
+    local: &LocalRelease,
+    mut state: RemoteRelease,
+) -> Result<RemoteRelease> {
+    for poll in 0..=AMBIGUOUS_DEPLOY_SETTLE_POLLS {
+        let next = release_plan::plan(local, &state)?;
+        if next == Action::Done {
+            return Ok(state);
+        }
+        if next != Action::Deploy {
+            return Err(anyhow!(
+                "deploy response was ambiguous and owner state changed to {next:?}; refusing any follow-up write because the original provisioning request may still commit"
+            ));
+        }
+        if poll == AMBIGUOUS_DEPLOY_SETTLE_POLLS {
+            break;
+        }
+        operations.wait_before_deploy_settlement_read(poll);
+        state = operations.read_state()?;
+    }
+    Err(anyhow!(
+        "deploy response was ambiguous and {reads} bounded owner-state reads did not prove completion; refusing a second deploy POST in this command. Wait for platform state to settle, then retry",
+        reads = AMBIGUOUS_DEPLOY_SETTLE_POLLS + 1
+    ))
+}
+
+struct ApiReleaseOperations<'a> {
+    client: &'a reqwest::blocking::Client,
+    apps_base: &'a str,
+    access_token: &'a str,
+    module: &'a api::Module,
+    slug: &'a str,
+    version: &'a str,
+    candidate: &'a ReleaseCandidate,
+    metadata: &'a ReleaseMetadata,
+    zip_path: &'a Path,
+    desired_deploy_status: String,
+    last_version_id: Option<String>,
+    observed_web_url: Option<String>,
+    expected_capture_url: Option<String>,
+    last_deploy: Option<api::ModuleDeploy>,
+}
+
+impl ApiReleaseOperations<'_> {
+    fn convert_state(&self, state: &api::ModuleReleaseState) -> RemoteRelease {
+        let receipt = &state.release_receipt;
+        let version = &state.version;
+        RemoteRelease::Present(Box::new(RemoteVersion {
+            immutable_mismatches: immutable_metadata_mismatches(version, self.metadata),
+            yanked: version.yanked_at.is_some(),
+            coherent: receipt.coherent,
+            ready: receipt.ready,
+            web_bundle_url: receipt
+                .web
+                .as_ref()
+                .map_or_else(String::new, |web| web.url.clone()),
+            artifact: receipt.artifact.as_ref().map(|artifact| RemoteArtifact {
+                status: artifact.status.clone(),
+                size_bytes: artifact.size_bytes,
+                sha256: artifact.sha256.clone(),
+                created: present_timestamp(&artifact.created_at),
+                updated: present_timestamp(&artifact.updated_at),
+                finalized: present_timestamp(&artifact.finalized_at),
+            }),
+            deploy: receipt.deploy.as_ref().map(|deploy| RemoteDeploy {
+                mode: deploy.mode.clone(),
+                status: deploy.status.clone(),
+                source_sha256: deploy.source_sha256.clone(),
+                manifest_sha256: deploy.manifest_sha256.clone(),
+                artifact_sha256: deploy.artifact_sha256.clone(),
+                lambda_version: deploy.lambda_version.clone(),
+                lambda_code_sha256: deploy.lambda_code_sha256.clone(),
+                created: present_timestamp(&deploy.created_at),
+                updated: present_timestamp(&deploy.updated_at),
+            }),
+        }))
+    }
+}
+
+fn mutation_error(
+    error: ApiError,
+    race_codes: &[&str],
+    hint: fn(&str) -> &'static str,
+    deploy: bool,
+) -> Result<MutationOutcome> {
+    match error {
+        ApiError::Server {
+            status: 409,
+            ref code,
+            ..
+        } if race_codes.contains(&code.as_str()) => Ok(MutationOutcome::Replan),
+        ApiError::Server { code, message, .. } if code == "artifact_storage_unconfigured" => {
+            Err(anyhow!("{code}: {message}{suffix}", suffix = hint(&code)))
+        }
+        ApiError::Http(_)
+        | ApiError::Decode(_)
+        | ApiError::Unexpected { status: 500.., .. }
+        | ApiError::Server { status: 500.., .. } => {
+            if deploy {
+                Ok(MutationOutcome::AmbiguousDeploy)
+            } else {
+                Ok(MutationOutcome::Replan)
+            }
+        }
+        ApiError::Unauthenticated => Err(session_expired()),
+        ApiError::Server { code, message, .. } => {
+            Err(anyhow!("{code}: {message}{suffix}", suffix = hint(&code)))
+        }
+        other => Err(other.into()),
+    }
+}
+
+fn immutable_metadata_mismatches(
+    version: &api::ModuleReleaseStateVersion,
+    metadata: &ReleaseMetadata,
+) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    if version.title != VERSION_TITLE {
+        mismatches.push("title".into());
+    }
+    if version.description.is_some() {
+        mismatches.push("description".into());
+    }
+    if version.channel != VERSION_CHANNEL {
+        mismatches.push("channel".into());
+    }
+    if version.changelog != metadata.changelog {
+        mismatches.push("changelog".into());
+    }
+    if version.readme != metadata.readme {
+        mismatches.push("readme".into());
+    }
+    if version.migration_app != metadata.migration_app {
+        mismatches.push("migration.app".into());
+    }
+    if version.migration_module != metadata.migration_module {
+        mismatches.push("migration.module".into());
+    }
+    mismatches
+}
+
+fn present_timestamp(value: &Option<String>) -> bool {
+    value
         .as_deref()
-        .is_some_and(|id| id != state.version.id)
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+impl ReleaseOperations for ApiReleaseOperations<'_> {
+    fn read_state(&mut self) -> Result<RemoteRelease> {
+        let result = with_spinner("Reading owner release state…", || {
+            api::get_module_release_state(
+                self.client,
+                self.apps_base,
+                self.access_token,
+                &self.module.id,
+                self.version,
+            )
+        });
+        let state = match result {
+            Ok(state) => state,
+            Err(ApiError::Server {
+                status: 404, code, ..
+            }) if code == "not_found" => {
+                self.last_version_id = None;
+                self.observed_web_url = None;
+                return Ok(RemoteRelease::Absent);
+            }
+            Err(ApiError::Unexpected { status: 404, .. }) => {
+                return Err(anyhow!(
+                    "the platform does not expose the structured owner release-state contract required for safe retries; refusing the legacy blind-deploy path"
+                ));
+            }
+            Err(ApiError::Unauthenticated) => return Err(session_expired()),
+            Err(error) => return Err(error.into()),
+        };
+        verify_existing_release_candidate(
+            &state,
+            &self.module.id,
+            self.slug,
+            self.version,
+            self.candidate.receipt(),
+        )?;
+        let actual_web_url = state
+            .release_receipt
+            .web
+            .as_ref()
+            .map_or_else(String::new, |web| web.url.clone());
+        if self
+            .observed_web_url
+            .as_deref()
+            .is_some_and(|previous| !previous.trim().is_empty() && previous != actual_web_url)
+        {
+            return Err(anyhow!(
+                "owner release state moved the immutable pinned web URL for {}@{}; refusing any artifact or deploy write",
+                self.slug,
+                self.version
+            ));
+        }
+        if let Some(expected_url) = self.expected_capture_url.as_deref()
+            && (actual_web_url != expected_url || actual_web_url.is_empty())
+        {
+            return Err(anyhow!(
+                "web capture for {}@{} returned success, but the owner-state reread did not preserve the same pinned URL",
+                self.slug,
+                self.version
+            ));
+        }
+        if let Some(response) = self.last_deploy.as_ref() {
+            let mode = match response.mode.as_str() {
+                "artifact" => api::ModuleDeployMode::Artifact,
+                "local_simulation" => api::ModuleDeployMode::LocalSimulation,
+                _ => {
+                    return Err(anyhow!(
+                        "deploy response returned unknown mode {:?}",
+                        response.mode
+                    ));
+                }
+            };
+            verify_final_release_state(
+                &state,
+                &self.module.id,
+                self.slug,
+                self.version,
+                self.candidate.receipt(),
+                mode,
+                response,
+            )?;
+        }
+        self.last_version_id = Some(state.version.id.clone());
+        self.observed_web_url = Some(actual_web_url);
+        Ok(self.convert_state(&state))
+    }
+
+    fn record_version(&mut self) -> Result<MutationOutcome> {
+        self.candidate
+            .verify_live_source()
+            .context("release candidate: live source changed before immutable version recording")?;
+        let release_candidate = serde_json::to_value(self.candidate.receipt())
+            .context("release candidate: encode immutable version-create receipt")?;
+        let input = RecordModuleVersionInput {
+            version: self.version,
+            changelog: &self.metadata.changelog,
+            readme: &self.metadata.readme,
+            declaration: api::ModuleVersionDeclaration::ReleaseCandidate {
+                release_candidate: &release_candidate,
+            },
+        };
+        guard_version_create_size(&input)?;
+        let result = with_spinner("Recording version…", || {
+            api::record_module_version(
+                self.client,
+                self.apps_base,
+                self.access_token,
+                &self.module.id,
+                &input,
+            )
+        });
+        match result {
+            Ok(recorded) => {
+                verify_recorded_version_response(
+                    &recorded,
+                    &self.module.id,
+                    self.slug,
+                    self.version,
+                    self.candidate.receipt(),
+                )?;
+                for warning in &self.metadata.changelog_warnings {
+                    eprintln!("{} {warning}", warn_prefix());
+                }
+                if self.metadata.readme_truncated {
+                    eprintln!(
+                        "{} a README file exceeded {} bytes and was truncated for the version record",
+                        warn_prefix(),
+                        readme::MAX_README_BYTES
+                    );
+                }
+                eprintln!(
+                    "{} recorded {}",
+                    ok_mark(),
+                    style(format!("{}@{}", self.slug, self.version))
+                        .cyan()
+                        .bold()
+                );
+                eprintln!("  {} {}", style("id:").dim(), recorded.id);
+                for line in changelog_preview(&self.metadata.changelog["default"], 3) {
+                    eprintln!("  {} {line}", style("│").dim());
+                }
+                Ok(MutationOutcome::Applied)
+            }
+            Err(ApiError::Server {
+                status: 409, code, ..
+            }) if code == "version_exists" => Ok(MutationOutcome::VersionExists),
+            Err(error) => mutation_error(error, &[], record_error_hint, false),
+        }
+    }
+
+    fn capture_web_bundle(&mut self) -> Result<MutationOutcome> {
+        let local_web = self.candidate.receipt().web.as_ref().ok_or_else(|| {
+            anyhow!("planner requested web capture for a backend-only release candidate")
+        })?;
+        let version_id = self.last_version_id.as_deref().ok_or_else(|| {
+            anyhow!("planner requested web capture before a version id was proven")
+        })?;
+        let result = with_spinner("Verifying pinned web bundle…", || {
+            api::capture_module_version_bundle(
+                self.client,
+                self.apps_base,
+                self.access_token,
+                &self.module.id,
+                self.version,
+            )
+        });
+        match result {
+            Ok(capture) => {
+                verify_bundle_capture_response(
+                    &capture,
+                    &self.module.id,
+                    version_id,
+                    self.slug,
+                    self.version,
+                    local_web,
+                    self.observed_web_url.as_deref(),
+                )?;
+                self.expected_capture_url = Some(capture.web_bundle_url);
+                Ok(MutationOutcome::Applied)
+            }
+            Err(error) => mutation_error(error, &[], bundle_capture_error_hint, false),
+        }
+    }
+
+    fn upload_artifact(&mut self) -> Result<MutationOutcome> {
+        let version_id = self.last_version_id.as_deref().ok_or_else(|| {
+            anyhow!("planner requested artifact upload before a version id was proven")
+        })?;
+        self.candidate.verify_artifact()?;
+        match artifact::ship_artifact(
+            self.client,
+            self.apps_base,
+            self.access_token,
+            &self.module.id,
+            self.version,
+            self.zip_path,
+            self.candidate.receipt(),
+            version_id,
+        )? {
+            artifact::ShipOutcome::Shipped => {
+                eprintln!(
+                    "{} uploaded {}",
+                    ok_mark(),
+                    style(format!("{}@{}", self.slug, self.version))
+                        .cyan()
+                        .bold()
+                );
+                Ok(MutationOutcome::Applied)
+            }
+            artifact::ShipOutcome::StorageUnconfigured => {
+                eprintln!(
+                    "{} artifact storage is explicitly unconfigured for {}; requesting the server-gated local simulator only",
+                    warn_prefix(),
+                    style(format!("{}@{}", self.slug, self.version))
+                        .cyan()
+                        .bold()
+                );
+                Ok(MutationOutcome::StorageUnconfigured)
+            }
+            artifact::ShipOutcome::Replan => Ok(MutationOutcome::Replan),
+        }
+    }
+
+    fn deploy(&mut self, mode: api::ModuleDeployMode) -> Result<MutationOutcome> {
+        let version_id = self
+            .last_version_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("planner requested deploy before a version id was proven"))?;
+        let result = with_spinner("Deploying…", || {
+            api::set_module_deploy(
+                self.client,
+                self.apps_base,
+                self.access_token,
+                &self.module.id,
+                self.version,
+                &SetModuleDeployInput {
+                    mode,
+                    status: Some(&self.desired_deploy_status),
+                },
+            )
+        });
+        match result {
+            Ok(deploy) => {
+                verify_deploy_response(
+                    &deploy,
+                    version_id,
+                    &self.module.id,
+                    self.slug,
+                    self.version,
+                    self.candidate.receipt(),
+                    mode,
+                    &self.desired_deploy_status,
+                )?;
+                self.last_deploy = Some(deploy);
+                Ok(MutationOutcome::Applied)
+            }
+            Err(error) => mutation_error(error, &["artifact_not_ready"], deploy_error_hint, true),
+        }
+    }
+
+    fn wait_before_deploy_settlement_read(&mut self, poll: usize) {
+        let seconds = (1_u64 << poll.min(4)).min(15);
+        std::thread::sleep(Duration::from_secs(seconds));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_bundle_capture_response(
+    capture: &api::ModuleBundleCapture,
+    module_id: &str,
+    version_id: &str,
+    slug: &str,
+    version: &str,
+    local_web: &release_candidate::WebEvidence,
+    observed_web_url: Option<&str>,
+) -> Result<()> {
+    if !release_candidate::module_ids_equal(&capture.module_id, module_id)
+        || capture.version_id != version_id
+        || capture.version != version
+        || capture.web_bundle_sha256 != local_web.sha256
+        || capture.web_bundle_size_bytes != local_web.size_bytes
+        || capture.web_bundle_url.trim().is_empty()
     {
         return Err(anyhow!(
-            "recorded {slug}@{version}, but its owner release-state id did not match the version-create response; no artifact or deploy write was attempted"
+            "web bundle capture returned evidence that does not match the immutable {slug}@{version} candidate"
         ));
     }
-    Ok(state)
+    if observed_web_url
+        .filter(|url| !url.trim().is_empty())
+        .is_some_and(|url| url != capture.web_bundle_url)
+    {
+        return Err(anyhow!(
+            "web bundle capture tried to move the immutable pinned URL for {slug}@{version}; refusing any artifact or deploy write"
+        ));
+    }
+    Ok(())
 }
 
 fn verify_recorded_version_response(
@@ -400,6 +864,7 @@ fn verify_recorded_version_response(
     Ok(())
 }
 
+#[cfg(test)]
 fn verify_version_exists_candidate(
     client: &reqwest::blocking::Client,
     apps_base: &str,
@@ -425,6 +890,7 @@ fn verify_version_exists_candidate(
     Ok(state)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn ensure_candidate_web_capture(
     client: &reqwest::blocking::Client,
@@ -525,6 +991,7 @@ fn guard_version_create_size(input: &RecordModuleVersionInput<'_>) -> Result<()>
 /// Read an existing immutable row without turning the owner-hidden 404 into
 /// success. Callers decide whether absence means the original local lint
 /// error or a contradictory `version_exists` race.
+#[cfg(test)]
 fn read_existing_release_state(
     client: &reqwest::blocking::Client,
     apps_base: &str,
@@ -567,7 +1034,8 @@ fn verify_existing_release_candidate(
     {
         return Err(mismatch("local identity"));
     }
-    if !release_candidate::module_ids_equal(&state.version.module_id, module_id)
+    if state.version.id.trim().is_empty()
+        || !release_candidate::module_ids_equal(&state.version.module_id, module_id)
         || state.version.version != version
     {
         return Err(mismatch("stored identity"));
@@ -840,14 +1308,6 @@ fn decode_manifest_evidence(sha256: &str, encoded: &str, label: &str) -> Result<
         .with_context(|| format!("existing release: parse exact {label} JSON"))
 }
 
-fn print_already_recorded(slug: &str, version: &str) {
-    eprintln!(
-        "{} {} is already recorded — its changelog is frozen. Bump the Versions key in main.go to ship a new entry.",
-        ok_mark(),
-        style(format!("{slug}@{version}")).cyan()
-    );
-}
-
 /// First `max_lines` non-empty changelog lines for the record summary,
 /// with a trailing ellipsis when the section continues.
 pub(super) fn changelog_preview(body: &str, max_lines: usize) -> Vec<String> {
@@ -870,6 +1330,28 @@ pub(super) fn record_error_hint(code: &str) -> &'static str {
         "version_invalid" => " (versions must be canonical SemVer, e.g. 1.2.0 or 1.2.0-beta.1)",
         "changelog_too_large" => " (trim this version's CHANGELOG.md section to 16KB)",
         "readme_too_large" => " (trim README.md to 64KB)",
+        _ => "",
+    }
+}
+
+fn bundle_capture_error_hint(code: &str) -> &'static str {
+    match code {
+        "not_found" => " (the module version is unavailable to this owner)",
+        "bundle_capture_unavailable" => {
+            " (the platform's pinned bundle publisher or storage is unavailable)"
+        }
+        "bundle_source_missing" => {
+            " (run `mirrorstack dev --tunnel --share --watch=false` and wait for its release receipt, then retry)"
+        }
+        "bundle_source_invalid" => {
+            " (the frozen dev bundle failed origin, key, type, size, or SHA-256 validation; rebuild a one-shot release candidate)"
+        }
+        "bundle_capture_conflict" => {
+            " (the immutable pinned destination contains different or unverifiable bytes; investigate or bump the version)"
+        }
+        "bundle_capture_transient" => {
+            " (the platform could not complete deterministic capture; no artifact or deploy mutation was attempted)"
+        }
         _ => "",
     }
 }
@@ -918,6 +1400,15 @@ pub(super) fn deploy_error_hint(code: &str) -> &'static str {
         "artifact_superseded" => {
             " (another deploy of this version started a new upload — let that one finish, or re-run `mirrorstack module deploy` to upload and finalize again)"
         }
+        "artifact_already_ready" => {
+            " (a concurrent deploy finalized the immutable artifact; owner state will be reread before the planner continues)"
+        }
+        "artifact_not_ready" => {
+            " (the artifact is not ready; owner state will be reread before any upload or deploy retry)"
+        }
+        "artifact_code_mismatch" => {
+            " (the Lambda version does not contain the exact immutable artifact SHA-256; deployment failed closed)"
+        }
         // What `httputil.Conflict` emits when a deploy is attempted for a
         // version whose artifact never finalized.
         "conflict" => {
@@ -937,6 +1428,7 @@ pub(super) fn deploy_error_hint(code: &str) -> &'static str {
 mod release_preparation_tests {
     use super::*;
 
+    use std::collections::VecDeque;
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -944,6 +1436,346 @@ mod release_preparation_tests {
     const SDK_MODULE_ID: &str = "m11111111111111111111111111111111";
     const SLUG: &str = "media";
     const VERSION: &str = "1.2.3";
+
+    struct FakeOperations {
+        reads: VecDeque<RemoteRelease>,
+        outcomes: VecDeque<(Action, MutationOutcome)>,
+        attempts: Vec<Action>,
+        deploy_modes: Vec<api::ModuleDeployMode>,
+        settlement_polls: Vec<usize>,
+    }
+
+    impl FakeOperations {
+        fn new(reads: Vec<RemoteRelease>, outcomes: Vec<(Action, MutationOutcome)>) -> Self {
+            Self {
+                reads: reads.into(),
+                outcomes: outcomes.into(),
+                attempts: Vec::new(),
+                deploy_modes: Vec::new(),
+                settlement_polls: Vec::new(),
+            }
+        }
+
+        fn mutate(&mut self, action: Action) -> Result<MutationOutcome> {
+            self.attempts.push(action);
+            let (expected, outcome) = self
+                .outcomes
+                .pop_front()
+                .ok_or_else(|| anyhow!("unexpected mutation {action:?}"))?;
+            if expected != action {
+                return Err(anyhow!("expected mutation {expected:?}, got {action:?}"));
+            }
+            Ok(outcome)
+        }
+    }
+
+    impl ReleaseOperations for FakeOperations {
+        fn read_state(&mut self) -> Result<RemoteRelease> {
+            self.reads
+                .pop_front()
+                .ok_or_else(|| anyhow!("unexpected owner-state read"))
+        }
+
+        fn record_version(&mut self) -> Result<MutationOutcome> {
+            self.mutate(Action::RecordVersion)
+        }
+
+        fn capture_web_bundle(&mut self) -> Result<MutationOutcome> {
+            self.mutate(Action::CaptureWebBundle)
+        }
+
+        fn upload_artifact(&mut self) -> Result<MutationOutcome> {
+            self.mutate(Action::UploadArtifact)
+        }
+
+        fn deploy(&mut self, mode: api::ModuleDeployMode) -> Result<MutationOutcome> {
+            self.deploy_modes.push(mode);
+            self.mutate(Action::Deploy)
+        }
+
+        fn wait_before_deploy_settlement_read(&mut self, poll: usize) {
+            self.settlement_polls.push(poll);
+        }
+    }
+
+    fn planner_local(web_required: bool) -> LocalRelease {
+        LocalRelease {
+            source_sha256: "c".repeat(64),
+            manifest_sha256: "d".repeat(64),
+            artifact_sha256: "a".repeat(64),
+            artifact_size_bytes: 42,
+            web_required,
+            web_verified: false,
+            local_simulation_authorized: false,
+            desired_deploy_status: "active".into(),
+        }
+    }
+
+    fn planner_artifact(status: &str) -> RemoteArtifact {
+        let persisted = status != "missing";
+        RemoteArtifact {
+            status: status.into(),
+            size_bytes: 42,
+            sha256: "a".repeat(64),
+            created: persisted,
+            updated: persisted,
+            finalized: status == "ready",
+        }
+    }
+
+    fn planner_deploy(mode: &str, status: &str) -> RemoteDeploy {
+        let artifact_mode = mode == "artifact";
+        RemoteDeploy {
+            mode: mode.into(),
+            status: status.into(),
+            source_sha256: Some("c".repeat(64)),
+            manifest_sha256: Some("d".repeat(64)),
+            artifact_sha256: artifact_mode.then(|| "a".repeat(64)),
+            lambda_version: artifact_mode.then(|| "17".into()),
+            lambda_code_sha256: artifact_mode.then(|| "a".repeat(64)),
+            created: true,
+            updated: true,
+        }
+    }
+
+    fn planner_state(artifact_status: &str, deploy: Option<RemoteDeploy>) -> RemoteRelease {
+        let ready = artifact_status == "ready"
+            || deploy
+                .as_ref()
+                .is_some_and(|deploy| deploy.mode == "local_simulation");
+        RemoteRelease::Present(Box::new(RemoteVersion {
+            immutable_mismatches: Vec::new(),
+            yanked: false,
+            coherent: true,
+            ready,
+            web_bundle_url: String::new(),
+            artifact: Some(planner_artifact(artifact_status)),
+            deploy,
+        }))
+    }
+
+    #[test]
+    fn driver_matrix_noops_resumes_and_converges_atomic_races() {
+        let done = planner_state("ready", Some(planner_deploy("artifact", "active")));
+        let mut noop = FakeOperations::new(vec![done.clone()], vec![]);
+        let result = drive_release(&mut noop, planner_local(false)).unwrap();
+        assert!(result.attempts.is_empty());
+        assert!(noop.attempts.is_empty());
+
+        let ready = planner_state("ready", None);
+        let mut resume = FakeOperations::new(
+            vec![ready, done.clone()],
+            vec![(Action::Deploy, MutationOutcome::Applied)],
+        );
+        let result = drive_release(&mut resume, planner_local(false)).unwrap();
+        assert_eq!(result.attempts, vec![Action::Deploy]);
+        assert_eq!(resume.deploy_modes, vec![api::ModuleDeployMode::Artifact]);
+
+        let missing = planner_state("missing", None);
+        let ready = planner_state("ready", None);
+        let mut race = FakeOperations::new(
+            vec![missing, ready, done],
+            vec![
+                (Action::UploadArtifact, MutationOutcome::Replan),
+                (Action::Deploy, MutationOutcome::Applied),
+            ],
+        );
+        let result = drive_release(&mut race, planner_local(false)).unwrap();
+        assert_eq!(
+            result.attempts,
+            vec![Action::UploadArtifact, Action::Deploy]
+        );
+    }
+
+    #[test]
+    fn version_exists_must_be_visible_before_any_second_write() {
+        let mut operations = FakeOperations::new(
+            vec![RemoteRelease::Absent, RemoteRelease::Absent],
+            vec![(Action::RecordVersion, MutationOutcome::VersionExists)],
+        );
+        let error = drive_release(&mut operations, planner_local(false))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("did not prove its complete postcondition"),
+            "{error}"
+        );
+        assert_eq!(operations.attempts, vec![Action::RecordVersion]);
+    }
+
+    #[test]
+    fn present_version_cannot_disappear_after_capture_or_upload_replan() {
+        for (action, web_required) in [
+            (Action::CaptureWebBundle, true),
+            (Action::UploadArtifact, false),
+        ] {
+            let mut operations = FakeOperations::new(
+                vec![planner_state("missing", None), RemoteRelease::Absent],
+                vec![(action, MutationOutcome::Replan)],
+            );
+            let error = drive_release(&mut operations, planner_local(web_required))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("cannot become absent"),
+                "{action:?}: {error}"
+            );
+            assert_eq!(operations.attempts, vec![action]);
+        }
+    }
+
+    #[test]
+    fn storage_unconfigured_is_the_only_local_simulation_authorization() {
+        let missing = planner_state("missing", None);
+        let done = planner_state(
+            "missing",
+            Some(planner_deploy("local_simulation", "active")),
+        );
+        let mut operations = FakeOperations::new(
+            vec![missing.clone(), missing, done],
+            vec![
+                (Action::UploadArtifact, MutationOutcome::StorageUnconfigured),
+                (Action::Deploy, MutationOutcome::Applied),
+            ],
+        );
+        let result = drive_release(&mut operations, planner_local(false)).unwrap();
+        assert_eq!(
+            result.attempts,
+            vec![Action::UploadArtifact, Action::Deploy]
+        );
+        assert_eq!(
+            operations.deploy_modes,
+            vec![api::ModuleDeployMode::LocalSimulation]
+        );
+    }
+
+    #[test]
+    fn ambiguous_deploy_only_polls_and_never_posts_twice() {
+        let ready = planner_state("ready", None);
+        let done = planner_state("ready", Some(planner_deploy("artifact", "active")));
+        let mut delayed = FakeOperations::new(
+            vec![ready.clone(), ready.clone(), ready.clone(), done],
+            vec![(Action::Deploy, MutationOutcome::AmbiguousDeploy)],
+        );
+        let result = drive_release(&mut delayed, planner_local(false)).unwrap();
+        assert_eq!(result.attempts, vec![Action::Deploy]);
+        assert_eq!(delayed.attempts, vec![Action::Deploy]);
+        assert_eq!(delayed.settlement_polls, vec![0, 1]);
+
+        let mut never_settles = FakeOperations::new(
+            std::iter::repeat_n(ready, AMBIGUOUS_DEPLOY_SETTLE_POLLS + 2).collect(),
+            vec![(Action::Deploy, MutationOutcome::AmbiguousDeploy)],
+        );
+        let error = drive_release(&mut never_settles, planner_local(false))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refusing a second deploy POST"), "{error}");
+        assert_eq!(never_settles.attempts, vec![Action::Deploy]);
+        assert_eq!(
+            never_settles.settlement_polls,
+            (0..AMBIGUOUS_DEPLOY_SETTLE_POLLS).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn only_exact_409_is_a_confirmed_deploy_race() {
+        let race = mutation_error(
+            ApiError::Server {
+                status: 409,
+                code: "artifact_not_ready".into(),
+                message: "not ready".into(),
+            },
+            &["artifact_not_ready"],
+            deploy_error_hint,
+            true,
+        )
+        .unwrap();
+        assert_eq!(race, MutationOutcome::Replan);
+
+        let ambiguous = mutation_error(
+            ApiError::Server {
+                status: 500,
+                code: "artifact_not_ready".into(),
+                message: "wrong status".into(),
+            },
+            &["artifact_not_ready"],
+            deploy_error_hint,
+            true,
+        )
+        .unwrap();
+        assert_eq!(ambiguous, MutationOutcome::AmbiguousDeploy);
+
+        assert!(
+            mutation_error(
+                ApiError::Server {
+                    status: 409,
+                    code: "artifact_code_mismatch".into(),
+                    message: "wrong bytes".into(),
+                },
+                &["artifact_not_ready"],
+                deploy_error_hint,
+                true,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bad_remote_state_with_missing_web_performs_zero_writes() {
+        let mut mismatched = planner_state("ready", None);
+        let RemoteRelease::Present(version) = &mut mismatched else {
+            unreachable!()
+        };
+        version.artifact.as_mut().unwrap().sha256 = "b".repeat(64);
+        let mut operations = FakeOperations::new(vec![mismatched], vec![]);
+        let error = drive_release(&mut operations, planner_local(true))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("different artifact"), "{error}");
+        assert!(operations.attempts.is_empty());
+    }
+
+    #[test]
+    fn immutable_metadata_comparison_matches_server_normalization() {
+        let normalized = normalize_locale_map(BTreeMap::from([
+            ("default".into(), "  - ship it\n".into()),
+            ("empty".into(), " \n ".into()),
+        ]));
+        assert_eq!(
+            normalized,
+            BTreeMap::from([("default".into(), "- ship it".into())])
+        );
+        let manifest = serde_json::json!({
+            "migration": {"app": "0008", "module": "0003"}
+        });
+        assert_eq!(manifest_migration_counter(&manifest, "app").unwrap(), 8);
+        assert_eq!(manifest_migration_counter(&manifest, "module").unwrap(), 3);
+
+        let mut state = matching_state(&candidate());
+        let metadata = ReleaseMetadata {
+            changelog: normalized,
+            readme: BTreeMap::from([("default".into(), "# Media".into())]),
+            migration_app: 8,
+            migration_module: 3,
+            changelog_warnings: Vec::new(),
+            readme_truncated: false,
+        };
+        state.version.changelog = metadata.changelog.clone();
+        state.version.readme = metadata.readme.clone();
+        state.version.migration_app = 8;
+        state.version.migration_module = 3;
+        assert!(immutable_metadata_mismatches(&state.version, &metadata).is_empty());
+
+        state
+            .version
+            .readme
+            .insert("default".into(), "changed".into());
+        state.version.channel = "beta".into();
+        assert_eq!(
+            immutable_metadata_mismatches(&state.version, &metadata),
+            vec!["channel".to_string(), "readme".to_string()]
+        );
+    }
 
     fn manifest_evidence(manifest: &serde_json::Value) -> release_candidate::ManifestEvidence {
         let mut bytes = serde_json::to_vec(manifest).unwrap();
@@ -996,8 +1828,17 @@ mod release_preparation_tests {
                 id: "version-id".to_string(),
                 module_id: MODULE_ID.to_string(),
                 version: VERSION.to_string(),
+                title: String::new(),
+                description: None,
+                channel: VERSION_CHANNEL.to_string(),
+                changelog: BTreeMap::new(),
+                readme: BTreeMap::new(),
+                migration_app: 0,
+                migration_module: 0,
                 manifest,
+                published_at: "2026-08-31T00:00:00Z".to_string(),
                 yanked_at: None,
+                created_at: "2026-08-31T00:00:00Z".to_string(),
             },
             release_receipt: api::ModuleReleaseReceipt {
                 state: "bound".to_string(),
@@ -1050,8 +1891,17 @@ mod release_preparation_tests {
                 "id": "version-id",
                 "module_id": MODULE_ID,
                 "version": VERSION,
+                "title": "",
+                "description": null,
+                "channel": VERSION_CHANNEL,
+                "changelog": {},
+                "readme": {},
+                "migration_app": 0,
+                "migration_module": 0,
                 "manifest": manifest,
-                "yanked_at": null
+                "published_at": "2026-08-31T00:00:00Z",
+                "yanked_at": null,
+                "created_at": "2026-08-31T00:00:00Z"
             },
             "release_receipt": {
                 "state": "bound",
@@ -1625,6 +2475,34 @@ mod release_preparation_tests {
         .unwrap();
         capture.assert();
         reread.assert();
+    }
+
+    #[test]
+    fn production_capture_validation_never_moves_an_observed_pinned_url() {
+        let candidate = candidate();
+        let local_web = candidate.web.as_ref().unwrap();
+        let pinned = "https://cdn.example.test/media/index.js";
+        let moved = "https://cdn.example.test/media/replacement.js";
+        let capture = api::ModuleBundleCapture {
+            module_id: MODULE_ID.to_string(),
+            version_id: "version-id".to_string(),
+            version: VERSION.to_string(),
+            web_bundle_url: moved.to_string(),
+            web_bundle_sha256: local_web.sha256.clone(),
+            web_bundle_size_bytes: local_web.size_bytes,
+        };
+
+        let error = verify_bundle_capture_response(
+            &capture,
+            MODULE_ID,
+            "version-id",
+            SLUG,
+            VERSION,
+            local_web,
+            Some(pinned),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("move the immutable pinned URL"));
     }
 
     #[test]
