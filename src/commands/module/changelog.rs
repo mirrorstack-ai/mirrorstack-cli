@@ -1,8 +1,8 @@
 //! CHANGELOG locale-map lint for `module deploy`'s record step.
 //!
-//! CHANGELOG files at the module root are the version log: deploy extracts each
+//! CHANGELOG files under `docs/` are the version log: deploy extracts each
 //! one's `## <version>` section and records a locale map on the version row.
-//! `CHANGELOG.md` is the `default`; `CHANGELOG.<tag>.md` (e.g.
+//! `docs/CHANGELOG.md` is the `default`; `docs/CHANGELOG.<tag>.md` (e.g.
 //! `CHANGELOG.zh-TW.md`) contributes a locale translation. The default is
 //! required and hard-linted — file missing, no (or multiple) headings for the
 //! version, empty body, or a section over the platform cap are all errors, and
@@ -21,15 +21,15 @@ use crate::commands::dev::module_meta;
 /// the failure is a lint error, not a `changelog_too_large` round-trip.
 const MAX_SECTION_BYTES: usize = 16_384;
 
-/// A module's changelog for the recorded version: `default` (CHANGELOG.md,
-/// always present) plus any `CHANGELOG.<tag>.md` locale sections.
+/// A module's changelog for the recorded version: `default`
+/// (`docs/CHANGELOG.md`, always present) plus locale sections.
 #[derive(Debug)]
 pub(super) struct Changelog {
     /// Locale → this version's trimmed section body. Key `default` is
-    /// CHANGELOG.md; a `<tag>` key is CHANGELOG.<tag>.md. Always carries
+    /// docs/CHANGELOG.md; a `<tag>` key is docs/CHANGELOG.<tag>.md. Always carries
     /// `default` — its section is a hard requirement.
     pub map: BTreeMap<String, String>,
-    /// Non-fatal anomalies from the default CHANGELOG.md, one message per line.
+    /// Non-fatal anomalies from docs/CHANGELOG.md, one message per line.
     pub warnings: Vec<String>,
 }
 
@@ -43,15 +43,16 @@ struct ChangelogEntry {
     warnings: Vec<String>,
 }
 
-/// Lint `CHANGELOG.md` in `module_dir` for `version` (canonical SemVer, no `v`
+/// Lint `docs/CHANGELOG.md` in `module_dir` for `version` (canonical SemVer, no `v`
 /// prefix) and collect any `CHANGELOG.<tag>.md` locale sections into a map.
 /// The default file is required — a missing or invalid default section is a
 /// hard error; locale variants are optional.
 pub(super) fn lint(module_dir: &Path, version: &str) -> Result<Changelog> {
-    let path = module_dir.join("CHANGELOG.md");
+    let directory = module_dir.join("docs");
+    let path = directory.join("CHANGELOG.md");
     if !path.exists() {
         return Err(anyhow!(
-            "no CHANGELOG.md in {} — create one with a `## {version}` section describing this release",
+            "no docs/CHANGELOG.md in {} — create one with a `## {version}` section describing this release",
             module_dir.display()
         ));
     }
@@ -61,7 +62,7 @@ pub(super) fn lint(module_dir: &Path, version: &str) -> Result<Changelog> {
 
     let mut map = BTreeMap::new();
     map.insert("default".to_string(), default.body);
-    for (tag, section) in locale_sections(module_dir, version)? {
+    for (tag, section) in locale_sections(&directory, version)? {
         map.insert(tag, section);
     }
 
@@ -144,13 +145,13 @@ fn lint_body(changelog: &str, version: &str) -> Result<ChangelogEntry> {
     let start = match matches.as_slice() {
         [] => {
             return Err(anyhow!(
-                "CHANGELOG.md has no `## {version}` section — add one describing this release"
+                "docs/CHANGELOG.md has no `## {version}` section — add one describing this release"
             ));
         }
         [i] => *i,
         many => {
             return Err(anyhow!(
-                "CHANGELOG.md has {} `## {version}` headings — keep exactly one",
+                "docs/CHANGELOG.md has {} `## {version}` headings — keep exactly one",
                 many.len()
             ));
         }
@@ -164,12 +165,12 @@ fn lint_body(changelog: &str, version: &str) -> Result<ChangelogEntry> {
     let body = lines[start + 1..end].join("\n").trim().to_string();
     if body.is_empty() {
         return Err(anyhow!(
-            "the `## {version}` section in CHANGELOG.md is empty — describe the release before deploying"
+            "the `## {version}` section in docs/CHANGELOG.md is empty — describe the release before deploying"
         ));
     }
     if body.len() > MAX_SECTION_BYTES {
         return Err(anyhow!(
-            "the `## {version}` section in CHANGELOG.md is {} bytes; the platform caps changelogs at {MAX_SECTION_BYTES}",
+            "the `## {version}` section in docs/CHANGELOG.md is {} bytes; the platform caps changelogs at {MAX_SECTION_BYTES}",
             body.len()
         ));
     }
@@ -180,7 +181,7 @@ fn lint_body(changelog: &str, version: &str) -> Result<ChangelogEntry> {
         // Both came from heading_version, so parse_semver always succeeds.
         if module_meta::parse_semver(a) < module_meta::parse_semver(b) {
             warnings.push(format!(
-                "CHANGELOG.md versions are not in descending order ({a} appears above {b})"
+                "docs/CHANGELOG.md versions are not in descending order ({a} appears above {b})"
             ));
             break;
         }
@@ -189,7 +190,7 @@ fn lint_body(changelog: &str, version: &str) -> Result<ChangelogEntry> {
     let mut dup_warned = HashSet::new();
     for (_, v) in &version_headings {
         if v != version && !seen.insert(v.as_str()) && dup_warned.insert(v.as_str()) {
-            warnings.push(format!("CHANGELOG.md has duplicate `## {v}` headings"));
+            warnings.push(format!("docs/CHANGELOG.md has duplicate `## {v}` headings"));
         }
     }
 
@@ -221,6 +222,12 @@ fn heading_version(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn docs_file(directory: &Path, name: &str) -> std::path::PathBuf {
+        let docs = directory.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        docs.join(name)
+    }
 
     const SAMPLE: &str = "\
 # Changelog
@@ -322,13 +329,13 @@ mod tests {
     fn lint_missing_file_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let err = lint(tmp.path(), "0.1.0").unwrap_err().to_string();
-        assert!(err.contains("no CHANGELOG.md"), "got {err}");
+        assert!(err.contains("no docs/CHANGELOG.md"), "got {err}");
     }
 
     #[test]
     fn lint_reads_default_from_disk() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("CHANGELOG.md"), SAMPLE).unwrap();
+        std::fs::write(docs_file(tmp.path(), "CHANGELOG.md"), SAMPLE).unwrap();
         let cl = lint(tmp.path(), "0.2.0").expect("ok");
         assert_eq!(cl.map.len(), 1);
         assert!(cl.map["default"].contains("deploy verb"));
@@ -337,9 +344,9 @@ mod tests {
     #[test]
     fn lint_collects_locale_variants() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("CHANGELOG.md"), SAMPLE).unwrap();
+        std::fs::write(docs_file(tmp.path(), "CHANGELOG.md"), SAMPLE).unwrap();
         std::fs::write(
-            tmp.path().join("CHANGELOG.zh-TW.md"),
+            docs_file(tmp.path(), "CHANGELOG.zh-TW.md"),
             "## 0.2.0\n\n- 加入部署指令\n",
         )
         .unwrap();
@@ -355,10 +362,10 @@ mod tests {
     #[test]
     fn lint_omits_locale_missing_the_version_section() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("CHANGELOG.md"), SAMPLE).unwrap();
+        std::fs::write(docs_file(tmp.path(), "CHANGELOG.md"), SAMPLE).unwrap();
         // The French log only documents 0.1.0, not the 0.2.0 being recorded.
         std::fs::write(
-            tmp.path().join("CHANGELOG.fr.md"),
+            docs_file(tmp.path(), "CHANGELOG.fr.md"),
             "## 0.1.0\n\n- version initiale\n",
         )
         .unwrap();
@@ -371,9 +378,9 @@ mod tests {
     fn lint_default_missing_section_errors_despite_locale() {
         let tmp = tempfile::tempdir().unwrap();
         // Default lacks 0.2.0; a locale carrying it must not rescue the record.
-        std::fs::write(tmp.path().join("CHANGELOG.md"), "## 0.1.0\n\n- old\n").unwrap();
+        std::fs::write(docs_file(tmp.path(), "CHANGELOG.md"), "## 0.1.0\n\n- old\n").unwrap();
         std::fs::write(
-            tmp.path().join("CHANGELOG.zh-TW.md"),
+            docs_file(tmp.path(), "CHANGELOG.zh-TW.md"),
             "## 0.2.0\n\n- 新版\n",
         )
         .unwrap();
@@ -384,7 +391,7 @@ mod tests {
     #[test]
     fn lint_ignores_non_changelog_files() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("CHANGELOG.md"), SAMPLE).unwrap();
+        std::fs::write(docs_file(tmp.path(), "CHANGELOG.md"), SAMPLE).unwrap();
         std::fs::write(tmp.path().join("README.md"), "# Media\n").unwrap();
         std::fs::write(tmp.path().join("CHANGELOG.notes.txt"), "## 0.2.0\n\n- x\n").unwrap();
         let cl = lint(tmp.path(), "0.2.0").expect("ok");

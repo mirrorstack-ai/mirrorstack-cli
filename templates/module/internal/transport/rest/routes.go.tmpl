@@ -1,0 +1,32 @@
+// Package rest owns the module's HTTP transport.
+package rest
+
+import (
+    "net/http"
+
+    "github.com/go-chi/chi/v5"
+    ms "github.com/mirrorstack-ai/app-module-sdk"
+)
+
+// Register declares public, platform, and internal route scopes explicitly.
+func Register() {
+    ms.Public(func(router chi.Router) {
+        router.Get("/health", func(writer http.ResponseWriter, _ *http.Request) {
+            writer.WriteHeader(http.StatusNoContent)
+        })
+    })
+
+    ms.Platform(func(router chi.Router) {
+        router.Get("/hello", func(writer http.ResponseWriter, _ *http.Request) {
+            writer.Header().Set("Content-Type", "application/json")
+            _, _ = writer.Write([]byte(`{"message":"hello from __MS_SLUG__"}`))
+        })
+    })
+
+    ms.Internal(func(router chi.Router) {
+        router.Get("/status", func(writer http.ResponseWriter, _ *http.Request) {
+            writer.Header().Set("Content-Type", "application/json")
+            _, _ = writer.Write([]byte(`{"ok":true}`))
+        })
+    })
+}

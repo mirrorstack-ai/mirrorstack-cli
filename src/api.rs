@@ -278,8 +278,8 @@ pub fn create_module(
 pub struct RecordModuleVersionInput<'a> {
     /// Canonical SemVer, no `v` prefix (the platform 422s anything else).
     pub version: &'a str,
-    /// This version's changelog locale map — `{ "default": <CHANGELOG.md
-    /// section>, "<tag>": <CHANGELOG.<tag>.md section> }`, each the module's
+    /// This version's changelog locale map — `{ "default": <docs/CHANGELOG.md
+    /// section>, "<tag>": <docs/CHANGELOG.<tag>.md section> }`, each the module's
     /// `## <version>` section extracted off disk. `default` is required;
     /// omitted only when empty. Capped server-side at 16KB per value
     /// (`changelog_too_large`).

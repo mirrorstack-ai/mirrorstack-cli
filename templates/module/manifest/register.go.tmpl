@@ -1,0 +1,16 @@
+// Package manifest declares the module's stable platform surface.
+package manifest
+
+import (
+    modulemcp "__MS_SLUG__/internal/transport/mcp"
+    "__MS_SLUG__/internal/transport/rest"
+
+    ms "github.com/mirrorstack-ai/app-module-sdk"
+)
+
+// Register installs every declaration before ms.Start.
+func Register() {
+    ms.Describe("Replace this description with the module's purpose.")
+    rest.Register()
+    modulemcp.Register()
+}

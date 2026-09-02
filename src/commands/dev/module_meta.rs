@@ -61,6 +61,7 @@ pub(crate) fn read_module_meta(module_dir: &Path, root: &Path) -> Result<ModuleM
 }
 
 /// Convenience wrapper that returns just the ID (for tunnel registration).
+#[cfg(test)]
 pub(super) fn read_module_id(module_dir: &Path, root: &Path) -> Result<String> {
     let meta = read_module_meta(module_dir, root)?;
     if meta.id.is_empty() {

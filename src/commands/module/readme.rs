@@ -4,7 +4,7 @@
 //! Deploy reads them (when present) and records them on the version row so the
 //! marketplace catalog can render the reader's locale. `README.md` is the
 //! default; `README.<tag>.md` (e.g. `README.zh-TW.md`) contributes a
-//! locale-specific translation. Unlike CHANGELOG.md they are optional and
+//! locale-specific translation. Unlike docs/CHANGELOG.md they are optional and
 //! free-form — there is no lint. Missing files are not an error (nothing is
 //! sent). Each value has its trailing whitespace trimmed and is capped at the
 //! platform's byte limit, truncated on a UTF-8 char boundary.
@@ -32,7 +32,7 @@ pub(super) struct Readme {
 /// Scan `module_dir` for `README.md` (key `default`) and any
 /// `README.<tag>.md` (key `<tag>`), building a locale map. A dir with no
 /// README files yields an empty map — READMEs are optional, unlike
-/// CHANGELOG.md.
+/// docs/CHANGELOG.md.
 pub(super) fn read(module_dir: &Path) -> Result<Readme> {
     let mut map = BTreeMap::new();
     let mut truncated = false;

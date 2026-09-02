@@ -237,7 +237,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     let mut skipped = Vec::new();
     for m in &all_modules {
         match module_meta::read_module_meta(&m.abs_dir, root) {
-            Ok(meta) if !meta.id.is_empty() => ready.push(m.clone()),
+            Ok(meta) if !meta.id.is_empty() => ready.push((m.clone(), meta)),
             Ok(meta) => skipped.push((m.dir.display().to_string(), meta.slug)),
             Err(_) => skipped.push((m.dir.display().to_string(), String::new())),
         }
@@ -250,8 +250,13 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         ready.len(),
         skipped.len()
     );
-    for m in &ready {
-        eprintln!("  {} {}", style("✓").green(), m.dir.display());
+    for (m, meta) in &ready {
+        eprintln!(
+            "  {} {} ({})",
+            style("✓").green(),
+            style(&meta.slug).cyan(),
+            style(m.dir.display()).dim()
+        );
     }
     for (dir, slug) in &skipped {
         let reason = if slug.is_empty() {
@@ -302,10 +307,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     let internal_secrets = if args.tunnel {
         std::fs::create_dir_all(root.join(".secret"))
             .context("dev: create .secret directory for tunnel credentials")?;
-        let slugs: Vec<_> = ready
-            .iter()
-            .map(|m| m.dir.file_name().unwrap().to_string_lossy())
-            .collect();
+        let slugs: Vec<_> = ready.iter().map(|(_, meta)| meta.slug.as_str()).collect();
         let secrets = mint_internal_secrets(slugs.iter().map(|slug| slug.as_ref()))?;
         for (slug, secret) in &secrets {
             let file = internal_secret_file(root, slug);
@@ -381,7 +383,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     // upload belongs here, not in the container (see share.rs). Best-effort:
     // a share failure never blocks the tunnel.
     let share_state = if args.tunnel && args.share {
-        let targets = build_share_targets(root, &ready);
+        let targets = build_share_targets(&ready);
         if targets.is_empty() {
             eprintln!(
                 "{} --share: no module ships a web bundle — nothing to share",
@@ -486,19 +488,15 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
 /// Build the `--share` watcher's target list from the ready modules: one
 /// entry per web-bundle-shipping module, carrying its slug, catalog id, and
 /// the host path to its built bundle. Modules that ship no web bundle
-/// (`ShareTarget::for_module` returns None) or whose id can't be resolved
-/// (shouldn't happen — `open_tunnels` already resolved every id) are skipped.
+/// (`ShareTarget::for_module` returns None) are skipped.
 fn build_share_targets(
-    root: &Path,
-    ready: &[workspace::WorkspaceModule],
+    ready: &[(workspace::WorkspaceModule, module_meta::ModuleMeta)],
 ) -> Vec<share::ShareTarget> {
     let mut targets = Vec::new();
-    for m in ready {
-        let slug = m.dir.file_name().unwrap().to_string_lossy().to_string();
-        let Ok(module_id) = module_meta::read_module_id(&m.abs_dir, root) else {
-            continue;
-        };
-        if let Some(t) = share::ShareTarget::for_module(&m.abs_dir, slug, module_id) {
+    for (m, meta) in ready {
+        if let Some(t) =
+            share::ShareTarget::for_module(&m.abs_dir, meta.slug.clone(), meta.id.clone())
+        {
             targets.push(t);
         }
     }
@@ -531,7 +529,7 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
     let mut ready = Vec::new();
     for m in &all_modules {
         match module_meta::read_module_meta(&m.abs_dir, root) {
-            Ok(meta) if !meta.id.is_empty() => ready.push((m.clone(), meta.id)),
+            Ok(meta) if !meta.id.is_empty() => ready.push((m.clone(), meta)),
             _ => {
                 eprintln!("{} skipping {} (no ID)", warn_prefix(), m.dir.display());
             }
@@ -557,8 +555,8 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
         .filter(|secret| !secret.is_empty());
     let module_internal_secrets: HashMap<String, String> = ready
         .iter()
-        .filter_map(|(m, _)| {
-            let slug = m.dir.file_name().unwrap().to_string_lossy().to_string();
+        .filter_map(|(_, meta)| {
+            let slug = meta.slug.clone();
             let secret = resolve_internal_secret(root, &slug, legacy_internal_secret.as_deref())?;
             Some((slug, secret))
         })
@@ -589,8 +587,8 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
     let mut routes: HashMap<String, u16> = HashMap::new();
     let mut lr_port = LR_PORT_BASE;
 
-    for (i, (m, module_id)) in ready.iter().enumerate() {
-        let slug = m.dir.file_name().unwrap().to_string_lossy().to_string();
+    for (i, (m, meta)) in ready.iter().enumerate() {
+        let slug = meta.slug.clone();
         // Deterministic internal port: go.work order, from 18080.
         let port = INTERNAL_PORT_BASE + u16::try_from(i).expect("module count fits u16");
         routes.insert(slug.clone(), port);
@@ -601,7 +599,7 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
                 log_shipper::spawn(
                     client.clone(),
                     log_dispatch_url.clone(),
-                    module_id.clone(),
+                    meta.id.clone(),
                     secret.clone(),
                 )
             })
@@ -622,7 +620,7 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
         let mut envs: Vec<(String, String)> = module_process_envs(
             &db_url,
             port,
-            module_id,
+            &meta.id,
             token_file.is_file().then_some(token_file.as_path()),
             internal_secret.map(String::as_str),
         );
@@ -1265,7 +1263,7 @@ struct OpenedTunnels {
 /// `module_meta::env_key_for_slug`).
 fn open_tunnels(
     root: &Path,
-    modules: &[workspace::WorkspaceModule],
+    modules: &[(workspace::WorkspaceModule, module_meta::ModuleMeta)],
     local_url_base: Option<&str>,
     internal_secrets: &HashMap<String, String>,
 ) -> Result<OpenedTunnels> {
@@ -1289,10 +1287,10 @@ fn open_tunnels(
         None => format!("{DEFAULT_LOCAL_URL}:{DEFAULT_MODULE_PORT}"),
     };
 
-    for m in modules {
-        let module_id = module_meta::read_module_id(&m.abs_dir, root)?;
-        let slug = m.dir.file_name().unwrap().to_string_lossy();
-        let internal_secret = internal_secrets.get(slug.as_ref()).ok_or_else(|| {
+    for (m, meta) in modules {
+        let module_id = meta.id.clone();
+        let slug = &meta.slug;
+        let internal_secret = internal_secrets.get(slug).ok_or_else(|| {
             anyhow!(
                 "dev: no internal secret minted for module {}",
                 m.dir.display()
@@ -1303,7 +1301,7 @@ fn open_tunnels(
         eprintln!(
             "{} fetching tunnel token for {} from {}",
             ok_mark(),
-            style(m.dir.display()).cyan(),
+            style(slug).cyan(),
             style(&dispatch_base).dim()
         );
 
@@ -1360,16 +1358,16 @@ fn open_tunnels(
         eprintln!(
             "{} tunnel {} → {} (session {})",
             ok_mark(),
-            style(m.dir.display()).cyan(),
+            style(slug).cyan(),
             style(&module_local_url).dim(),
             style(&session.handle.session_id).dim()
         );
 
         targets.push(supervisor::TunnelTarget {
-            slug: slug.to_string(),
+            slug: slug.clone(),
             module_id,
             local_url: module_local_url,
-            token_file: platform_token_file(root, &slug),
+            token_file: platform_token_file(root, slug),
             internal_secret: internal_secret.clone(),
         });
         sessions.push(session);
@@ -1469,6 +1467,36 @@ fn mint_internal_secrets<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_uses_manifest_slug_when_directory_name_differs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let module_dir = tmp.path().join("certificates-core");
+        std::fs::create_dir_all(module_dir.join("web")).unwrap();
+        std::fs::write(
+            module_dir.join("web/esbuild.config.mjs"),
+            "export default {}",
+        )
+        .unwrap();
+
+        let ready = vec![(
+            workspace::WorkspaceModule {
+                dir: PathBuf::from("certificates-core"),
+                abs_dir: module_dir.clone(),
+            },
+            module_meta::ModuleMeta {
+                id: "mcertificate".into(),
+                slug: "certificate-core".into(),
+                name: "Certificates".into(),
+                version: Some("v0.3.0".into()),
+            },
+        )];
+
+        let targets = build_share_targets(&ready);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].slug, "certificate-core");
+        assert_eq!(targets[0].dist, module_dir.join("web/dist/index.js"));
+    }
 
     #[test]
     fn capability_skip_flag_parsing() {

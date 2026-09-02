@@ -55,7 +55,7 @@ enum ModuleCommand {
     /// Deploy the version your code declares (the newest Config.Versions
     /// key in ./main.go). Cross-compiles the module for Linux/arm64 and
     /// packages it as a Lambda `bootstrap` zip, records the version with its
-    /// CHANGELOG.md section when it isn't recorded yet — records are
+    /// docs/CHANGELOG.md section when it isn't recorded yet — records are
     /// immutable, bump the key to ship a new entry — then uploads the
     /// artifact and points the deploy at it. The prod transport target is
     /// derived by the platform from the module's own identity, never
@@ -108,8 +108,8 @@ pub struct DeployArgs {
     /// Module slug. Defaults to Config.Slug parsed from ./main.go.
     #[arg(long)]
     module: Option<String>,
-    /// Module directory containing main.go, CHANGELOG.md, and optional
-    /// README.md. Defaults to cwd.
+    /// Module directory containing main.go and docs/CHANGELOG.md. Defaults to
+    /// cwd.
     #[arg(long)]
     dir: Option<PathBuf>,
     /// Deploy transport status. Defaults to the platform's default ("active").
@@ -751,7 +751,7 @@ fn ensure_version_recorded(
                 style(format!("{slug}@{version}")).cyan().bold()
             );
             eprintln!("  {} {}", style("id:").dim(), recorded.id);
-            // `default` (CHANGELOG.md) is always present after a clean lint.
+            // `default` (docs/CHANGELOG.md) is always present after a clean lint.
             for line in changelog_preview(&entry.map["default"], 3) {
                 eprintln!("  {} {line}", style("│").dim());
             }
@@ -875,7 +875,7 @@ fn changelog_preview(body: &str, max_lines: usize) -> Vec<String> {
 fn record_error_hint(code: &str) -> &'static str {
     match code {
         "version_invalid" => " (versions must be canonical SemVer, e.g. 1.2.0 or 1.2.0-beta.1)",
-        "changelog_too_large" => " (trim this version's CHANGELOG.md section to 16KB)",
+        "changelog_too_large" => " (trim this version's docs/CHANGELOG.md section to 16KB)",
         "readme_too_large" => " (trim README.md to 64KB)",
         _ => "",
     }
@@ -1303,7 +1303,7 @@ mod tests {
     #[test]
     fn record_error_hint_for_known_codes() {
         assert!(record_error_hint("version_invalid").contains("SemVer"));
-        assert!(record_error_hint("changelog_too_large").contains("CHANGELOG.md"));
+        assert!(record_error_hint("changelog_too_large").contains("docs/CHANGELOG.md"));
         assert!(record_error_hint("readme_too_large").contains("README.md"));
         // `version_exists` is intercepted by deploy (already-recorded path),
         // so the hint table deliberately has no entry for it.

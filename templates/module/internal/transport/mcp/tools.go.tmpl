@@ -1,0 +1,29 @@
+// Package mcp owns agent-facing tools and resources.
+package mcp
+
+import (
+    "context"
+
+    ms "github.com/mirrorstack-ai/app-module-sdk"
+)
+
+// GreetArgs is validated from the generated JSON schema.
+type GreetArgs struct {
+    Name string `json:"name" jsonschema:"description=Name to greet"`
+}
+
+// GreetResult is returned to the calling agent.
+type GreetResult struct {
+    Message string `json:"message"`
+}
+
+// Register declares the module's MCP surface.
+func Register() {
+    ms.MCPTool(
+        "greet",
+        "Greet a person",
+        func(_ context.Context, args GreetArgs) (GreetResult, error) {
+            return GreetResult{Message: "Hello, " + args.Name}, nil
+        },
+    )
+}
