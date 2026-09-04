@@ -2275,7 +2275,14 @@ mod tests {
         // Without this, a publication_due() that returned true unconditionally
         // would pass the assertion above and prove nothing.
         assert!(
-            !publication_due(&artifact, &artifact, 7, 7, now + Duration::from_secs(3600), now),
+            !publication_due(
+                &artifact,
+                &artifact,
+                7,
+                7,
+                now + Duration::from_secs(3600),
+                now
+            ),
             "a confirmed, current, un-expired target must not be republished"
         );
     }
