@@ -1510,12 +1510,23 @@ pub(super) fn publish_initial(
             let slug = published.target.slug.clone();
             let confirmed_sha256 = published.confirmed_sha256.clone();
             publisher.track(published)?;
-            eprintln!(
-                "{} [{}] module client ready ({})",
-                ok_mark(),
-                style(slug).cyan(),
-                style(format!("sha256:{confirmed_sha256}")).dim()
-            );
+            // An unconfirmed target is tracked and retried, but saying "ready"
+            // for it would be the same class of lie as a green check over a
+            // module that never built.
+            if confirmed_sha256.is_empty() {
+                eprintln!(
+                    "{} [{}] module client NOT published yet; retrying in the background",
+                    warn_prefix(),
+                    style(slug).cyan()
+                );
+            } else {
+                eprintln!(
+                    "{} [{}] module client ready ({})",
+                    ok_mark(),
+                    style(slug).cyan(),
+                    style(format!("sha256:{confirmed_sha256}")).dim()
+                );
+            }
             Ok(())
         },
     )
@@ -1629,10 +1640,41 @@ fn publish_initial_target(
                 thread::sleep(BUILD_POLL);
             }
             Err(error) => {
-                return Err(anyhow!(
-                    "[{}] publish initial module client: {error}",
-                    target.slug
-                ));
+                // A failed FIRST publish is not a startup failure. The module
+                // client is a package OTHER modules import; it has nothing to
+                // do with this module serving its own routes, and every
+                // publish after this one already warns and retries on the
+                // backoff below. Only the first attempt killed the session —
+                // an asymmetry that turned a degraded client into a dead dev
+                // tunnel, taking compose and every module down with it.
+                //
+                // Hand the publisher an UNCONFIRMED target instead: an empty
+                // confirmed_sha256 keeps publication_due() true, so the
+                // running loop retries this exact artifact on the same
+                // schedule a later failure would get.
+                let failures = 1;
+                eprintln!(
+                    "{} [{}] module client publish failed: {error}; the module is serving and the client will retry in the background",
+                    warn_prefix(),
+                    style(&target.slug).cyan()
+                );
+                return Ok(PublishedTarget {
+                    target: target.clone(),
+                    // Empty on purpose: nothing has been confirmed, so
+                    // publication_due() compares "" against the artifact sha
+                    // and stays true until a retry succeeds.
+                    confirmed_sha256: String::new(),
+                    build_generation: status.generation,
+                    confirmed_session_generation: 0,
+                    last_build_warning: None,
+                    last_publish_warning: Some(format!("publish: {error}")),
+                    retry_sha256: artifact.sha256.clone(),
+                    retry_session_generation: session.generation,
+                    publish_failures: failures,
+                    next_publish_attempt: Instant::now() + publish_retry_delay(failures),
+                    next_renewal: Instant::now() + PUBLISH_RENEW_INTERVAL,
+                    artifact,
+                });
             }
         }
     }
@@ -2206,6 +2248,43 @@ mod tests {
         .unwrap();
 
         assert_eq!(read_status(&target, "run-a"), None);
+    }
+
+    // A failed FIRST publish now tracks the target with an EMPTY
+    // confirmed_sha256 instead of aborting the dev session. That only retries
+    // because publication_due() reads "" as "nothing confirmed yet". If this
+    // contract ever changes, the module client would silently never publish
+    // for the rest of the session and nothing else would notice — the failure
+    // would look exactly like success.
+    #[test]
+    fn an_unconfirmed_target_is_still_due_for_publication() {
+        let now = Instant::now();
+        let artifact = "a".repeat(64);
+
+        // Session generations MATCH and no renewal is due, so the ONLY clause
+        // that can make this true is the empty-vs-artifact sha comparison.
+        // With mismatched generations the assertion would pass on the
+        // generation clause alone and prove nothing about the empty sha.
+        assert!(
+            publication_due("", &artifact, 7, 7, now + Duration::from_secs(3600), now),
+            "an unconfirmed target must stay due, or a failed first publish never retries"
+        );
+
+        // Vacuity control: the same call with the artifact already confirmed,
+        // the same session generation and no renewal due must be FALSE.
+        // Without this, a publication_due() that returned true unconditionally
+        // would pass the assertion above and prove nothing.
+        assert!(
+            !publication_due(
+                &artifact,
+                &artifact,
+                7,
+                7,
+                now + Duration::from_secs(3600),
+                now
+            ),
+            "a confirmed, current, un-expired target must not be republished"
+        );
     }
 
     #[test]
