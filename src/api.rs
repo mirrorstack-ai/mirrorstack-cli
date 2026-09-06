@@ -1620,6 +1620,140 @@ pub fn confirm_dev_bundle(
     Err(envelope_error(resp))
 }
 
+/// The client artifact currently installable for one module installed on an
+/// app. `client` is absent whenever nothing is installable right now, and
+/// `reason` then says why in a stable machine-readable code — a dev-mode
+/// module whose tunnel is gone is the common case, not an error.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppModuleClient {
+    pub module_id: String,
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub owner_username: String,
+    #[serde(default)]
+    pub installed_version: String,
+    #[serde(default)]
+    pub client: Option<ModuleClientDescriptor>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// The immutable artifact a live tunnel session has published. `revision` is
+/// `sha256:<lowercase-hex>` and is the only value a watcher may compare to
+/// decide that the artifact changed.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleClientDescriptor {
+    // source/format_version/confirmed_at/session_id are part of the contract
+    // and are decoded so a mismatch surfaces here rather than silently, but
+    // the installer decides on revision + sha256 + size alone.
+    #[allow(dead_code)]
+    pub source: String,
+    pub revision: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    #[allow(dead_code)]
+    pub format_version: u8,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub confirmed_at: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub session_id: String,
+}
+
+#[derive(Deserialize)]
+struct AppModuleClientList {
+    clients: Vec<AppModuleClient>,
+}
+
+fn app_module_clients_endpoint(apps_base: &str, app_id: &str) -> String {
+    format!(
+        "{}/v1/apps/{}/module-clients",
+        apps_base.trim_end_matches('/'),
+        app_id
+    )
+}
+
+/// GET /v1/apps/{appId}/module-clients — one row per module installed on the
+/// app, each carrying the client that is installable right now or the reason
+/// there is none. `app_id` must be the app UUID for the same reason
+/// [`list_app_installs`] needs one: the handler resolves the per-app tenant
+/// schema from it. Member-scoped.
+pub fn list_app_module_clients(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    app_id: &str,
+) -> Result<Vec<AppModuleClient>, ApiError> {
+    let endpoint = app_module_clients_endpoint(apps_base, app_id);
+    let resp = http
+        .get(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<AppModuleClientList>()?.clients);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
+// Do not derive Debug: `url` is a presigned credential and must never become
+// printable through an otherwise harmless debug log.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModuleClientDownload {
+    pub url: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub revision: String,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub expires_at: String,
+}
+
+fn module_client_download_endpoint(apps_base: &str, app_id: &str, module_id: &str) -> String {
+    format!(
+        "{}/v1/apps/{}/module-clients/{}/download",
+        apps_base.trim_end_matches('/'),
+        app_id,
+        module_id
+    )
+}
+
+/// POST /v1/apps/{appId}/module-clients/{moduleId}/download — mint a
+/// short-lived presigned GET for exactly the artifact the caller just listed.
+/// The URL is minted per request rather than returned by the list so an
+/// object credential is never handed out for a module nobody downloads.
+pub fn request_module_client_download(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    app_id: &str,
+    module_id: &str,
+) -> Result<ModuleClientDownload, ApiError> {
+    let endpoint = module_client_download_endpoint(apps_base, app_id, module_id);
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<ModuleClientDownload>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
 /// Declaration for one canonical module-client artifact. The exact tunnel
 /// session is part of both phases so a predecessor cannot publish after a
 /// reconnect installs its successor.
@@ -1888,6 +2022,109 @@ mod tests {
             list_app_installs(&test_client(), &server.url(), "bad", "app-id"),
             Err(ApiError::Unauthenticated)
         ));
+    }
+
+    #[test]
+    fn list_app_module_clients_decodes_an_artifact_and_a_reason() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/apps/app-id/module-clients")
+            .match_header("authorization", "Bearer AT")
+            .with_status(200)
+            .with_body(
+                r#"{"clients":[
+                    {"moduleId":"m1","slug":"user-core","ownerUsername":"mirrorstack","installedVersion":"dev",
+                     "client":{"source":"tunnel","revision":"sha256:aa","sha256":"aa","sizeBytes":2048,"formatVersion":1,"confirmedAt":"2026-09-06T12:00:00Z","sessionId":"s-1"}},
+                    {"moduleId":"m2","slug":"credit","ownerUsername":"mirrorstack","installedVersion":"dev","client":null,"reason":"tunnel_offline"}
+                ]}"#,
+            )
+            .create();
+
+        let clients =
+            list_app_module_clients(&test_client(), &server.url(), "AT", "app-id").unwrap();
+
+        assert_eq!(clients.len(), 2);
+        let installable = clients[0].client.as_ref().expect("m1 has a client");
+        assert_eq!(installable.revision, "sha256:aa");
+        assert_eq!(installable.sha256, "aa");
+        assert_eq!(installable.size_bytes, 2048);
+        assert_eq!(clients[0].owner_username, "mirrorstack");
+        assert!(clients[1].client.is_none());
+        assert_eq!(clients[1].reason.as_deref(), Some("tunnel_offline"));
+    }
+
+    #[test]
+    fn list_app_module_clients_401_is_unauthenticated() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/apps/app-id/module-clients")
+            .with_status(401)
+            .create();
+
+        assert!(matches!(
+            list_app_module_clients(&test_client(), &server.url(), "bad", "app-id"),
+            Err(ApiError::Unauthenticated)
+        ));
+    }
+
+    #[test]
+    fn request_module_client_download_surfaces_the_platform_reason() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/app-id/module-clients/m1/download")
+            .with_status(409)
+            .with_body(
+                r#"{"error":{"code":"tunnel_session_expired","message":"no installable client"}}"#,
+            )
+            .create();
+
+        // Not formatted with {:?}: ModuleClientDownload deliberately has no
+        // Debug impl because it carries a presigned URL.
+        match request_module_client_download(&test_client(), &server.url(), "AT", "app-id", "m1") {
+            Err(ApiError::Server { code, .. }) => assert_eq!(code, "tunnel_session_expired"),
+            Err(other) => panic!("expected a server error carrying the reason, got {other}"),
+            Ok(_) => panic!("expected a server error carrying the reason, got success"),
+        }
+    }
+
+    #[test]
+    fn request_module_client_download_decodes_the_verification_metadata() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/app-id/module-clients/m1/download")
+            .match_header("authorization", "Bearer AT")
+            .with_status(200)
+            .with_body(
+                r#"{"url":"https://example.invalid/signed","sha256":"aa","sizeBytes":2048,"revision":"sha256:aa","expiresAt":"2026-09-06T12:02:00Z"}"#,
+            )
+            .create();
+
+        let download =
+            request_module_client_download(&test_client(), &server.url(), "AT", "app-id", "m1")
+                .unwrap();
+
+        assert_eq!(download.url, "https://example.invalid/signed");
+        assert_eq!(download.sha256, "aa");
+        assert_eq!(download.size_bytes, 2048);
+        assert_eq!(download.revision, "sha256:aa");
+    }
+
+    #[test]
+    fn default_apps_base_builds_bare_module_client_routes() {
+        let list = app_module_clients_endpoint(crate::commands::DEFAULT_APPS_API_BASE, "app-id");
+        assert_eq!(
+            list,
+            "https://api.mirrorstack.ai/v1/apps/app-id/module-clients"
+        );
+        assert!(!list.contains("/apps/v1/"));
+
+        let download =
+            module_client_download_endpoint(crate::commands::DEFAULT_APPS_API_BASE, "app-id", "m1");
+        assert_eq!(
+            download,
+            "https://api.mirrorstack.ai/v1/apps/app-id/module-clients/m1/download"
+        );
+        assert!(!download.contains("/apps/v1/"));
     }
 
     fn test_client() -> Client {
