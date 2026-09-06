@@ -18,6 +18,7 @@ use super::{
     ENV_WEB_URL, ok_mark, resolve_base, session_expired,
 };
 
+mod client_install;
 mod deploy;
 mod deploy_auth;
 mod ssr;
@@ -38,6 +39,21 @@ enum AppCommand {
     /// Manage developer modules (the per-developer reusable units installed
     /// into apps).
     Module(super::module::ModuleArgs),
+    /// Manage the clients of the modules installed on an app.
+    Client(ClientArgs),
+}
+
+#[derive(Args)]
+pub struct ClientArgs {
+    #[command(subcommand)]
+    command: ClientCommand,
+}
+
+#[derive(Subcommand)]
+enum ClientCommand {
+    /// Install the client of every module installed on the app, into
+    /// `node_modules` under `@mirrorstack-ai/<owner>/<module>`.
+    Install(client_install::InstallArgs),
 }
 
 #[derive(Args)]
@@ -75,6 +91,9 @@ pub fn run(args: AppArgs) -> Result<()> {
             WebCommand::Deploy(d) => deploy::run(d),
         },
         AppCommand::Module(m) => super::module::run(m),
+        AppCommand::Client(c) => match c.command {
+            ClientCommand::Install(i) => client_install::run(i),
+        },
     }
 }
 
