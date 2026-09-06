@@ -1183,6 +1183,12 @@ pub struct DeployGrantInput<'a> {
     pub token: &'a str,
     pub app: &'a str,
     pub env: &'a str,
+    /// What the exchanged grant is for: `None` (omitted from the wire body
+    /// entirely, so a deploy exchange stays byte-identical to before this
+    /// field existed) means `"deploy"`; `Some("client_install")` scopes the
+    /// grant to the module-client endpoints instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<&'a str>,
 }
 
 impl std::fmt::Debug for DeployGrantInput<'_> {
@@ -1191,6 +1197,7 @@ impl std::fmt::Debug for DeployGrantInput<'_> {
             .field("token", &"<redacted>")
             .field("app", &self.app)
             .field("env", &self.env)
+            .field("purpose", &self.purpose)
             .finish()
     }
 }
@@ -1681,7 +1688,14 @@ fn app_module_clients_endpoint(apps_base: &str, app_id: &str) -> String {
 /// app, each carrying the client that is installable right now or the reason
 /// there is none. `app_id` must be the app UUID for the same reason
 /// [`list_app_installs`] needs one: the handler resolves the per-app tenant
-/// schema from it. Member-scoped.
+/// schema from it. Member-scoped for a user session.
+///
+/// Also accepts a deploy grant or deploy token as the bearer (`{appId}` then
+/// takes an id or slug). Only 401 collapses to [`ApiError::Unauthenticated`]
+/// here — a machine credential's 403 (bound to a different app than the
+/// path) is left as [`ApiError::Server`]/[`ApiError::Unexpected`] with its
+/// real status so a caller presenting one can tell the two apart, matching
+/// [`request_module_client_download`].
 pub fn list_app_module_clients(
     http: &Client,
     apps_base: &str,
@@ -1698,7 +1712,7 @@ pub fn list_app_module_clients(
     if status.is_success() {
         return Ok(resp.json::<AppModuleClientList>()?.clients);
     }
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(ApiError::Unauthenticated);
     }
     Err(envelope_error(resp))
@@ -1731,6 +1745,10 @@ fn module_client_download_endpoint(apps_base: &str, app_id: &str, module_id: &st
 /// short-lived presigned GET for exactly the artifact the caller just listed.
 /// The URL is minted per request rather than returned by the list so an
 /// object credential is never handed out for a module nobody downloads.
+///
+/// Also accepts a deploy grant or deploy token as the bearer, same as
+/// [`list_app_module_clients`] — only 401 collapses to
+/// [`ApiError::Unauthenticated`] here, a 403 (wrong app) stays distinguishable.
 pub fn request_module_client_download(
     http: &Client,
     apps_base: &str,
@@ -2161,6 +2179,7 @@ mod tests {
                 token: "github-jwt",
                 app: "company",
                 env: "prod",
+                purpose: None,
             },
         )
         .expect_err("exchange error");
@@ -2254,6 +2273,7 @@ mod tests {
                 token: "github-jwt",
                 app: "company",
                 env: "prod",
+                purpose: None,
             },
         )
         .expect("exchange");
@@ -2283,6 +2303,7 @@ mod tests {
                 token: "different-jwt",
                 app: "company",
                 env: "prod",
+                purpose: None,
             },
         )
         .expect_err("pending");
@@ -2302,6 +2323,48 @@ mod tests {
             other => panic!("expected binding payload, got {other:?}"),
         }
         pending.assert();
+    }
+
+    /// `purpose` is the whole point of the field: a deploy exchange omits it
+    /// (asserted above, where the matcher is the 3-key body with no
+    /// `purpose` at all — `Matcher::Json` is exact, so an extra key there
+    /// would already fail it) and `apps client install --oidc` sets it.
+    #[test]
+    fn deploy_grant_exchange_sends_purpose_when_set() {
+        let mut server = Server::new();
+        let request = server
+            .mock("POST", "/v1/oidc/deploy-grant")
+            .match_body(mockito::Matcher::Json(json!({
+                "token": "github-jwt",
+                "app": "company",
+                "env": "prod",
+                "purpose": "client_install"
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "grant": "msg-secret",
+                    "expires_at": "2026-07-27T05:30:00Z",
+                    "app_id": "app-1",
+                    "env": "prod"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let grant = exchange_deploy_grant(
+            &test_client(),
+            &server.url(),
+            &DeployGrantInput {
+                token: "github-jwt",
+                app: "company",
+                env: "prod",
+                purpose: Some("client_install"),
+            },
+        )
+        .expect("exchange with purpose");
+        assert_eq!(grant.grant, "msg-secret");
+        request.assert();
     }
 
     #[test]

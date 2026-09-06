@@ -80,7 +80,10 @@ fn bound_credential_error(secret: &str, grant: bool, error: ApiError) -> anyhow:
     }
 }
 
-fn redact(value: &str, secret: &str) -> String {
+/// Strip a live secret out of server-echoed text before it reaches a message.
+/// `pub(super)`: `client_install` builds its own machine-credential error
+/// messages from the same secrets and needs this too.
+pub(super) fn redact(value: &str, secret: &str) -> String {
     if secret.is_empty() {
         value.to_string()
     } else {
@@ -216,6 +219,11 @@ pub(super) fn request_actions_id_token(
     Ok(response.value)
 }
 
+/// `purpose`: `None` for a deploy exchange (the wire body then omits the
+/// field entirely — byte-identical to before `purpose` existed);
+/// `Some("client_install")` for `apps client install --oidc`, which scopes
+/// the grant to the module-client endpoints instead of `/deploys`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn exchange_oidc(
     client: &Client,
     apps_base: &str,
@@ -224,6 +232,7 @@ pub(super) fn exchange_oidc(
     audience: &str,
     app: &str,
     env: &str,
+    purpose: Option<&str>,
 ) -> Result<api::DeployGrant> {
     let jwt = request_actions_id_token(client, request_url, request_token, audience)?;
     api::exchange_deploy_grant(
@@ -233,6 +242,7 @@ pub(super) fn exchange_oidc(
             token: &jwt,
             app,
             env,
+            purpose,
         },
     )
     .map_err(|error| exchange_error(app, &jwt, error))
@@ -600,6 +610,7 @@ mod tests {
             DEFAULT_OIDC_AUDIENCE,
             "company",
             "prod",
+            None,
         )
         .expect_err("binding pending");
         let message = error.to_string();
@@ -731,6 +742,7 @@ mod tests {
             DEFAULT_OIDC_AUDIENCE,
             "company",
             "prod",
+            None,
         )
         .expect("exchange without credential file");
         assert_eq!(grant.grant, "grant-secret");
@@ -751,6 +763,7 @@ mod tests {
             DEFAULT_OIDC_AUDIENCE,
             "company",
             "prod",
+            None,
         )
         .expect("exchange with credential file");
         assert_eq!(fs::read(&credentials_path).unwrap(), original);
