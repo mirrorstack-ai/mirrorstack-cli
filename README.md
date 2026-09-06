@@ -30,6 +30,7 @@ mirrorstack apps client install --app my-app                    # Install every 
                                                                  # write mirrorstack.modules.json, generate @mirrorstack-ai/modules
 mirrorstack apps client install --app my-app --frozen           # CI: install exactly the manifest, fail on drift
 mirrorstack apps client install --app my-app --dev              # Keep reinstalling as tunnels publish new revisions
+mirrorstack apps client install --app my-app --oidc --frozen    # CI, no login: authenticate with the job's GitHub Actions identity
 mirrorstack --help             # Show help
 mirrorstack --version          # Show CLI version
 ```
@@ -61,6 +62,26 @@ Nothing scans `node_modules` at runtime and nothing is re-declared by hand:
 the manifest is the source, and a module's client package exports a factory
 named after its slug (`userCore` for `user-core`).
 
+### CI: installing module clients without a login
+
+`--oidc` authenticates with the job's own GitHub Actions identity instead of
+an interactive login — the same mechanism `apps web deploy --oidc` uses,
+scoped to installing module clients rather than deploying:
+
+```yaml
+permissions:
+  id-token: write
+
+steps:
+  - run: mirrorstack apps client install --app <slug> --oidc --frozen
+  - run: pnpm typecheck && pnpm build
+```
+
+The first run from a new repo creates a pending binding — approve it once in
+the app's deployment settings (console → app → deployment settings →
+**模組安裝**), then re-run the job. The grant lives 15 minutes, so `--oidc`
+refuses to pair with `--dev`; use an interactive login for a watcher.
+
 ## Deploy tokens
 
 Create a token in the app's deployment settings on the platform. Its value is
@@ -69,6 +90,7 @@ shown exactly once and does not expire.
 ```bash
 export MIRRORSTACK_TOKEN=...
 mirrorstack apps web deploy --app <slug> --dir out
+mirrorstack apps client install --app <slug> --frozen  # same token, no --oidc needed
 ```
 
 Revoke the token when it is no longer needed.

@@ -23,6 +23,14 @@ use crate::commands::{
 };
 use crate::{credentials, http};
 
+use super::deploy_auth::{self, DeployAuth, SelectedDeployAuth};
+
+/// The stage environment a deploy grant is exchanged for. Module clients
+/// aren't staged per environment the way a web deploy is — this only feeds
+/// the grant exchange, which is bound to an app + env pair regardless of
+/// purpose. Same default `apps web deploy --env` uses.
+const DEFAULT_STAGE_ENV: &str = "prod";
+
 /// The npm scope every module client is installed under. The platform owns
 /// package identity; a module repository never names its own package.
 const PLATFORM_SCOPE: &str = "@mirrorstack-ai";
@@ -63,9 +71,24 @@ pub struct InstallArgs {
     /// platform's installable set or any revision differs. For CI.
     #[arg(long, conflicts_with = "dev")]
     frozen: bool,
+    /// Authenticate with the GitHub Actions OIDC identity for this job,
+    /// exactly as `apps web deploy --oidc` does, instead of an interactive
+    /// login. The exchanged grant is scoped to installing module clients
+    /// (it cannot deploy) and lives 15 minutes — refused together with
+    /// --dev, which watches indefinitely.
+    #[arg(long)]
+    oidc: bool,
 }
 
 pub(super) fn run(args: InstallArgs) -> Result<()> {
+    // Before any network I/O: a grant lives 15 minutes, so it cannot back a
+    // loop that's meant to run for the length of a dev session.
+    if args.oidc && args.dev {
+        return Err(anyhow!(
+            "--oidc cannot back --dev: a grant lives 15 minutes; run the interactive login for a watcher"
+        ));
+    }
+
     let root = match &args.dir {
         Some(dir) => dir.clone(),
         None => std::env::current_dir().context("resolve the current directory")?,
@@ -75,26 +98,17 @@ pub(super) fn run(args: InstallArgs) -> Result<()> {
     }
     let interval = Duration::from_secs(args.interval.max(MIN_WATCH_INTERVAL_SECS));
 
-    let mut creds = credentials::load_or_login_hint()?;
     let client = http::client(Duration::from_secs(15))?;
     let download_client = http::client(DOWNLOAD_TIMEOUT)?;
     let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
 
-    // `module-clients` resolves the per-app tenant schema from the id, so it
-    // needs the UUID — the id-or-slug `--app` is resolved first.
-    let app = match credentials::with_refresh_retry(&mut creds, |tok| {
-        api::get_app(&client, &apps_base, tok, &args.app)
-    }) {
-        Ok(Some(app)) => app,
-        Ok(None) => {
-            return Err(anyhow!(
-                "app '{}' not found (or you are not a member)",
-                args.app
-            ));
-        }
-        Err(ApiError::Unauthenticated) => return Err(session_expired()),
-        Err(e) => return Err(e.into()),
-    };
+    let (app_id, app_slug, mut auth) = resolve_app_and_auth(
+        &args,
+        &client,
+        &apps_base,
+        |name| std::env::var(name).ok(),
+        credentials::load_or_login_hint,
+    )?;
 
     // Revision per module id, so a watch pass reinstalls only what changed.
     let mut installed: BTreeMap<String, String> = BTreeMap::new();
@@ -108,9 +122,9 @@ pub(super) fn run(args: InstallArgs) -> Result<()> {
         &client,
         &download_client,
         &apps_base,
-        &mut creds,
-        &app.id,
-        &app.slug,
+        &mut auth,
+        &app_id,
+        &app_slug,
         &root,
         &mut installed,
         true,
@@ -129,7 +143,7 @@ pub(super) fn run(args: InstallArgs) -> Result<()> {
     eprintln!(
         "{} watching {} for new client revisions every {}s — ctrl-c to stop",
         ok_mark(),
-        style(&app.slug).cyan(),
+        style(&app_slug).cyan(),
         interval.as_secs()
     );
     loop {
@@ -138,9 +152,9 @@ pub(super) fn run(args: InstallArgs) -> Result<()> {
             &client,
             &download_client,
             &apps_base,
-            &mut creds,
-            &app.id,
-            &app.slug,
+            &mut auth,
+            &app_id,
+            &app_slug,
             &root,
             &mut installed,
             false,
@@ -161,10 +175,135 @@ pub(super) fn run(args: InstallArgs) -> Result<()> {
     }
 }
 
-fn is_fatal_watch_error(error: &anyhow::Error) -> bool {
-    error.to_string().contains("session expired")
+/// Resolve which app id/slug to call and which credential to present, in
+/// `--oidc` / `MIRRORSTACK_TOKEN` / interactive precedence — the same rules
+/// `apps web deploy` uses via [`deploy_auth::select_deploy_auth`].
+///
+/// A machine credential (an exchanged grant or a deploy token) skips
+/// `GET /v1/apps/{app}` entirely: that endpoint is user-JWT only, and the two
+/// module-client endpoints accept an id or slug directly, so resolving one
+/// first would just reintroduce the login this flag exists to avoid. `--app`
+/// is used verbatim, for both the path and the manifest the caller ends up
+/// writing. Only an interactive session resolves `--app` to the app's
+/// canonical id/slug first, exactly as before this flag existed.
+fn resolve_app_and_auth(
+    args: &InstallArgs,
+    client: &reqwest::blocking::Client,
+    apps_base: &str,
+    env_lookup: impl FnMut(&str) -> Option<String>,
+    credential_loader: impl FnOnce() -> Result<credentials::Credentials>,
+) -> Result<(String, String, DeployAuth)> {
+    let selected = deploy_auth::select_deploy_auth(args.oidc, env_lookup, credential_loader)?;
+    match selected {
+        SelectedDeployAuth::Oidc {
+            request_url,
+            request_token,
+        } => {
+            let audience = deploy_auth::resolve_oidc_audience(|name| std::env::var(name).ok())?;
+            let exchanged = deploy_auth::exchange_oidc(
+                client,
+                apps_base,
+                &request_url,
+                &request_token,
+                &audience,
+                &args.app,
+                DEFAULT_STAGE_ENV,
+                Some("client_install"),
+            )?;
+            Ok((
+                args.app.clone(),
+                args.app.clone(),
+                DeployAuth::Grant(exchanged.grant),
+            ))
+        }
+        SelectedDeployAuth::Ready(DeployAuth::Token(token)) => {
+            Ok((args.app.clone(), args.app.clone(), DeployAuth::Token(token)))
+        }
+        SelectedDeployAuth::Ready(mut user @ DeployAuth::User(_)) => {
+            // Only a user principal may resolve a slug/UUID through the
+            // management endpoint. Machine credentials are endpoint-limited.
+            let app = match user.with_retry(|tok| api::get_app(client, apps_base, tok, &args.app)) {
+                Ok(Some(app)) => app,
+                Ok(None) => {
+                    return Err(anyhow!(
+                        "app '{}' not found (or you are not a member)",
+                        args.app
+                    ));
+                }
+                Err(ApiError::Unauthenticated) => return Err(session_expired()),
+                Err(e) => return Err(e.into()),
+            };
+            Ok((app.id, app.slug, user))
+        }
+        SelectedDeployAuth::Ready(DeployAuth::Grant(_)) => {
+            unreachable!("grants are created only by the OIDC exchange")
+        }
+    }
 }
 
+/// True for an auth-level rejection on the module-client endpoints: a bad
+/// bearer (401) or one bound to a different app than the path names (403,
+/// per the server contract — see `module_client_auth_error`). Distinguishes
+/// these from a per-module business error (e.g. `tunnel_session_expired`),
+/// which also arrives as [`ApiError::Server`] but at a different status and
+/// must not abort the whole pass.
+fn is_auth_failure(error: &ApiError) -> bool {
+    matches!(
+        error,
+        ApiError::Unauthenticated
+            | ApiError::Server { status: 403, .. }
+            | ApiError::Unexpected { status: 403, .. }
+    )
+}
+
+/// Diagnose a rejected call made with a deploy grant or deploy token —
+/// [`credentials::Credentials`] (a user session) never reaches here, it keeps
+/// its existing `session_expired()` / `{code}: {message}` wording untouched.
+/// Named after the credential so the two are never confused with each other
+/// or with an interactive login.
+fn module_client_auth_error(auth: &DeployAuth, app_ref: &str, error: ApiError) -> anyhow::Error {
+    let (name, secret, is_grant) = match auth {
+        DeployAuth::Grant(secret) => ("the deploy grant", secret.as_str(), true),
+        DeployAuth::Token(secret) => ("MIRRORSTACK_TOKEN", secret.as_str(), false),
+        DeployAuth::User(_) => unreachable!("module_client_auth_error is for Grant/Token only"),
+    };
+    match error {
+        ApiError::Unauthenticated if is_grant => anyhow!(
+            "{name} was refused — it may have expired (a grant lives 15 minutes) or been revoked; re-run the workflow to obtain a new one"
+        ),
+        ApiError::Unauthenticated => anyhow!(
+            "{name} was refused — it may be revoked. Create a new deploy token in the app's deployment settings"
+        ),
+        ApiError::Server { status: 403, .. } | ApiError::Unexpected { status: 403, .. } => {
+            anyhow!("{name} is bound to a different app than '{app_ref}'")
+        }
+        ApiError::Server { code, message, .. } => anyhow!(
+            "{}: {}",
+            deploy_auth::redact(&code, secret),
+            deploy_auth::redact(&message, secret)
+        ),
+        ApiError::Unexpected { status, body } => anyhow!(
+            "api: unexpected response {status}: {}",
+            deploy_auth::redact(&body, secret)
+        ),
+        ApiError::Http(error) => anyhow!("api: HTTP error: {error}"),
+        ApiError::Decode(error) => anyhow!("api: decode response: {error}"),
+    }
+}
+
+fn is_fatal_watch_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    // A deploy grant or MIRRORSTACK_TOKEN rejection is permanent — nothing
+    // about retrying fixes an expired grant or a revoked token — the same
+    // reasoning `--oidc --dev` is refused for up front, just reached at
+    // runtime instead of parse time for the token case (`--dev` doesn't
+    // forbid MIRRORSTACK_TOKEN, only `--oidc`).
+    message.contains("session expired")
+        || message.contains("was refused")
+        || message.contains("is bound to a different app")
+}
+
+#[derive(Debug)]
 struct PassOutcome {
     installed: usize,
 }
@@ -174,7 +313,7 @@ fn install_pass(
     client: &reqwest::blocking::Client,
     download_client: &reqwest::blocking::Client,
     apps_base: &str,
-    creds: &mut credentials::Credentials,
+    auth: &mut DeployAuth,
     app_id: &str,
     app_slug: &str,
     root: &Path,
@@ -182,21 +321,35 @@ fn install_pass(
     report_skips: bool,
     frozen: Option<&Manifest>,
 ) -> Result<PassOutcome> {
-    let clients = match credentials::with_refresh_retry(creds, |tok| {
-        api::list_app_module_clients(client, apps_base, tok, app_id)
-    }) {
+    let clients = match auth
+        .with_retry(|tok| api::list_app_module_clients(client, apps_base, tok, app_id))
+    {
         Ok(clients) => clients,
-        Err(ApiError::Unauthenticated) => return Err(session_expired()),
-        Err(ApiError::Server { code, message, .. }) => return Err(anyhow!("{code}: {message}")),
-        // The app resolved a moment ago, so a bare 404 here is not a missing
-        // app — it is a platform that does not mount this route yet. Say that
-        // rather than leaving the reader to guess which of the two it is.
-        Err(ApiError::Unexpected { status: 404, .. }) => {
-            return Err(anyhow!(
-                "this platform does not serve module clients yet (mirrorstack-ai/mirrorstack-core-v2#742). Upgrade the platform, or link a module's client directory by hand until it ships."
-            ));
+        Err(error) => {
+            // A deploy grant or MIRRORSTACK_TOKEN rejection is an auth
+            // failure end to end — unlike a user session, there's no partial
+            // "some modules listed, this one 403'd" state to preserve, so it
+            // takes priority over every other case below, 404 included.
+            if !matches!(auth, DeployAuth::User(_)) && is_auth_failure(&error) {
+                return Err(module_client_auth_error(auth, app_id, error));
+            }
+            match error {
+                ApiError::Unauthenticated => return Err(session_expired()),
+                ApiError::Server { code, message, .. } => {
+                    return Err(anyhow!("{code}: {message}"));
+                }
+                // The app resolved a moment ago, so a bare 404 here is not a
+                // missing app — it is a platform that does not mount this
+                // route yet. Say that rather than leaving the reader to
+                // guess which of the two it is.
+                ApiError::Unexpected { status: 404, .. } => {
+                    return Err(anyhow!(
+                        "this platform does not serve module clients yet (mirrorstack-ai/mirrorstack-core-v2#742). Upgrade the platform, or link a module's client directory by hand until it ships."
+                    ));
+                }
+                e => return Err(e.into()),
+            }
         }
-        Err(e) => return Err(e.into()),
     };
 
     if let Some(expected) = frozen {
@@ -233,20 +386,27 @@ fn install_pass(
             continue;
         }
 
-        let download = match credentials::with_refresh_retry(creds, |tok| {
+        let download = match auth.with_retry(|tok| {
             api::request_module_client_download(client, apps_base, tok, app_id, &module.module_id)
         }) {
             Ok(download) => download,
-            Err(ApiError::Unauthenticated) => return Err(session_expired()),
-            Err(ApiError::Server { code, message, .. }) => {
-                eprintln!(
-                    "{} [{}] {code}: {message}",
-                    warn_prefix(),
-                    style(&module.slug).cyan()
-                );
-                continue;
+            Err(error) => {
+                if !matches!(auth, DeployAuth::User(_)) && is_auth_failure(&error) {
+                    return Err(module_client_auth_error(auth, app_id, error));
+                }
+                match error {
+                    ApiError::Unauthenticated => return Err(session_expired()),
+                    ApiError::Server { code, message, .. } => {
+                        eprintln!(
+                            "{} [{}] {code}: {message}",
+                            warn_prefix(),
+                            style(&module.slug).cyan()
+                        );
+                        continue;
+                    }
+                    e => return Err(e.into()),
+                }
             }
-            Err(e) => return Err(e.into()),
         };
 
         // The list decided what to install; the download mints a URL a moment
@@ -1248,5 +1408,269 @@ mod tests {
             manifest["exports"].get("./credit").is_none(),
             "the manifest is regenerated from disk, not appended to"
         );
+    }
+
+    // ---- --oidc / MIRRORSTACK_TOKEN machine credentials --------------------
+    //
+    // Same mockito convention `deploy_auth`'s own tests use. `install_pass`
+    // and `resolve_app_and_auth` are driven directly with a pre-built
+    // `DeployAuth`/`InstallArgs`, exactly as `deploy.rs`'s tests drive
+    // `deploy_static`/`deploy_ssr` with a pre-built `DeployTarget`/`DeployAuth`
+    // rather than going through `run()`'s real env vars and stdin.
+
+    use mockito::{Matcher, Server};
+    use serde_json::json;
+
+    fn test_args(app: &str, dir: &Path, oidc: bool) -> InstallArgs {
+        InstallArgs {
+            app: app.to_string(),
+            dir: Some(dir.to_path_buf()),
+            dev: false,
+            interval: 5,
+            frozen: false,
+            oidc,
+        }
+    }
+
+    fn module_clients_list_body(module_id: &str, sha256: &str, size_bytes: u64) -> String {
+        json!({
+            "clients": [{
+                "moduleId": module_id,
+                "slug": "user-core",
+                "ownerUsername": "mirrorstack",
+                "installedVersion": "dev",
+                "client": {
+                    "source": "dev-tunnel",
+                    "revision": "sha256:aa",
+                    "sha256": sha256,
+                    "sizeBytes": size_bytes,
+                    "formatVersion": 1,
+                    "confirmedAt": "2026-09-06T12:00:00Z",
+                    "sessionId": "s-1"
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn oidc_scopes_the_exchange_to_client_install_and_never_resolves_the_app_by_get() {
+        let dir = TempDir::new().unwrap();
+        let archive = valid_archive();
+        let sha256 = format!("{:x}", Sha256::digest(&archive));
+        let size = archive.len() as u64;
+
+        let mut actions = Server::new();
+        let token_request = actions
+            .mock("GET", "/token")
+            .match_query(Matcher::UrlEncoded(
+                "audience".into(),
+                crate::commands::DEFAULT_OIDC_AUDIENCE.into(),
+            ))
+            .match_header("authorization", "Bearer runtime-bearer")
+            .with_status(200)
+            .with_body(json!({"value": "github-jwt"}).to_string())
+            .create();
+
+        let mut apps = Server::new();
+        let exchange = apps
+            .mock("POST", "/v1/oidc/deploy-grant")
+            .match_header("authorization", Matcher::Missing)
+            .match_body(Matcher::Json(json!({
+                "token": "github-jwt",
+                "app": "my-app",
+                "env": "prod",
+                "purpose": "client_install"
+            })))
+            .with_status(200)
+            .with_body(
+                json!({
+                    "grant": "msg_secret",
+                    "expires_at": "2026-09-06T13:00:00Z",
+                    // Deliberately different from --app: the server-resolved
+                    // id must never leak into the path or the manifest.
+                    "app_id": "should-not-be-used",
+                    "env": "prod"
+                })
+                .to_string(),
+            )
+            .create();
+        // A machine credential never resolves the app through the
+        // user-JWT-only endpoint.
+        let get_app = apps.mock("GET", "/v1/apps/my-app").expect(0).create();
+        let list = apps
+            .mock("GET", "/v1/apps/my-app/module-clients")
+            .match_header("authorization", "Bearer msg_secret")
+            .with_status(200)
+            .with_body(module_clients_list_body("m1", &sha256, size))
+            .create();
+        let artifact = apps
+            .mock("GET", "/artifact")
+            .with_status(200)
+            .with_body(archive.clone())
+            .create();
+        let download = apps
+            .mock("POST", "/v1/apps/my-app/module-clients/m1/download")
+            .match_header("authorization", "Bearer msg_secret")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "url": format!("{}/artifact", apps.url()),
+                    "sha256": sha256,
+                    "sizeBytes": size,
+                    "revision": "sha256:aa",
+                    "expiresAt": "2026-09-06T12:02:00Z"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let client = http::client(Duration::from_secs(15)).unwrap();
+        let download_client = http::client(DOWNLOAD_TIMEOUT).unwrap();
+        let args = test_args("my-app", dir.path(), true);
+
+        let (app_id, app_slug, mut auth) = resolve_app_and_auth(
+            &args,
+            &client,
+            &apps.url(),
+            |name| match name {
+                "ACTIONS_ID_TOKEN_REQUEST_URL" => Some(format!("{}/token", actions.url())),
+                "ACTIONS_ID_TOKEN_REQUEST_TOKEN" => Some("runtime-bearer".to_string()),
+                _ => None,
+            },
+            || panic!("--oidc must never load stored credentials"),
+        )
+        .expect("resolve --oidc auth");
+        assert_eq!(app_id, "my-app", "the path uses --app verbatim, not app_id");
+        assert_eq!(app_slug, "my-app");
+        assert!(matches!(&auth, DeployAuth::Grant(g) if g == "msg_secret"));
+
+        let mut installed = BTreeMap::new();
+        let outcome = install_pass(
+            &client,
+            &download_client,
+            &apps.url(),
+            &mut auth,
+            &app_id,
+            &app_slug,
+            dir.path(),
+            &mut installed,
+            true,
+            None,
+        )
+        .expect("install_pass with a deploy grant");
+        assert_eq!(outcome.installed, 1);
+
+        token_request.assert();
+        exchange.assert();
+        get_app.assert();
+        list.assert();
+        download.assert();
+        artifact.assert();
+    }
+
+    #[test]
+    fn mirrorstack_token_env_is_used_as_the_bearer_with_no_exchange_or_get_app() {
+        let dir = TempDir::new().unwrap();
+        let mut apps = Server::new();
+        let get_app = apps.mock("GET", "/v1/apps/my-app").expect(0).create();
+        let exchange = apps
+            .mock("POST", "/v1/oidc/deploy-grant")
+            .expect(0)
+            .create();
+        let list = apps
+            .mock("GET", "/v1/apps/my-app/module-clients")
+            .match_header("authorization", "Bearer token-secret")
+            .with_status(200)
+            .with_body(json!({"clients": []}).to_string())
+            .create();
+
+        let client = http::client(Duration::from_secs(15)).unwrap();
+        let download_client = http::client(DOWNLOAD_TIMEOUT).unwrap();
+        let args = test_args("my-app", dir.path(), false);
+
+        let (app_id, app_slug, mut auth) = resolve_app_and_auth(
+            &args,
+            &client,
+            &apps.url(),
+            |name| (name == deploy_auth::ENV_DEPLOY_TOKEN).then(|| "token-secret".to_string()),
+            || panic!("MIRRORSTACK_TOKEN must not load stored credentials"),
+        )
+        .expect("resolve token auth");
+        assert!(matches!(&auth, DeployAuth::Token(t) if t == "token-secret"));
+
+        let mut installed = BTreeMap::new();
+        install_pass(
+            &client,
+            &download_client,
+            &apps.url(),
+            &mut auth,
+            &app_id,
+            &app_slug,
+            dir.path(),
+            &mut installed,
+            true,
+            None,
+        )
+        .expect("install_pass with MIRRORSTACK_TOKEN");
+
+        get_app.assert();
+        exchange.assert();
+        list.assert();
+    }
+
+    #[test]
+    fn oidc_with_dev_is_refused_before_any_network_io() {
+        let args = InstallArgs {
+            app: "my-app".to_string(),
+            dir: None,
+            dev: true,
+            interval: 5,
+            frozen: false,
+            oidc: true,
+        };
+        let error = run(args).expect_err("--oidc --dev must be refused");
+        assert!(
+            error.to_string().contains("--oidc cannot back --dev"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_grant_bound_to_a_different_app_is_reported_from_the_list_call() {
+        let dir = TempDir::new().unwrap();
+        let mut apps = Server::new();
+        let list = apps
+            .mock("GET", "/v1/apps/my-app/module-clients")
+            .match_header("authorization", "Bearer msg_secret")
+            .with_status(403)
+            .with_body(
+                json!({"error": {"code": "wrong_app", "message": "grant is bound to a different app"}})
+                    .to_string(),
+            )
+            .create();
+
+        let client = http::client(Duration::from_secs(15)).unwrap();
+        let download_client = http::client(DOWNLOAD_TIMEOUT).unwrap();
+        let mut auth = DeployAuth::Grant("msg_secret".to_string());
+        let mut installed = BTreeMap::new();
+
+        let error = install_pass(
+            &client,
+            &download_client,
+            &apps.url(),
+            &mut auth,
+            "my-app",
+            "my-app",
+            dir.path(),
+            &mut installed,
+            true,
+            None,
+        )
+        .expect_err("a 403 must be fatal for a machine credential");
+        let message = error.to_string();
+        assert!(message.contains("different app"), "{message}");
+        assert!(!message.contains("msg_secret"), "{message}");
+        list.assert();
     }
 }

@@ -139,6 +139,7 @@ pub fn run(args: DeployArgs) -> Result<()> {
                 &oidc_audience,
                 &args.app,
                 &args.env,
+                None,
             )?;
             oidc_target(exchanged, &args.env)?
         }
