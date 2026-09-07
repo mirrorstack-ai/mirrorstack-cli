@@ -178,15 +178,16 @@ impl UtcTime {
         // 1970-01-01 was a Thursday (weekday 4 with Sunday = 0).
         let weekday = (days + 4).rem_euclid(7) as u32;
 
+        // The year is deliberately not reconstructed: it would be
+        // `yoe + era * 400 + (month <= 2)`, and a five-field cron has no year
+        // field, so the era term and the year itself are dead weight.
         let z = days + 719_468;
-        let era = z.div_euclid(146_097);
         let doe = z.rem_euclid(146_097);
         let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
         let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
         let mp = (5 * doy + 2) / 153;
         let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
         let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-        let _year = yoe + era * 400 + i64::from(month <= 2);
 
         Self {
             minute: (seconds_of_day / 60 % 60) as u32,
