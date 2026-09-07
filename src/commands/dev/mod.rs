@@ -55,6 +55,7 @@ use super::{
 use crate::{api, credentials, http};
 
 mod client;
+mod cron;
 mod log_shipper;
 pub(crate) mod module_meta;
 mod proxy;
@@ -114,6 +115,21 @@ pub struct DevArgs {
     /// Run all registered modules directly (used inside Docker runner).
     #[arg(long)]
     all: bool,
+    /// Fire each module's declared crons locally, for this app.
+    ///
+    /// 🔴 `mirrorstack dev` invokes NO crons otherwise. A dev-mount install
+    /// falls between both platform drivers — the EventBridge driver excludes
+    /// it by design, and dispatch's in-process ticker runs only in its
+    /// non-Lambda branch — so a declared `ms.Cron` never runs once and nothing
+    /// logs it. The queue simply grows.
+    ///
+    /// It takes the app UUID because the runner has NO app binding of its own:
+    /// it runs modules, and the platform decides which apps mount them. Crons
+    /// are app-scoped (`X-MS-App-ID`, without which the handler refuses with
+    /// "outbox dispatch requires trusted app context"), so the app cannot be
+    /// inferred here and is not guessed.
+    #[arg(long, value_name = "APP_UUID")]
+    cron_app: Option<String>,
     /// Publish each module's built web bundle to the CDN so REMOTE viewers of
     /// a prod dev-tunnel can load it. Only meaningful with --tunnel; in
     /// local-only mode the bundle already serves from localhost and this has
@@ -770,6 +786,11 @@ struct ModuleSpec {
     sink: Option<log_shipper::LogSink>,
     watch: bool,
     stop: Arc<AtomicBool>,
+    /// App UUID for local cron firing, from --cron-app. None = disabled,
+    /// which is the default and the pre-existing behaviour.
+    cron_app: Option<String>,
+    /// The module's internal port, so the ticker can reach its cron routes.
+    port: u16,
 }
 
 fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
@@ -906,6 +927,8 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
             sink,
             watch,
             stop: stop.clone(),
+            cron_app: args.cron_app.clone(),
+            port,
         };
         supervisors.push(thread::spawn(move || supervise_module(spec)));
 
@@ -1225,9 +1248,45 @@ fn supervise_module(spec: ModuleSpec) {
     };
     let mut last_scan = Instant::now();
 
+    // 🔴 Opt-in: without --cron-app this is None and nothing changes. The
+    // runner has no app binding of its own, and a cron is app-scoped, so the
+    // app cannot be inferred — see DevArgs::cron_app.
+    let mut ticker = spec.cron_app.as_ref().map(|app| {
+        let token = spec
+            .envs
+            .iter()
+            .find(|(key, _)| key == "MS_PLATFORM_TOKEN_FILE")
+            .and_then(|(_, path)| std::fs::read_to_string(path).ok())
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        cron::Ticker::new(app.clone(), spec.slug.clone(), spec.port, token)
+    });
+
     loop {
         if spec.stop.load(Ordering::SeqCst) {
             break;
+        }
+
+        if let Some(ticker) = ticker.as_mut()
+            && child.is_some()
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            for (name, outcome) in ticker.tick(now) {
+                match outcome {
+                    Ok(()) => eprintln!("  {} cron {}/{}", style("✓").green(), label, name),
+                    // Never fatal: a cron that cannot run must not take the
+                    // developer's module down with it.
+                    Err(error) => eprintln!(
+                        "  {} cron {}/{} failed: {error}",
+                        warn_prefix(),
+                        label,
+                        name
+                    ),
+                }
+            }
         }
 
         if let Some(c) = child.as_mut()
@@ -2392,6 +2451,8 @@ var _ = mirrorstack.Config{
             sink: Some(tx),
             watch: false,
             stop: Arc::new(AtomicBool::new(false)),
+            cron_app: None,
+            port: 0,
         };
 
         let mut child = start_module(&spec, "test-secret").expect("spawn /usr/bin/env");
@@ -2467,6 +2528,8 @@ var _ = mirrorstack.Config{
             sink: Some(tx),
             watch: false,
             stop: Arc::new(AtomicBool::new(false)),
+            cron_app: None,
+            port: 0,
         };
 
         let mut child = start_module(&spec, "test").expect("spawn /usr/bin/env");
