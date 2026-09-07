@@ -261,6 +261,18 @@ fn is_auth_failure(error: &ApiError) -> bool {
 /// its existing `session_expired()` / `{code}: {message}` wording untouched.
 /// Named after the credential so the two are never confused with each other
 /// or with an interactive login.
+/// A credential failure that RETRYING CANNOT FIX.
+///
+/// 🔴 Carried as a type rather than recognised from prose. `is_fatal_watch_error`
+/// used to substring-match the message — "was refused", "session expired",
+/// "is bound to a different app" — against every error the watch loop saw,
+/// including errors a MODULE produced. A module whose own message happened to
+/// contain "was refused" permanently killed the developer's watch, and
+/// rewording any of these strings silently turned a fatal error retryable.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct FatalCredential(String);
+
 fn module_client_auth_error(auth: &DeployAuth, app_ref: &str, error: ApiError) -> anyhow::Error {
     let (name, secret, is_grant) = match auth {
         DeployAuth::Grant(secret) => ("the deploy grant", secret.as_str(), true),
@@ -268,14 +280,16 @@ fn module_client_auth_error(auth: &DeployAuth, app_ref: &str, error: ApiError) -
         DeployAuth::User(_) => unreachable!("module_client_auth_error is for Grant/Token only"),
     };
     match error {
-        ApiError::Unauthenticated if is_grant => anyhow!(
+        ApiError::Unauthenticated if is_grant => anyhow::Error::new(FatalCredential(format!(
             "{name} was refused — it may have expired (a grant lives 15 minutes) or been revoked; re-run the workflow to obtain a new one"
-        ),
-        ApiError::Unauthenticated => anyhow!(
+        ))),
+        ApiError::Unauthenticated => anyhow::Error::new(FatalCredential(format!(
             "{name} was refused — it may be revoked. Create a new deploy token in the app's deployment settings"
-        ),
+        ))),
         ApiError::Server { status: 403, .. } | ApiError::Unexpected { status: 403, .. } => {
-            anyhow!("{name} is bound to a different app than '{app_ref}'")
+            anyhow::Error::new(FatalCredential(format!(
+                "{name} is bound to a different app than '{app_ref}'"
+            )))
         }
         ApiError::Server { code, message, .. } => anyhow!(
             "{}: {}",
@@ -291,16 +305,23 @@ fn module_client_auth_error(auth: &DeployAuth, app_ref: &str, error: ApiError) -
     }
 }
 
+/// Report whether the watch loop should STOP rather than retry.
+///
+/// A deploy grant or MIRRORSTACK_TOKEN rejection is permanent — nothing about
+/// retrying fixes an expired grant or a revoked token — the same reasoning
+/// `--oidc --dev` is refused for up front, just reached at runtime instead of
+/// parse time for the token case (`--dev` doesn't forbid MIRRORSTACK_TOKEN,
+/// only `--oidc`).
+///
+/// 🔴 Decided by TYPE, never by message text. Matching prose read every error
+/// in the loop, including a module's own: a module message containing "was
+/// refused" permanently killed the developer's watch, and rewording any of
+/// these sentences would have silently made a fatal error retryable. The whole
+/// chain is inspected because the error is wrapped with context on the way up.
 fn is_fatal_watch_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    // A deploy grant or MIRRORSTACK_TOKEN rejection is permanent — nothing
-    // about retrying fixes an expired grant or a revoked token — the same
-    // reasoning `--oidc --dev` is refused for up front, just reached at
-    // runtime instead of parse time for the token case (`--dev` doesn't
-    // forbid MIRRORSTACK_TOKEN, only `--oidc`).
-    message.contains("session expired")
-        || message.contains("was refused")
-        || message.contains("is bound to a different app")
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<FatalCredential>().is_some())
 }
 
 #[derive(Debug)]
@@ -429,6 +450,10 @@ fn install_pass(
         verify(&bytes, &download.sha256, download.size_bytes)
             .with_context(|| format!("verify the client of [{}]", module.slug))?;
 
+        // Validated BEFORE the join: these segments come from the server, and
+        // the directory built here is later handed to remove_dir_all.
+        safe_package_segment(&module.owner_username, "module owner")?;
+        safe_package_segment(&module.slug, "module slug")?;
         let package_dir = root
             .join("node_modules")
             .join(PLATFORM_SCOPE)
@@ -598,7 +623,7 @@ fn camel_case(slug: &str) -> String {
 /// The generated `@mirrorstack-ai/modules` package: static imports of every
 /// installed client (bundlers can follow them; nothing scans node_modules at
 /// runtime) and one `createClient` that registers them all.
-fn generated_client_sources(manifest: &Manifest) -> (String, String) {
+fn generated_client_sources(manifest: &Manifest) -> Result<(String, String)> {
     let mut js = String::from(
         "// Generated by `mirrorstack apps client install` from mirrorstack.modules.json. Do not edit.\n\
          import { createAppClient, platformBaseUrl } from \"@mirrorstack-ai/app-module-client\";\n",
@@ -610,6 +635,11 @@ fn generated_client_sources(manifest: &Manifest) -> (String, String) {
     let mut plugins = String::new();
     let mut plugin_types = String::new();
     for c in &manifest.clients {
+        // Validated before interpolation: `spec` lands inside a JS string
+        // literal, so a quote in either value would close it and turn the rest
+        // into code the app then imports.
+        safe_package_segment(&c.owner, "client owner")?;
+        safe_package_segment(&c.module, "client module")?;
         let key = camel_case(&c.module);
         let spec = format!("{PLATFORM_SCOPE}/{}/{}", c.owner, c.module);
         js.push_str(&format!("import {{ {key} }} from \"{spec}\";\n"));
@@ -623,7 +653,8 @@ fn generated_client_sources(manifest: &Manifest) -> (String, String) {
          \x20 const {{ apiUrl, appSlug, credential, headers, ...rest }} = options;\n\
          \x20 return createAppClient({{\n\
          \x20   baseUrl: platformBaseUrl({{ apiUrl, appSlug }}),\n\
-         \x20   headers: credential ? {{ ...(headers ?? {{}}), Authorization: `Bearer ${{credential}}` }} : headers,\n\
+         \x20   headers,\n\
+         \x20   ...(credential ? {{ memberCredential: credential }} : {{}}),\n\
          \x20   modules: plugins,\n\
          \x20   ...rest,\n\
          \x20 }});\n\
@@ -636,13 +667,19 @@ fn generated_client_sources(manifest: &Manifest) -> (String, String) {
          \x20 readonly apiUrl: string;\n\
          \x20 /** The app slug shown in the console URL. */\n\
          \x20 readonly appSlug: string;\n\
-         \x20 /** A member session credential to present as a bearer. Server-side only. */\n\
+         \x20 /**\n\
+         \x20  * A member session credential, presented as a bearer on PUBLIC scope\n\
+         \x20  * only. Server-side only.\n\
+         \x20  *\n\
+         \x20  * Not a configured header: those apply to every scope, and platform\n\
+         \x20  * scope rejects a configured Authorization outright.\n\
+         \x20  */\n\
          \x20 readonly credential?: string;\n\
          \x20 readonly headers?: Record<string, string>;\n\
          }}\n\n\
          export declare function createClient(options: CreateClientOptions): AppClient<typeof plugins>;\n"
     ));
-    (js, dts)
+    Ok((js, dts))
 }
 
 fn write_generated_client(root: &Path, manifest: &Manifest) -> Result<()> {
@@ -651,7 +688,7 @@ fn write_generated_client(root: &Path, manifest: &Manifest) -> Result<()> {
         .join(PLATFORM_SCOPE)
         .join(GENERATED_PACKAGE);
     fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let (js, dts) = generated_client_sources(manifest);
+    let (js, dts) = generated_client_sources(manifest)?;
     let package = serde_json::json!({
         "name": format!("{PLATFORM_SCOPE}/{GENERATED_PACKAGE}"),
         "version": "0.0.0-dev",
@@ -889,6 +926,42 @@ fn read_archive(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
     Ok(files)
 }
 
+/// Accept only a plain npm-style name segment.
+///
+/// 🔴 `owner_username` and `slug` arrive from the SERVER (the install
+/// response) and from `mirrorstack.modules.json` on disk, and both are used
+/// two ways that need this guard:
+///
+///   - joined into a filesystem path under `node_modules/@mirrorstack-ai/`,
+///     where `..` or a separator escapes the tree that `remove_dir_all` later
+///     deletes;
+///   - interpolated UNESCAPED into a generated JS import specifier, where a
+///     quote closes the string literal and the rest of the value becomes code.
+///
+/// Refused rather than normalized: a name that needs rewriting to be safe is a
+/// name this tool should not be installing under.
+fn safe_package_segment(value: &str, label: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 128 {
+        return Err(anyhow!("{label} is empty or too long: {value:?}"));
+    }
+    if value == "." || value == ".." {
+        return Err(anyhow!("{label} is a path traversal: {value:?}"));
+    }
+    // Leading dot would hide the directory and is not a valid npm name start.
+    if value.starts_with('.') || value.starts_with('_') {
+        return Err(anyhow!("{label} may not start with '.' or '_': {value:?}"));
+    }
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.' || c == '_')
+    {
+        return Err(anyhow!(
+            "{label} may contain only lowercase letters, digits, '-', '.' and '_': {value:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Accept only plain, relative, forward-slashed paths — the exact shape the
 /// packer emits. Anything else (absolute, `..`, a Windows separator, a
 /// non-UTF-8 name) is refused rather than normalized.
@@ -1102,7 +1175,7 @@ mod tests {
                 },
             ],
         };
-        let (js, dts) = generated_client_sources(&manifest);
+        let (js, dts) = generated_client_sources(&manifest).expect("valid fixture");
         assert!(js.contains("import { userCore } from \"@mirrorstack-ai/mirrorstack/user-core\";"));
         assert!(
             js.contains("import { assetLibrary } from \"@mirrorstack-ai/acme/asset-library\";")
@@ -1110,7 +1183,13 @@ mod tests {
         assert!(js.contains("userCore: userCore(),"));
         assert!(js.contains("assetLibrary: assetLibrary(),"));
         assert!(js.contains("platformBaseUrl({ apiUrl, appSlug })"));
-        assert!(js.contains("Authorization: `Bearer ${credential}`"));
+        // 🔴 The credential must NOT be folded into `headers`: configured
+        // headers apply to every scope and platform scope rejects a configured
+        // Authorization outright, so an app with a signed-in member could not
+        // call any platform method. app-module-client's `memberCredential` is
+        // public-scope only.
+        assert!(js.contains("memberCredential: credential"));
+        assert!(!js.contains("Authorization: `Bearer ${credential}`"));
         assert!(dts.contains("readonly userCore: ReturnType<typeof userCore>;"));
         assert!(dts.contains("export declare function createClient(options: CreateClientOptions): AppClient<typeof plugins>;"));
         // Nothing dynamic: no require, no import(), no directory scan.
@@ -1672,5 +1751,69 @@ mod tests {
         assert!(message.contains("different app"), "{message}");
         assert!(!message.contains("msg_secret"), "{message}");
         list.assert();
+    }
+
+    /// 🔴 owner_username and slug arrive from the SERVER and from a file on
+    /// disk, and are used two ways that both need a guard: joined into a path
+    /// under node_modules that remove_dir_all later deletes, and interpolated
+    /// UNESCAPED into a generated JS import specifier, where a quote closes the
+    /// string literal and the rest becomes code.
+    #[test]
+    fn safe_package_segment_refuses_traversal_and_injection() {
+        for bad in [
+            "..",
+            ".",
+            "",
+            "../etc",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "_private",
+            "Upper",
+            "quote\"",
+            "back`tick",
+            "dollar${x}",
+            "semi;colon",
+        ] {
+            assert!(
+                safe_package_segment(bad, "segment").is_err(),
+                "accepted {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_package_segment_accepts_real_names() {
+        for good in ["mirrorstack", "user-core", "user_core", "a.b", "acme2"] {
+            assert!(
+                safe_package_segment(good, "segment").is_ok(),
+                "refused {good:?}"
+            );
+        }
+    }
+
+    /// The watch loop must stop only on a credential failure retrying cannot
+    /// fix — decided by TYPE. Matching prose read every error in the loop,
+    /// including a module's own, so a module message containing "was refused"
+    /// permanently killed the developer's watch.
+    #[test]
+    fn is_fatal_watch_error_reads_the_type_not_the_message() {
+        let fatal = anyhow::Error::new(FatalCredential("the deploy grant was refused".into()));
+        assert!(is_fatal_watch_error(&fatal));
+        // Still fatal after the loop wraps it with context.
+        assert!(is_fatal_watch_error(
+            &fatal.context("install module clients")
+        ));
+
+        // A MODULE saying the same words is retryable.
+        assert!(!is_fatal_watch_error(&anyhow!(
+            "module build failed: the request was refused by the upstream service"
+        )));
+        assert!(!is_fatal_watch_error(&anyhow!(
+            "session expired while compiling"
+        )));
+        assert!(!is_fatal_watch_error(&anyhow!(
+            "this bundle is bound to a different app than the one you meant"
+        )));
     }
 }

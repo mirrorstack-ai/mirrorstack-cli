@@ -15,6 +15,17 @@ pub(crate) struct Manifest {
     pub exposes: Exposes,
     pub permissions: Vec<Permission>,
     pub events: Events,
+    /// Declared cron jobs. `path` is what the platform's scheduler POSTs when
+    /// the job fires; the SDK derives it as /__mirrorstack/crons/{name}.
+    pub schedules: Vec<Schedule>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct Schedule {
+    pub name: String,
+    pub cron: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
