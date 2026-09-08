@@ -473,7 +473,10 @@ impl ApiReleaseOperations<'_> {
     /// leg already takes. A version that already carries a bundle is the
     /// expected answer when re-deploying unchanged bytes, not a failure.
     fn upload_web_bundle(&mut self) -> Result<()> {
-        let bundle_path = web_bundle::locate(self.module_dir)?;
+        let Some(bundle_path) = web_bundle::locate(self.module_dir)? else {
+            // No web surface at all — nothing to ship, and that is normal.
+            return Ok(());
+        };
         match web_bundle::ship(
             self.client,
             self.apps_base,

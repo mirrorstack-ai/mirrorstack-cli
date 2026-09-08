@@ -53,16 +53,26 @@ pub(crate) enum WebBundleOutcome {
     AlreadyRecorded,
 }
 
-/// Where the module's built bundle lives, or a message naming what to build.
-pub(crate) fn locate(dir: &Path) -> Result<PathBuf> {
+/// Where the module's built bundle lives.
+///
+/// 🔴 THE TWO ABSENCES ARE NOT THE SAME. A module with no `web/` directory
+/// ships no UI and must deploy cleanly — returning an error there would break
+/// every headless module. A module that HAS a web project but no built bundle
+/// is a different thing entirely: its UI silently would not ship, which is the
+/// failure this whole path exists to prevent, so that one is fatal and names
+/// the file.
+pub(crate) fn locate(dir: &Path) -> Result<Option<PathBuf>> {
     let path = dir.join(WEB_BUNDLE_REL);
-    if !path.is_file() {
-        return Err(anyhow!(
-            "no web bundle at {} — build the module's web project before deploying (its UI ships from this file, and a version records the bundle it was cut with)",
-            path.display()
-        ));
+    if path.is_file() {
+        return Ok(Some(path));
     }
-    Ok(path)
+    if !dir.join("web").is_dir() {
+        return Ok(None);
+    }
+    Err(anyhow!(
+        "no web bundle at {} — the module has a web project but nothing built it. Its UI ships from this file, and a version records the bundle it was cut with, so deploying now would publish a module that cannot render.",
+        path.display()
+    ))
 }
 
 /// Upload the built bundle for `version_ref` and promote it.
@@ -191,26 +201,40 @@ mod tests {
         }
     }
 
+    // 🔴 THE THREE STATES MUST NOT COLLAPSE INTO TWO. A headless module and a
+    // module whose bundle was never built both "have no bundle", but treating
+    // them alike either breaks every headless deploy or silently publishes a
+    // UI module that cannot render.
     #[test]
-    fn locate_finds_the_built_bundle_and_names_it_when_absent() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Absent: the error must name the path, because "build your web
-        // project" without a path is not actionable in a 14-module workspace.
-        let err = locate(tmp.path()).unwrap_err().to_string();
+    fn locate_separates_headless_from_unbuilt_from_built() {
+        // Headless: no web/ at all — deploys cleanly, ships nothing.
+        let headless = tempfile::tempdir().unwrap();
+        assert_eq!(locate(headless.path()).unwrap(), None);
+
+        // Has a web project, nothing built: fatal, and the error names the
+        // file, because "build your web project" is not actionable on its own
+        // in a 14-module workspace.
+        let unbuilt = tempfile::tempdir().unwrap();
+        fs::create_dir_all(unbuilt.path().join("web/src")).unwrap();
+        let err = locate(unbuilt.path()).unwrap_err().to_string();
         assert!(
             err.contains(WEB_BUNDLE_REL),
             "error did not name the path: {err}"
         );
 
-        // Present: the control. Without it, a `locate` that always failed
-        // would pass the assertion above.
-        fs::create_dir_all(tmp.path().join("web/dist")).unwrap();
+        // Built: the control. Without it, a `locate` that always failed would
+        // satisfy the assertion above.
+        let built = tempfile::tempdir().unwrap();
+        fs::create_dir_all(built.path().join("web/dist")).unwrap();
         fs::write(
-            tmp.path().join(WEB_BUNDLE_REL),
+            built.path().join(WEB_BUNDLE_REL),
             b"export function mount(){}",
         )
         .unwrap();
-        assert_eq!(locate(tmp.path()).unwrap(), tmp.path().join(WEB_BUNDLE_REL));
+        assert_eq!(
+            locate(built.path()).unwrap(),
+            Some(built.path().join(WEB_BUNDLE_REL))
+        );
     }
 
     #[test]
