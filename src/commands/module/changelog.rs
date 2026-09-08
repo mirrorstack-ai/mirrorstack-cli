@@ -11,7 +11,7 @@
 //! that lacks this version's section is simply omitted from the map, no error.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
@@ -43,15 +43,35 @@ struct ChangelogEntry {
     warnings: Vec<String>,
 }
 
+/// Where a module keeps its CLI-consumed changelog, and the directory its
+/// `CHANGELOG.<tag>.md` locale variants live beside.
+///
+/// 🔴 TWO LAYOUTS ARE IN USE AND THE REPO PICKS docs/ FIRST. ms-app-modules'
+/// own scripts/check-module-docs.sh resolves exactly this way — it calls
+/// docs/CHANGELOG.md the canonical path whenever it exists and the module root
+/// otherwise. This CLI used to read the root unconditionally, so a module that
+/// had adopted the docs/ layout could not be released at all: the release
+/// candidate refused it for having "no CHANGELOG.md" while its changelog sat
+/// one directory away. Mirror the repo's precedence rather than forcing every
+/// module to keep a second copy at the root, which would only drift.
+fn changelog_location(module_dir: &Path) -> (PathBuf, PathBuf) {
+    let docs = module_dir.join("docs");
+    let modern = docs.join("CHANGELOG.md");
+    if modern.is_file() {
+        return (docs, modern);
+    }
+    (module_dir.to_path_buf(), module_dir.join("CHANGELOG.md"))
+}
+
 /// Lint `CHANGELOG.md` in `module_dir` for `version` (canonical SemVer, no `v`
 /// prefix) and collect any `CHANGELOG.<tag>.md` locale sections into a map.
 /// The default file is required — a missing or invalid default section is a
 /// hard error; locale variants are optional.
 pub(super) fn lint(module_dir: &Path, version: &str) -> Result<Changelog> {
-    let path = module_dir.join("CHANGELOG.md");
+    let (dir, path) = changelog_location(module_dir);
     if !path.exists() {
         return Err(anyhow!(
-            "no CHANGELOG.md in {} — create one with a `## {version}` section describing this release",
+            "no CHANGELOG.md in {} (looked in docs/ then the module root) — create one with a `## {version}` section describing this release",
             module_dir.display()
         ));
     }
@@ -61,7 +81,7 @@ pub(super) fn lint(module_dir: &Path, version: &str) -> Result<Changelog> {
 
     let mut map = BTreeMap::new();
     map.insert("default".to_string(), default.body);
-    for (tag, section) in locale_sections(module_dir, version)? {
+    for (tag, section) in locale_sections(&dir, version)? {
         map.insert(tag, section);
     }
 
@@ -430,5 +450,47 @@ mod tests {
         assert_eq!(heading_version("0.1.0 fixed stuff"), None);
         assert_eq!(heading_version("0.1.0 - 2026-07-02"), Some("0.1.0".into()));
         assert_eq!(heading_version("[v0.1.0]"), Some("0.1.0".into()));
+    }
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::*;
+
+    // 🔴 A module using the docs/ layout could not be released at all before
+    // this: the release candidate refused it for having "no CHANGELOG.md"
+    // while its changelog sat one directory away. The control is the root
+    // case, which must keep working — every module that has not moved still
+    // depends on it.
+    #[test]
+    fn docs_layout_wins_over_root_and_root_still_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let module = tmp.path();
+
+        // Neither: the root path is what gets reported as missing.
+        let (_, missing) = changelog_location(module);
+        assert_eq!(missing, module.join("CHANGELOG.md"));
+
+        // Root only.
+        std::fs::write(module.join("CHANGELOG.md"), "# c\n\n## 1.0.0\n\nroot\n").unwrap();
+        let (dir, path) = changelog_location(module);
+        assert_eq!(path, module.join("CHANGELOG.md"));
+        assert_eq!(dir, module.to_path_buf());
+
+        // Both present: docs/ wins, and the locale scan follows it there
+        // rather than staying at the root.
+        std::fs::create_dir_all(module.join("docs")).unwrap();
+        std::fs::write(
+            module.join("docs/CHANGELOG.md"),
+            "# c\n\n## 1.0.0\n\ndocs\n",
+        )
+        .unwrap();
+        let (dir, path) = changelog_location(module);
+        assert_eq!(path, module.join("docs/CHANGELOG.md"));
+        assert_eq!(dir, module.join("docs"));
+
+        // And the lint reads the docs/ body, not the root one.
+        let linted = lint(module, "1.0.0").unwrap();
+        assert_eq!(linted.map["default"], "docs");
     }
 }

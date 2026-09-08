@@ -465,42 +465,72 @@ fn build_web(
         ));
     }
     let sha256 = sha256_hex(&bytes);
-    let session = load_for_module(request.module_dir, request.slug)?;
-    if session.watch || !session.share {
-        return Err(anyhow!(
-            "release candidate: current tunnel for {} is watch={} share={}; restart it with `mirrorstack dev --tunnel --share --watch=false`",
-            request.slug,
-            session.watch,
-            session.share
-        ));
+
+    // 🔴 A --share SESSION IS NO LONGER REQUIRED TO CUT A RELEASE.
+    //
+    // This gate used to demand `mirrorstack dev --tunnel --share --watch=false`,
+    // because promoting a session's confirmed object was the only way a version
+    // could ever get a web bundle. It is not any more: `module deploy` uploads
+    // the bundle itself through the version-scoped route, and the platform
+    // recomputes size and sha256 off the stored object. Requiring a developer's
+    // tunnel to cut a release meant a released module's UI was provable only
+    // through a laptop, which is exactly what that path was retired for.
+    //
+    // The one-shot production build above is unchanged and still mandatory —
+    // the bytes a release records are built here, in this process, never picked
+    // up from whatever happened to be lying in web/dist.
+    //
+    // When a conforming --share session IS present its confirmation is still
+    // cross-checked, because a session that confirmed DIFFERENT bytes than the
+    // build just produced means the tunnel is serving something else, and
+    // shipping while that is true is how a version records one UI and serves
+    // another. A non-conforming session (watch on, share off) is simply not
+    // evidence either way, and is ignored rather than treated as an error.
+    // 🔴 WEB EVIDENCE IS DECLARED ONLY WHEN A --share SESSION CONFIRMED IT.
+    //
+    // The platform couples the two: a release candidate carrying web evidence
+    // is rejected outright if its session id is empty, and when the evidence
+    // IS present, version-create calls the bundle publisher's Prepare and
+    // demands an exact match against the live dev-session descriptor. So
+    // declaring locally-built evidence with no session would not merely be
+    // dishonest, it would be refused.
+    //
+    // Omitting it is the correct declaration, not a downgrade: the bundle now
+    // travels through the version-scoped upload that `module deploy` performs,
+    // and the platform records size and sha256 it read off the stored object
+    // itself. A pre-declaration adds nothing when the server hashes the bytes.
+    //
+    // The one-shot production build above still ran, and its output is what
+    // gets uploaded — a release never ships whatever happened to be sitting in
+    // web/dist.
+    let Ok(session) = load_for_module(request.module_dir, request.slug) else {
+        return Ok(None);
+    };
+    if session.watch || !session.share || !module_ids_equal(&session.module_id, request.module_id) {
+        return Ok(None);
     }
-    if !module_ids_equal(&session.module_id, request.module_id) {
-        return Err(anyhow!(
-            "release candidate: current tunnel module id {} does not match owned module {}",
-            session.module_id,
-            request.module_id
-        ));
-    }
-    let ConfirmedWeb {
+    let Some(ConfirmedWeb {
         session_id,
         sha256: confirmed_sha,
         size_bytes,
-    } = session.web.ok_or_else(|| {
-        anyhow!(
-            "release candidate: current tunnel session {} has not confirmed a web bundle yet",
-            session.session_id
-        )
-    })?;
+    }) = session.web
+    else {
+        return Ok(None);
+    };
+    // A conforming session that confirmed DIFFERENT bytes than this build just
+    // produced means the tunnel is serving something else. Shipping while that
+    // is true is how a version records one UI and serves another, so it stays
+    // a hard error rather than falling back to the upload path.
     if confirmed_sha != sha256 || size_bytes != bytes.len() as u64 {
         return Err(anyhow!(
-            "release candidate: one-shot staged web bundle ({sha256}, {} bytes) does not match current-session confirmation ({confirmed_sha}, {size_bytes} bytes)",
+            "release candidate: one-shot staged web bundle ({sha256}, {} bytes) does not match current-session confirmation ({confirmed_sha}, {size_bytes} bytes) — the tunnel is serving different bytes than this build produced",
             bytes.len()
         ));
     }
     Ok(Some(WebEvidence {
         session_id,
         sha256,
-        size_bytes,
+        size_bytes: bytes.len() as u64,
     }))
 }
 
@@ -1563,12 +1593,21 @@ mod tests {
 
     #[test]
     fn watch_session_cannot_attest_release_web_bytes() {
+        // A watch session still cannot ATTEST release bytes — that property is
+        // unchanged and is the point of this test. What changed is the
+        // consequence: it is no longer a hard error, because a release no
+        // longer needs a session at all. The bundle ships through the
+        // version-scoped upload instead, so a non-attesting session simply
+        // yields no web evidence rather than blocking the release.
         let (root, module) = fixture(true, true);
         let _session = session(root.path(), &module, true);
-        let error = build_with(&FakeRunner::default(), request(&module))
-            .err()
-            .expect("watch session rejected");
-        assert!(error.to_string().contains("watch=true"), "{error:#}");
+        let candidate = build_with(&FakeRunner::default(), request(&module))
+            .expect("a watch session no longer blocks a release");
+        assert!(
+            candidate.receipt.web.is_none(),
+            "a watch session must not attest web bytes, got {:?}",
+            candidate.receipt.web
+        );
     }
 
     #[test]
