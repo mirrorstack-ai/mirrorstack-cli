@@ -196,6 +196,7 @@ pub(super) fn run(args: DeployArgs) -> Result<()> {
         candidate: &candidate,
         metadata: &metadata,
         zip_path,
+        module_dir: &dir,
         desired_deploy_status: local.desired_deploy_status.clone(),
         last_version_id: None,
         observed_web_url: None,
@@ -445,6 +446,10 @@ struct ApiReleaseOperations<'a> {
     candidate: &'a dyn CandidateEvidence,
     metadata: &'a ReleaseMetadata,
     zip_path: &'a Path,
+    /// The module source directory, so the deploy can ship the module's own
+    /// web bundle instead of depending on a `--share` session having uploaded
+    /// one. See commands::module::web_bundle.
+    module_dir: &'a Path,
     desired_deploy_status: String,
     last_version_id: Option<String>,
     observed_web_url: Option<String>,
@@ -453,6 +458,70 @@ struct ApiReleaseOperations<'a> {
 }
 
 impl ApiReleaseOperations<'_> {
+    /// Ship the module's own web bundle alongside its Go artifact.
+    ///
+    /// 🔴 A DEPLOY MUST NOT DEPEND ON A DEV TUNNEL. Before this, a version's
+    /// UI could only arrive by the platform promoting an object a
+    /// `mirrorstack dev --share` session had uploaded — so a module deployed
+    /// without one served its UI from a laptop, or not at all. `--share`
+    /// exists to let another device reach a LOCAL module while the tunnel is
+    /// up; its objects are dev-scoped and reaped, and it is not a release
+    /// input.
+    ///
+    /// Non-fatal on purpose: a platform without bundle storage, or one that
+    /// predates these routes, still deploys — exactly the posture the artifact
+    /// leg already takes. A version that already carries a bundle is the
+    /// expected answer when re-deploying unchanged bytes, not a failure.
+    fn upload_web_bundle(&mut self) -> Result<()> {
+        let bundle_path = web_bundle::locate(self.module_dir)?;
+        match web_bundle::ship(
+            self.client,
+            self.apps_base,
+            self.access_token,
+            &self.module.id,
+            self.version,
+            &bundle_path,
+        )? {
+            web_bundle::WebBundleOutcome::Shipped {
+                url,
+                sha256,
+                size_bytes,
+            } => {
+                // The digest is the SERVER's, read off the stored object —
+                // printing it is what lets a caller check the deployed bytes
+                // against the file it built.
+                eprintln!(
+                    "{} uploaded web bundle ({size_bytes} bytes, sha256 {}) -> {}",
+                    ok_mark(),
+                    style(&sha256[..sha256.len().min(12)]).dim(),
+                    style(url).dim()
+                );
+            }
+            web_bundle::WebBundleOutcome::AlreadyRecorded => {
+                eprintln!(
+                    "{} {} already has a web bundle; versions are immutable so its UI is unchanged",
+                    ok_mark(),
+                    style(format!("{}@{}", self.slug, self.version))
+                        .cyan()
+                        .bold()
+                );
+            }
+            web_bundle::WebBundleOutcome::StorageUnconfigured => {
+                eprintln!(
+                    "{} no web bundle was uploaded: this platform has no module bundle storage configured",
+                    warn_prefix()
+                );
+            }
+            web_bundle::WebBundleOutcome::EndpointsMissing => {
+                eprintln!(
+                    "{} no web bundle was uploaded: this platform build has no web-bundle endpoints (the upload route answered 404)",
+                    warn_prefix()
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn convert_state(&self, state: &api::ModuleReleaseState) -> RemoteRelease {
         let receipt = &state.release_receipt;
         let version = &state.version;
@@ -762,6 +831,7 @@ impl ReleaseOperations for ApiReleaseOperations<'_> {
                         .cyan()
                         .bold()
                 );
+                self.upload_web_bundle()?;
                 Ok(MutationOutcome::Applied)
             }
             artifact::ShipOutcome::StorageUnconfigured => {
@@ -1373,6 +1443,7 @@ mod release_preparation_tests {
             candidate,
             metadata,
             zip_path: Path::new("unused-test-artifact.zip"),
+            module_dir: Path::new("unused-test-module-dir"),
             desired_deploy_status: "active".to_string(),
             last_version_id: None,
             observed_web_url: None,

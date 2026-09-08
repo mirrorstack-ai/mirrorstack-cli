@@ -32,6 +32,7 @@ mod release_plan;
 mod rename;
 mod scaffold;
 mod version_move;
+pub(crate) mod web_bundle;
 
 use super::{
     DEFAULT_API_BASE, DEFAULT_APPS_API_BASE, DEFAULT_WEB_BASE, ENV_API_URL, ENV_APPS_API_URL,
