@@ -486,47 +486,54 @@ fn build_web(
     // shipping while that is true is how a version records one UI and serves
     // another. A non-conforming session (watch on, share off) is simply not
     // evidence either way, and is ignored rather than treated as an error.
-    // 🔴 WEB EVIDENCE IS DECLARED ONLY WHEN A --share SESSION CONFIRMED IT.
+    // 🔴 THE EVIDENCE IS ALWAYS DECLARED; ONLY ITS SOURCE VARIES.
     //
-    // The platform couples the two: a release candidate carrying web evidence
-    // is rejected outright if its session id is empty, and when the evidence
-    // IS present, version-create calls the bundle publisher's Prepare and
-    // demands an exact match against the live dev-session descriptor. So
-    // declaring locally-built evidence with no session would not merely be
-    // dishonest, it would be refused.
+    // A previous revision omitted web evidence entirely when no --share session
+    // was present, on the reasoning that the platform hashes the uploaded bytes
+    // itself so a pre-declaration adds nothing. That was wrong, and the schema
+    // is what says so: migration 088 seals web_bundle_sha256 and
+    // web_bundle_size_bytes at INSERT, and the finalize may only pin
+    // web_bundle_url. A version recorded with no evidence can therefore NEVER
+    // acquire any — it serves a bundle nothing on the row describes, forever.
     //
-    // Omitting it is the correct declaration, not a downgrade: the bundle now
-    // travels through the version-scoped upload that `module deploy` performs,
-    // and the platform records size and sha256 it read off the stored object
-    // itself. A pre-declaration adds nothing when the server hashes the bytes.
-    //
-    // The one-shot production build above still ran, and its output is what
-    // gets uploaded — a release never ships whatever happened to be sitting in
-    // web/dist.
-    let Ok(session) = load_for_module(request.module_dir, request.slug) else {
-        return Ok(None);
+    // So the digest and size from this process's one-shot build are always
+    // declared. The session id is what distinguishes the two sources: present
+    // means the platform promotes that tunnel's confirmed object, empty means
+    // `module deploy` uploads these exact bytes itself. Either way the server
+    // re-hashes what it stores and refuses to pin a URL that disagrees.
+    let session_id = match load_for_module(request.module_dir, request.slug) {
+        Ok(session)
+            if !session.watch
+                && session.share
+                && module_ids_equal(&session.module_id, request.module_id) =>
+        {
+            match session.web {
+                Some(ConfirmedWeb {
+                    session_id,
+                    sha256: confirmed_sha,
+                    size_bytes,
+                }) => {
+                    // A conforming session that confirmed DIFFERENT bytes than
+                    // this build just produced means the tunnel is serving
+                    // something else, and shipping while that is true is how a
+                    // version records one UI and serves another.
+                    if confirmed_sha != sha256 || size_bytes != bytes.len() as u64 {
+                        return Err(anyhow!(
+                            "release candidate: one-shot staged web bundle ({sha256}, {} bytes) does not match current-session confirmation ({confirmed_sha}, {size_bytes} bytes) — the tunnel is serving different bytes than this build produced",
+                            bytes.len()
+                        ));
+                    }
+                    session_id
+                }
+                // A conforming session that has confirmed nothing is not
+                // evidence of anything; the deploy uploads instead.
+                None => String::new(),
+            }
+        }
+        // No session, or a non-conforming one (watch on, share off, different
+        // module): not evidence either way, and no longer an error.
+        _ => String::new(),
     };
-    if session.watch || !session.share || !module_ids_equal(&session.module_id, request.module_id) {
-        return Ok(None);
-    }
-    let Some(ConfirmedWeb {
-        session_id,
-        sha256: confirmed_sha,
-        size_bytes,
-    }) = session.web
-    else {
-        return Ok(None);
-    };
-    // A conforming session that confirmed DIFFERENT bytes than this build just
-    // produced means the tunnel is serving something else. Shipping while that
-    // is true is how a version records one UI and serves another, so it stays
-    // a hard error rather than falling back to the upload path.
-    if confirmed_sha != sha256 || size_bytes != bytes.len() as u64 {
-        return Err(anyhow!(
-            "release candidate: one-shot staged web bundle ({sha256}, {} bytes) does not match current-session confirmation ({confirmed_sha}, {size_bytes} bytes) — the tunnel is serving different bytes than this build produced",
-            bytes.len()
-        ));
-    }
     Ok(Some(WebEvidence {
         session_id,
         sha256,
@@ -1593,21 +1600,31 @@ mod tests {
 
     #[test]
     fn watch_session_cannot_attest_release_web_bytes() {
-        // A watch session still cannot ATTEST release bytes — that property is
-        // unchanged and is the point of this test. What changed is the
-        // consequence: it is no longer a hard error, because a release no
-        // longer needs a session at all. The bundle ships through the
-        // version-scoped upload instead, so a non-attesting session simply
-        // yields no web evidence rather than blocking the release.
+        // The property is unchanged and is the whole point: a watch session
+        // cannot ATTEST release bytes. What changed is how that is expressed.
+        // Evidence is now always declared from this process's one-shot build,
+        // because the schema seals the digest at INSERT and a version recorded
+        // without one can never acquire it. So a non-attesting session yields
+        // evidence with an EMPTY session id — the bundle will be uploaded by
+        // the deploy — rather than no evidence at all.
         let (root, module) = fixture(true, true);
         let _session = session(root.path(), &module, true);
         let candidate = build_with(&FakeRunner::default(), request(&module))
             .expect("a watch session no longer blocks a release");
-        assert!(
-            candidate.receipt.web.is_none(),
-            "a watch session must not attest web bytes, got {:?}",
-            candidate.receipt.web
+        let web = candidate
+            .receipt
+            .web
+            .as_ref()
+            .expect("evidence is declared from the build, not the session");
+        assert_eq!(
+            web.session_id, "",
+            "a watch session must not attest; its id must not reach the receipt"
         );
+        assert!(
+            !web.sha256.is_empty(),
+            "the build's digest must be declared"
+        );
+        assert!(web.size_bytes > 0, "the build's size must be declared");
     }
 
     #[test]
