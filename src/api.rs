@@ -4261,3 +4261,95 @@ mod tests {
         ));
     }
 }
+
+fn web_bundle_endpoint(apps_base: &str, module_id: &str, version_ref: &str, tail: &str) -> String {
+    format!(
+        "{}/v1/modules/{}/versions/{}/web-bundle{}",
+        apps_base.trim_end_matches('/'),
+        module_id,
+        version_ref,
+        tail
+    )
+}
+
+/// The presign response for a version's web bundle. It carries no expected
+/// size or digest because the CLI declares neither: the platform reads both
+/// off the stored object at finalize.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ModuleWebBundleUpload {
+    /// The presigned PUT. The response also carries version_id/module_id and
+    /// an expiry; the CLI reads none of them — it PUTs immediately and the
+    /// finalize leg re-resolves the version server-side — so they are left
+    /// off this struct rather than parsed and ignored.
+    pub url: String,
+}
+
+/// The finalized public identity of a version's UI bundle. Every field here is
+/// server-read; none of it was sent by this CLI.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ModuleWebBundle {
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub size_bytes: i64,
+}
+
+/// POST /v1/modules/{moduleId}/versions/{versionRef}/web-bundle — record the
+/// pending web bundle for the version and mint its presigned PUT. Takes no
+/// body, for the same reason the artifact leg takes none: anything sent here
+/// would be a caller's claim about bytes the server has not seen.
+pub fn create_module_web_bundle_upload(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+    version_ref: &str,
+) -> Result<ModuleWebBundleUpload, ApiError> {
+    let resp = http
+        .post(web_bundle_endpoint(apps_base, module_id, version_ref, ""))
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<ModuleWebBundleUpload>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
+/// POST /v1/modules/{moduleId}/versions/{versionRef}/web-bundle/finalize —
+/// promote the staged upload into the immutable version destination. Also
+/// bodyless: the server HEADs, reads and hashes the object itself.
+pub fn finalize_module_web_bundle(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+    version_ref: &str,
+) -> Result<ModuleWebBundle, ApiError> {
+    let resp = http
+        .post(web_bundle_endpoint(
+            apps_base,
+            module_id,
+            version_ref,
+            "/finalize",
+        ))
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<ModuleWebBundle>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
