@@ -54,7 +54,7 @@ use super::{
 };
 use crate::{api, credentials, http};
 
-mod client;
+pub(crate) mod client;
 mod cron;
 mod log_shipper;
 pub(crate) mod module_meta;

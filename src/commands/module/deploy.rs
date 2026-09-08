@@ -472,6 +472,59 @@ impl ApiReleaseOperations<'_> {
     /// predates these routes, still deploys — exactly the posture the artifact
     /// leg already takes. A version that already carries a bundle is the
     /// expected answer when re-deploying unchanged bytes, not a failure.
+    /// Ship the module's CLIENT for this version (core-v2 #742).
+    ///
+    /// 🔴 THIS IS WHAT LETS A CONSUMER CLOSE ITS TUNNEL. Until this existed a
+    /// module client lived only behind a live dev tunnel, so an app importing
+    /// one — kaohsiung imports `@mirrorstack-ai/modules` — could never stop
+    /// running `mirrorstack dev`. A published version now carries its own.
+    ///
+    /// Non-fatal on the platform's absence, for the same reason the web-bundle
+    /// leg is: a platform without artifact storage, or one predating these
+    /// routes, still deploys. A module with a client project that did not BUILD
+    /// is fatal, and that check is in version_client::locate.
+    fn upload_version_client(&mut self) -> Result<()> {
+        let Some(output_dir) = version_client::locate(self.module_dir)? else {
+            // No client project at all — normal for a headless module.
+            return Ok(());
+        };
+        match version_client::ship(
+            self.client,
+            self.apps_base,
+            self.access_token,
+            &self.module.id,
+            self.version,
+            &output_dir,
+        )? {
+            version_client::VersionClientOutcome::Shipped {
+                revision,
+                size_bytes,
+            } => {
+                // The revision is the string a consumer pins in
+                // mirrorstack.modules.json, so printing it in full is what lets
+                // them update the pin without a second lookup.
+                eprintln!(
+                    "{} uploaded module client ({size_bytes} bytes) -> {}",
+                    ok_mark(),
+                    style(&revision).dim()
+                );
+            }
+            version_client::VersionClientOutcome::StorageUnconfigured => {
+                eprintln!(
+                    "{} no module client was uploaded: this platform has no module artifact storage configured",
+                    warn_prefix()
+                );
+            }
+            version_client::VersionClientOutcome::EndpointsMissing => {
+                eprintln!(
+                    "{} no module client was uploaded: this platform predates the version-client routes, so consumers still need a dev tunnel",
+                    warn_prefix()
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn upload_web_bundle(&mut self) -> Result<()> {
         let Some(bundle_path) = web_bundle::locate(self.module_dir)? else {
             // No web surface at all — nothing to ship, and that is normal.
@@ -835,6 +888,11 @@ impl ReleaseOperations for ApiReleaseOperations<'_> {
                         .bold()
                 );
                 self.upload_web_bundle()?;
+                // core-v2 #742 — the client rides the same successful upload as
+                // the bundle. Ordered after it deliberately: a module with a UI
+                // but no client is common, the reverse is not, so the more
+                // common leg reports first.
+                self.upload_version_client()?;
                 Ok(MutationOutcome::Applied)
             }
             artifact::ShipOutcome::StorageUnconfigured => {

@@ -31,6 +31,7 @@ mod register;
 mod release_plan;
 mod rename;
 mod scaffold;
+pub(crate) mod version_client;
 mod version_move;
 pub(crate) mod web_bundle;
 

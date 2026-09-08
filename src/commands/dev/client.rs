@@ -69,9 +69,9 @@ const COMPOSE_RUNNING_RUNNER_PS_ARGS: [&str; 6] =
 const COMPOSE_ALL_RUNNER_PS_ARGS: [&str; 5] = ["compose", "ps", "--all", "--quiet", "runner"];
 
 #[derive(Debug)]
-struct ClientArtifact {
-    bytes: Vec<u8>,
-    sha256: String,
+pub(crate) struct ClientArtifact {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) sha256: String,
 }
 
 struct OutputFile {
@@ -82,7 +82,7 @@ struct OutputFile {
 /// Package a built client output directory into the canonical v1 artifact.
 /// Module-authored package metadata is never copied: the platform assigns
 /// identity and version when the artifact is installed.
-fn package_client(output_dir: &Path) -> Result<ClientArtifact> {
+pub(crate) fn package_client(output_dir: &Path) -> Result<ClientArtifact> {
     let output_metadata = fs::symlink_metadata(output_dir)
         .with_context(|| format!("module client output is missing: {}", output_dir.display()))?;
     if output_metadata.file_type().is_symlink() || !output_metadata.is_dir() {
