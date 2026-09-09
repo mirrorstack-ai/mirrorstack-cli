@@ -1790,6 +1790,74 @@ mod release_preparation_tests {
     }
 
     #[test]
+    fn an_unpublished_version_may_be_amended_but_a_published_one_never() {
+        // 🔴 THE OWNER'S ASK, TWICE: "make api and cli possible to reupload
+        // again before publish to public". A version is immutable once it is
+        // PUBLISHED — once a deploy row exists — not once it is recorded.
+        //
+        // Before this, a release interrupted after recording could never be
+        // completed or corrected: the key was spent on bytes that were wrong
+        // and nothing could replace them. user-core v1.0.3 was recorded with
+        // an artifact built against an SDK that freezes its database token, so
+        // without an amend path the ONLY way to ship the fix was a fourth
+        // version key the owner had explicitly refused.
+        let mut unpublished = planner_state("ready", None);
+        let RemoteRelease::Present(version) = &mut unpublished else {
+            unreachable!()
+        };
+        version.immutable_mismatches = vec!["manifest".into()];
+
+        assert_eq!(
+            release_plan::plan(&planner_local(false), &unpublished).unwrap(),
+            Action::RecordVersion,
+            "an unpublished version with changed bytes must RE-RECORD, not refuse"
+        );
+
+        // THE CONTROL, and the boundary that must never move: the same
+        // mismatch on a PUBLISHED version is still refused outright. Consumers
+        // have pinned those bytes; replacing them changes what an existing
+        // lockfile resolves to.
+        let mut published = planner_state("ready", Some(planner_deploy("artifact", "active")));
+        let RemoteRelease::Present(version) = &mut published else {
+            unreachable!()
+        };
+        version.immutable_mismatches = vec!["manifest".into()];
+        assert!(
+            matches!(
+                release_plan::plan(&planner_local(false), &published),
+                Err(release_plan::PlanError::ImmutableMismatch { .. })
+            ),
+            "a PUBLISHED version was allowed to change its recorded bytes"
+        );
+
+        // A new artifact for an unpublished version uploads rather than
+        // erroring; the same shape published still refuses.
+        let mut swapped = planner_state("ready", None);
+        let RemoteRelease::Present(version) = &mut swapped else {
+            unreachable!()
+        };
+        version.artifact.as_mut().unwrap().sha256 = "f".repeat(64);
+        assert_eq!(
+            release_plan::plan(&planner_local(false), &swapped).unwrap(),
+            Action::UploadArtifact,
+            "an unpublished version must accept replacement artifact bytes"
+        );
+
+        let mut swapped_live = planner_state("ready", Some(planner_deploy("artifact", "active")));
+        let RemoteRelease::Present(version) = &mut swapped_live else {
+            unreachable!()
+        };
+        version.artifact.as_mut().unwrap().sha256 = "f".repeat(64);
+        assert!(
+            matches!(
+                release_plan::plan(&planner_local(false), &swapped_live),
+                Err(release_plan::PlanError::ArtifactMismatch { .. })
+            ),
+            "a PUBLISHED version was allowed to swap its artifact"
+        );
+    }
+
+    #[test]
     fn version_exists_must_be_visible_before_any_second_write() {
         let mut operations = FakeOperations::new(
             vec![RemoteRelease::Absent, RemoteRelease::Absent],
@@ -1924,7 +1992,12 @@ mod release_preparation_tests {
 
     #[test]
     fn bad_remote_state_with_missing_web_performs_zero_writes() {
-        let mut mismatched = planner_state("ready", None);
+        // PUBLISHED: an artifact that disagrees with a version consumers have
+        // already pinned is still a hard stop with zero writes. Unpublished is
+        // now an amend — see an_unpublished_version_may_be_amended_but_a_
+        // published_one_never — so the refusal has to be asserted where it
+        // still applies, or this test would pass by testing nothing.
+        let mut mismatched = planner_state("ready", Some(planner_deploy("artifact", "active")));
         let RemoteRelease::Present(version) = &mut mismatched else {
             unreachable!()
         };
