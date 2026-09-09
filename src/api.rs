@@ -4300,6 +4300,99 @@ pub struct ModuleWebBundle {
 /// pending web bundle for the version and mint its presigned PUT. Takes no
 /// body, for the same reason the artifact leg takes none: anything sent here
 /// would be a caller's claim about bytes the server has not seen.
+fn version_client_endpoint(
+    apps_base: &str,
+    module_id: &str,
+    version_ref: &str,
+    tail: &str,
+) -> String {
+    format!(
+        "{}/v1/modules/{}/versions/{}/client{}",
+        apps_base.trim_end_matches('/'),
+        module_id,
+        version_ref,
+        tail
+    )
+}
+
+/// The presign response for a PUBLISHED version's client (core-v2 #742). Like
+/// the web-bundle twin it carries no expected size or digest: the CLI declares
+/// neither, and the platform reads both off the stored object at finalize.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModuleVersionClientUpload {
+    pub url: String,
+}
+
+/// The finalized identity of a published version's client. `revision` is the
+/// string a consumer pins in mirrorstack.modules.json and that
+/// `apps client install --frozen` compares against, so it is carried in the
+/// exact form it is compared in.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModuleVersionClient {
+    #[serde(default)]
+    pub revision: String,
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub size_bytes: i64,
+}
+
+pub fn create_module_version_client_upload(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+    version_ref: &str,
+) -> Result<ModuleVersionClientUpload, ApiError> {
+    let resp = http
+        .post(version_client_endpoint(
+            apps_base,
+            module_id,
+            version_ref,
+            "",
+        ))
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<ModuleVersionClientUpload>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
+pub fn finalize_module_version_client(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    module_id: &str,
+    version_ref: &str,
+) -> Result<ModuleVersionClient, ApiError> {
+    let resp = http
+        .post(version_client_endpoint(
+            apps_base,
+            module_id,
+            version_ref,
+            "/finalize",
+        ))
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<ModuleVersionClient>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
 pub fn create_module_web_bundle_upload(
     http: &Client,
     apps_base: &str,
