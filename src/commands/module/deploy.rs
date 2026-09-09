@@ -77,6 +77,8 @@ trait ReleaseOperations {
     fn record_version(&mut self) -> Result<MutationOutcome>;
     fn capture_web_bundle(&mut self) -> Result<MutationOutcome>;
     fn upload_artifact(&mut self) -> Result<MutationOutcome>;
+    /// Ship the module client for a version that is not yet deployed.
+    fn ship_client(&mut self) -> Result<()>;
     fn deploy(&mut self, mode: api::ModuleDeployMode) -> Result<MutationOutcome>;
     fn wait_before_deploy_settlement_read(&mut self, _poll: usize) {}
 }
@@ -359,6 +361,16 @@ fn drive_release(
             Action::CaptureWebBundle => operations.capture_web_bundle()?,
             Action::UploadArtifact => operations.upload_artifact()?,
             Action::Deploy => {
+                // 🔴 THE CLIENT SHIPS HERE, NOT WITH THE ARTIFACT. It used to
+                // ride upload_artifact's success branch, which made it
+                // unreachable for any version whose artifact was ALREADY ready
+                // — a resumed or repaired release recorded its version, stored
+                // its Go zip, and then deployed with no client at all, so a
+                // consumer could never close its dev tunnel. Deploy is the one
+                // action every path passes through exactly once, and running it
+                // first means a version is never published missing a client its
+                // module declares.
+                operations.ship_client()?;
                 let mode = deploy_mode_for(&state, local.local_simulation_authorized)?;
                 operations.deploy(mode)?
             }
@@ -707,6 +719,10 @@ fn present_timestamp(value: &Option<String>) -> bool {
 }
 
 impl ReleaseOperations for ApiReleaseOperations<'_> {
+    fn ship_client(&mut self) -> Result<()> {
+        self.upload_version_client()
+    }
+
     fn read_state(&mut self) -> Result<RemoteRelease> {
         let result = with_spinner("Reading owner release state…", || {
             api::get_module_release_state(
@@ -913,11 +929,6 @@ impl ReleaseOperations for ApiReleaseOperations<'_> {
                         .bold()
                 );
                 self.upload_web_bundle()?;
-                // core-v2 #742 — the client rides the same successful upload as
-                // the bundle. Ordered after it deliberately: a module with a UI
-                // but no client is common, the reverse is not, so the more
-                // common leg reports first.
-                self.upload_version_client()?;
                 Ok(MutationOutcome::Applied)
             }
             artifact::ShipOutcome::StorageUnconfigured => {
@@ -1569,6 +1580,9 @@ mod release_preparation_tests {
         attempts: Vec<Action>,
         deploy_modes: Vec<api::ModuleDeployMode>,
         settlement_polls: Vec<usize>,
+        /// Every leg the driver ran, client legs included. `attempts` holds
+        /// planner actions only, so it cannot express where the client shipped.
+        legs: Vec<&'static str>,
     }
 
     impl FakeOperations {
@@ -1579,11 +1593,19 @@ mod release_preparation_tests {
                 attempts: Vec::new(),
                 deploy_modes: Vec::new(),
                 settlement_polls: Vec::new(),
+                legs: Vec::new(),
             }
         }
 
         fn mutate(&mut self, action: Action) -> Result<MutationOutcome> {
             self.attempts.push(action);
+            self.legs.push(match action {
+                Action::RecordVersion => "record",
+                Action::CaptureWebBundle => "capture-web",
+                Action::UploadArtifact => "upload-artifact",
+                Action::Deploy => "deploy",
+                Action::Done => "done",
+            });
             let (expected, outcome) = self
                 .outcomes
                 .pop_front()
@@ -1612,6 +1634,11 @@ mod release_preparation_tests {
 
         fn upload_artifact(&mut self) -> Result<MutationOutcome> {
             self.mutate(Action::UploadArtifact)
+        }
+
+        fn ship_client(&mut self) -> Result<()> {
+            self.legs.push("ship-client");
+            Ok(())
         }
 
         fn deploy(&mut self, mode: api::ModuleDeployMode) -> Result<MutationOutcome> {
@@ -1711,6 +1738,55 @@ mod release_preparation_tests {
             result.attempts,
             vec![Action::UploadArtifact, Action::Deploy]
         );
+    }
+
+    #[test]
+    fn the_client_ships_on_a_resumed_release_and_never_on_a_published_one() {
+        // v1.0.3's exact production shape: version recorded, Go artifact ready,
+        // web bundle pinned, NEVER deployed. Under the old wiring the client
+        // rode upload_artifact's success branch, so this path — the only one a
+        // repaired or resumed release takes — deployed with no client at all
+        // and left a consumer unable to close its dev tunnel.
+        let resumed = planner_state("ready", None);
+        let done = planner_state("ready", Some(planner_deploy("artifact", "active")));
+        let mut operations = FakeOperations::new(
+            vec![resumed, done.clone()],
+            vec![(Action::Deploy, MutationOutcome::Applied)],
+        );
+        drive_release(&mut operations, planner_local(false)).unwrap();
+        assert_eq!(
+            operations.legs,
+            vec!["ship-client", "deploy"],
+            "a resumed release must ship its client, and before it publishes"
+        );
+
+        // A fresh release ships it exactly ONCE, and still before the deploy —
+        // moving the leg must not double it up for the path that always worked.
+        let mut fresh = FakeOperations::new(
+            vec![
+                RemoteRelease::Absent,
+                planner_state("missing", None),
+                planner_state("ready", None),
+                done.clone(),
+            ],
+            vec![
+                (Action::RecordVersion, MutationOutcome::Applied),
+                (Action::UploadArtifact, MutationOutcome::Applied),
+                (Action::Deploy, MutationOutcome::Applied),
+            ],
+        );
+        drive_release(&mut fresh, planner_local(false)).unwrap();
+        assert_eq!(
+            fresh.legs,
+            vec!["record", "upload-artifact", "ship-client", "deploy"]
+        );
+
+        // CONTROL: an already-deployed version is immutable and public. The
+        // driver plans Done, so nothing ships — if this ever records a leg the
+        // change has started rewriting published releases.
+        let mut published = FakeOperations::new(vec![done], vec![]);
+        drive_release(&mut published, planner_local(false)).unwrap();
+        assert!(published.legs.is_empty(), "{:?}", published.legs);
     }
 
     #[test]
