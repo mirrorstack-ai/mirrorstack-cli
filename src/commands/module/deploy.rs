@@ -147,6 +147,31 @@ pub(super) fn run(args: DeployArgs) -> Result<()> {
         return Ok(());
     }
 
+    // 🔴 PREFLIGHT EVERY SHIPPABLE ARTIFACT BEFORE ANY REMOTE MUTATION.
+    //
+    // record_version SEALS the version: its manifest bytes, artifact digest and
+    // web-bundle identity become immutable the instant the platform accepts it
+    // (api-platform migration 088). Every upload happens AFTER that. So a
+    // failure at any later step leaves a recorded, immutable, half-published
+    // version that can never be completed and never be re-cut — the key is
+    // simply gone.
+    //
+    // That is not hypothetical. user-core v1.0.2 and v1.0.3 were both lost this
+    // way on 2026-09-09: v1.0.2 recorded, uploaded its Go artifact, then failed
+    // because nothing had built web/dist; v1.0.3 recorded, uploaded its artifact
+    // AND its web bundle, then failed on the client upload. Pinning an app to
+    // either left that module with no console UI. Two version keys for two
+    // missing local directories, both of which were knowable before a single
+    // byte was sent.
+    //
+    // Checking here costs one stat() per artifact and converts an unrecoverable
+    // remote state into a local error that names the missing build.
+    if let Some(missing) = missing_release_inputs(&dir)? {
+        return Err(anyhow!(
+            "refusing to record {slug}@{version}: {missing}\n\n               A version is sealed the moment it is recorded, and its artifacts upload afterwards — \n               so recording now would burn this version key permanently if the upload then failed.\n               Build the missing output and rerun; nothing has been sent to the platform."
+        ));
+    }
+
     let creds = credentials::load_or_login_hint()?;
     let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
     let client = http::client(Duration::from_secs(15))?;
@@ -2619,4 +2644,29 @@ mod release_preparation_tests {
             "{error:#}"
         );
     }
+}
+
+/// Report what a deployable release candidate is missing locally, or None when
+/// every declared surface has a built artifact.
+///
+/// Deliberately checks the SAME locators the upload steps use, so a preflight
+/// pass and a later upload cannot disagree about what exists. A module that
+/// declares no web project and no client project is complete with neither —
+/// headless modules are normal and must stay deployable.
+fn missing_release_inputs(dir: &Path) -> Result<Option<String>> {
+    let mut missing = Vec::new();
+    // Each locator returns Ok(None) for "surface not declared" and Err for
+    // "declared but not built", which is the distinction that matters here.
+    match web_bundle::locate(dir) {
+        Ok(_) => {}
+        Err(error) => missing.push(format!("web bundle — {error}")),
+    }
+    match version_client::locate(dir) {
+        Ok(_) => {}
+        Err(error) => missing.push(format!("module client — {error}")),
+    }
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(missing.join("\n  ")))
 }
