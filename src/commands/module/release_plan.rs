@@ -113,10 +113,28 @@ pub(super) fn plan(local: &LocalRelease, remote: &RemoteRelease) -> Result<Actio
     let RemoteRelease::Present(version) = remote else {
         return Ok(Action::RecordVersion);
     };
-    if !version.immutable_mismatches.is_empty() {
+    // 🔴 AN UNPUBLISHED VERSION IS AMENDABLE. A version becomes immutable when
+    // it is PUBLISHED — when a deploy row exists — not when it is recorded.
+    // api-platform migration 104 re-anchored the receipt seal to publication
+    // for exactly this case, and the platform still refuses an amend to a
+    // published version, so this is not the only gate.
+    //
+    // Without it a release interrupted after recording could never be
+    // completed OR corrected: the key was spent on bytes that were wrong and
+    // no path existed to replace them. user-core v1.0.2 and v1.0.3 were both
+    // lost that way on 2026-09-09, and the second could not take a platform
+    // fix it needed because its artifact was sealed against a broken SDK.
+    let amendable = version.deploy.is_none();
+    if !version.immutable_mismatches.is_empty() && !amendable {
         return Err(PlanError::ImmutableMismatch {
             fields: version.immutable_mismatches.join(", "),
         });
+    }
+    if !version.immutable_mismatches.is_empty() {
+        // Re-record first: every later step compares against the recorded
+        // evidence, so amending anything else before the record would measure
+        // the new bytes against the old receipt.
+        return Ok(Action::RecordVersion);
     }
     if version.yanked {
         return Err(PlanError::YankedVersion);
@@ -154,6 +172,16 @@ fn plan_artifact_and_deploy(
             "a bound version has no immutable expected artifact receipt".into(),
         )
     })?;
+    // Same rule as the manifest above: an unpublished version may replace the
+    // artifact its record expects. Re-record has already run by this point, so
+    // the receipt names the NEW digest and a mismatch here means the upload
+    // itself still has to happen.
+    if version.deploy.is_none()
+        && (artifact.size_bytes != local.artifact_size_bytes
+            || artifact.sha256 != local.artifact_sha256)
+    {
+        return Ok(Action::UploadArtifact);
+    }
     validate_artifact(local, artifact)?;
     if let Some(deploy) = version.deploy.as_ref() {
         validate_deploy(local, artifact, deploy)?;
@@ -494,7 +522,12 @@ mod tests {
 
     #[test]
     fn immutable_yanked_mismatch_unknown_and_contradictory_states_fail() {
-        let mut mismatch = present(Some(artifact("missing")), None);
+        // 🔴 IMMUTABILITY IS ANCHORED AT PUBLICATION, so the refusal is
+        // asserted on a PUBLISHED version. Before api-platform migration 104
+        // this fixture carried no deploy row and still refused; an unpublished
+        // version is now amendable, which is the whole point of the change, and
+        // that case is covered in deploy.rs's amend test.
+        let mut mismatch = present(Some(artifact("ready")), Some(deploy("artifact", "active")));
         let RemoteRelease::Present(version) = &mut mismatch else {
             unreachable!()
         };
@@ -503,6 +536,16 @@ mod tests {
             plan(&local(), &mismatch),
             Err(PlanError::ImmutableMismatch { .. })
         ));
+
+        // The same mismatch UNPUBLISHED re-records instead of refusing. Pinned
+        // here too so the pair cannot drift apart: if this ever starts
+        // refusing, an interrupted release is unrecoverable again.
+        let mut amendable = present(Some(artifact("ready")), None);
+        let RemoteRelease::Present(version) = &mut amendable else {
+            unreachable!()
+        };
+        version.immutable_mismatches = vec!["manifest".into()];
+        assert_eq!(plan(&local(), &amendable), Ok(Action::RecordVersion));
 
         let mut yanked = present(Some(artifact("missing")), None);
         let RemoteRelease::Present(version) = &mut yanked else {

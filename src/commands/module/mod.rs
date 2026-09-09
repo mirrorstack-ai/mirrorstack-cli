@@ -24,6 +24,7 @@ use crate::http;
 pub(crate) mod artifact;
 pub(crate) mod capabilities;
 mod changelog;
+mod client_publish;
 mod deploy;
 mod init;
 mod readme;
@@ -70,6 +71,11 @@ enum ModuleCommand {
     /// derived by the platform from the module's own identity, never
     /// supplied by the caller.
     Deploy(DeployArgs),
+    /// Publish a version's client library on its own, without re-cutting the
+    /// release. For a version the platform already holds and has NOT deployed:
+    /// the whole-release path ships the client on its way to Deploy, and this
+    /// completes a release that was interrupted after its artifact.
+    ClientPublish(client_publish::ClientPublishArgs),
     /// Move one app's installed module onto another published version of
     /// that module. Forward by default; moving backwards needs an explicit
     /// --allow-downgrade. Omit --to to pick from the published versions.
@@ -143,6 +149,7 @@ pub fn run(args: ModuleArgs) -> Result<()> {
         ModuleCommand::Register(r) => register::run(r),
         ModuleCommand::Rename(r) => rename::run(r),
         ModuleCommand::Deploy(d) => deploy::run(d),
+        ModuleCommand::ClientPublish(c) => client_publish::run(c),
         ModuleCommand::Move(m) => version_move::run(m),
     }
 }
