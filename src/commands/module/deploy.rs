@@ -1460,6 +1460,31 @@ pub(super) fn deploy_error_hint(code: &str) -> &'static str {
     }
 }
 
+/// Report what a deployable release candidate is missing locally, or None when
+/// every declared surface has a built artifact.
+///
+/// Deliberately checks the SAME locators the upload steps use, so a preflight
+/// pass and a later upload cannot disagree about what exists. A module that
+/// declares no web project and no client project is complete with neither —
+/// headless modules are normal and must stay deployable.
+fn missing_release_inputs(dir: &Path) -> Result<Option<String>> {
+    let mut missing = Vec::new();
+    // Each locator returns Ok(None) for "surface not declared" and Err for
+    // "declared but not built", which is the distinction that matters here.
+    match web_bundle::locate(dir) {
+        Ok(_) => {}
+        Err(error) => missing.push(format!("web bundle — {error}")),
+    }
+    match version_client::locate(dir) {
+        Ok(_) => {}
+        Err(error) => missing.push(format!("module client — {error}")),
+    }
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(missing.join("\n  ")))
+}
+
 #[cfg(test)]
 mod release_preparation_tests {
     use super::*;
@@ -2644,29 +2669,4 @@ mod release_preparation_tests {
             "{error:#}"
         );
     }
-}
-
-/// Report what a deployable release candidate is missing locally, or None when
-/// every declared surface has a built artifact.
-///
-/// Deliberately checks the SAME locators the upload steps use, so a preflight
-/// pass and a later upload cannot disagree about what exists. A module that
-/// declares no web project and no client project is complete with neither —
-/// headless modules are normal and must stay deployable.
-fn missing_release_inputs(dir: &Path) -> Result<Option<String>> {
-    let mut missing = Vec::new();
-    // Each locator returns Ok(None) for "surface not declared" and Err for
-    // "declared but not built", which is the distinction that matters here.
-    match web_bundle::locate(dir) {
-        Ok(_) => {}
-        Err(error) => missing.push(format!("web bundle — {error}")),
-    }
-    match version_client::locate(dir) {
-        Ok(_) => {}
-        Err(error) => missing.push(format!("module client — {error}")),
-    }
-    if missing.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(missing.join("\n  ")))
 }
