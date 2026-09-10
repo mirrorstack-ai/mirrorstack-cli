@@ -27,9 +27,9 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Args, ValueEnum};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
+use percent_encoding::percent_decode_str;
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
-use percent_encoding::percent_decode_str;
 use url::Url;
 
 use crate::api::{self, CreateAppDeployInput, DeployFile};
@@ -374,9 +374,10 @@ fn deploy_ssr_with_cap(
     })
     .map_err(|error| creds.deploy_error(error))?;
 
-    let upload = staged.uploads.first().ok_or_else(|| {
-        anyhow!("staging deploy returned no upload for the SSR bundle")
-    })?;
+    let upload = staged
+        .uploads
+        .first()
+        .ok_or_else(|| anyhow!("staging deploy returned no upload for the SSR bundle"))?;
     // Read the key back out of the platform's OWN presigned URL rather than
     // rebuilding "apps/<app>/deploys/<id>/files/<path>" here. That layout is
     // api-platform's private convention; a copy of it in this CLI would be a
