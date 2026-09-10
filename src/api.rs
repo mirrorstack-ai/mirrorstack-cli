@@ -1158,6 +1158,14 @@ pub struct CreateAppDeployInput<'a> {
     /// (server default: `"static"`) for today's static-export deploys.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<&'a str>,
+    /// The S3 key of an ALREADY-UPLOADED standalone bundle, required when
+    /// `runtime == "ssr"`.
+    ///
+    /// 🔴 THE PLATFORM HEADS THIS KEY BEFORE PROVISIONING, so the artifact has
+    /// to be in S3 *before* the ssr deploy is created — which is why an ssr
+    /// deploy is two create calls, not one. See `deploy_ssr_with_cap`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssr_artifact_key: Option<&'a str>,
     pub files: &'a [DeployFile<'a>],
 }
 
@@ -3481,6 +3489,7 @@ mod tests {
                 env: "prod",
                 note: Some("first ship"),
                 runtime: None,
+                ssr_artifact_key: None,
                 files: &[DeployFile {
                     path: "index.html",
                     size: 5,
@@ -3529,6 +3538,7 @@ mod tests {
                 env: "prod",
                 note: None,
                 runtime: Some("ssr"),
+                ssr_artifact_key: None,
                 files: &[DeployFile {
                     path: "ssr-bundle.zip",
                     size: 9,
@@ -3563,6 +3573,7 @@ mod tests {
                 env: "prod",
                 note: None,
                 runtime: None,
+                ssr_artifact_key: None,
                 files: &[DeployFile {
                     path: "index.html",
                     size: 5,

@@ -27,8 +27,10 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Args, ValueEnum};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
+use percent_encoding::percent_decode_str;
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
+use url::Url;
 
 use crate::api::{self, CreateAppDeployInput, DeployFile};
 use crate::commands::{DEFAULT_APPS_API_BASE, ENV_APPS_API_URL, ok_mark, resolve_base};
@@ -256,6 +258,7 @@ fn deploy_static(
                     env: &args.env,
                     note: args.note.as_deref(),
                     runtime: None,
+                    ssr_artifact_key: None,
                     files: &file_inputs,
                 },
             )
@@ -337,9 +340,67 @@ fn deploy_ssr_with_cap(
         size,
         sha256: &sha256,
     }];
-    // `runtime: "ssr"` tells the platform this deploy's one file is a
-    // Lambda bundle, not a static-file manifest entry — see the PR
-    // description for the request-shape assumption this rests on.
+
+    // 🔴 AN SSR DEPLOY IS TWO CREATE CALLS, AND THE ORDER IS FORCED BY THE
+    // PLATFORM. api-platform HEADs `ssr_artifact_key` and provisions the Lambda
+    // from it INSIDE CreateDeploy, so the bundle must already be in S3 before
+    // the ssr deploy exists. The only way to put it there is a presigned PUT,
+    // and presigned PUTs come FROM a create call. One call cannot satisfy both
+    // halves, which is why sending `runtime: "ssr"` with a declared file and no
+    // key failed every time with
+    //
+    //   deploy_runtime_invalid: ssr runtime requires an ssr_artifact_key
+    //
+    // So: a staging create (static, the default) mints the key and the PUT, the
+    // bundle uploads, and the ssr create then points at the uploaded object.
+    // The staging row is never finalized or activated — it exists only to own
+    // an app-scoped S3 key, and an unfinalized deploy is inert.
+    let staged = with_spinner("Staging SSR bundle…", || {
+        creds.with_retry(|tok| {
+            api::create_app_deploy(
+                client,
+                apps_base,
+                tok,
+                &app.id,
+                &CreateAppDeployInput {
+                    env: &args.env,
+                    note: args.note.as_deref(),
+                    runtime: None,
+                    ssr_artifact_key: None,
+                    files: &file_inputs,
+                },
+            )
+        })
+    })
+    .map_err(|error| creds.deploy_error(error))?;
+
+    let upload = staged
+        .uploads
+        .first()
+        .ok_or_else(|| anyhow!("staging deploy returned no upload for the SSR bundle"))?;
+    // Read the key back out of the platform's OWN presigned URL rather than
+    // rebuilding "apps/<app>/deploys/<id>/files/<path>" here. That layout is
+    // api-platform's private convention; a copy of it in this CLI would be a
+    // second source of truth that breaks silently the day the platform changes
+    // it, and the failure would be a 403 or a not-found blaming the artifact.
+    let artifact_key = artifact_key_from_presigned(&upload.url)?;
+
+    let bundle_file = ManifestFile {
+        rel_path: "ssr-bundle.zip".to_string(),
+        abs_path: zip_path,
+        size,
+        sha256,
+    };
+    let upload_client = http::client(UPLOAD_TIMEOUT)?;
+    upload_all(
+        &upload_client,
+        &staged.uploads,
+        std::slice::from_ref(&bundle_file),
+    )?;
+    // `_bundle_dir` (the temp dir backing `bundle_file.abs_path`) stays
+    // alive through the upload above by still being in scope here.
+
+    // Now the object exists, so the platform can Head it and provision from it.
     let created = with_spinner("Creating deploy…", || {
         creds.with_retry(|tok| {
             api::create_app_deploy(
@@ -351,29 +412,47 @@ fn deploy_ssr_with_cap(
                     env: &args.env,
                     note: args.note.as_deref(),
                     runtime: Some("ssr"),
-                    files: &file_inputs,
+                    ssr_artifact_key: Some(&artifact_key),
+                    // Empty on purpose: an ssr deploy's Lambda code lives at
+                    // ssr_artifact_key, not in the file manifest, and declaring
+                    // the bundle again would ask for a second upload of bytes
+                    // that are already in S3.
+                    files: &[],
                 },
             )
         })
     })
     .map_err(|error| creds.deploy_error(error))?;
 
-    let bundle_file = ManifestFile {
-        rel_path: "ssr-bundle.zip".to_string(),
-        abs_path: zip_path,
-        size,
-        sha256,
-    };
-    let upload_client = http::client(UPLOAD_TIMEOUT)?;
-    upload_all(
-        &upload_client,
-        &created.uploads,
-        std::slice::from_ref(&bundle_file),
-    )?;
-    // `_bundle_dir` (the temp dir backing `bundle_file.abs_path`) stays
-    // alive through the upload above by still being in scope here.
-
     finish_deploy(args, app, creds, apps_base, client, &created.deploy_id)
+}
+
+/// Extract the S3 object key from a presigned PUT URL.
+///
+/// The key is the URL path minus its leading slash, percent-decoded — S3
+/// presigns encode the key into the path, so this recovers exactly the object
+/// the platform told us to write to. Query parameters (the signature) are
+/// dropped.
+fn artifact_key_from_presigned(url: &str) -> Result<String> {
+    let parsed = Url::parse(url).with_context(|| format!("parse presigned URL {url}"))?;
+    // Decode per SEGMENT, then rejoin. `url` hands back segments still
+    // percent-encoded, and decoding the whole path in one pass would turn an
+    // encoded "/" INSIDE a segment into a separator — a different key from the
+    // one S3 signed. Segment-wise decoding cannot, because the split happened
+    // first.
+    let key = parsed
+        .path_segments()
+        .map(|segments| {
+            segments
+                .map(|segment| percent_decode_str(segment).decode_utf8_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .unwrap_or_default();
+    if key.is_empty() {
+        return Err(anyhow!("presigned URL {url} carries no object key"));
+    }
+    Ok(key)
 }
 
 /// Shared tail for both runtimes: finalize the already-uploaded deploy,
@@ -1138,5 +1217,41 @@ mod tests {
         assert!(message.contains("staging"), "{message}");
         assert!(message.contains("prod"), "{message}");
         assert!(!message.contains("grant-secret"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod ssr_artifact_key_tests {
+    use super::artifact_key_from_presigned;
+
+    // 🔴 THE KEY COMES FROM THE PLATFORM'S OWN PRESIGNED URL, never from a copy
+    // of its layout. api-platform builds "apps/<app>/deploys/<id>/files/<path>"
+    // privately; rebuilding that string here would be a second source of truth
+    // that breaks silently the day it changes, surfacing as a not-found on the
+    // artifact rather than as the version skew it is.
+    #[test]
+    fn reads_the_key_out_of_the_signed_path() {
+        let url = "https://bucket.s3.ap-northeast-1.amazonaws.com/apps/a722a8a8/deploys/ddab4c68/files/ssr-bundle.zip?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=deadbeef";
+        assert_eq!(
+            artifact_key_from_presigned(url).unwrap(),
+            "apps/a722a8a8/deploys/ddab4c68/files/ssr-bundle.zip"
+        );
+    }
+
+    // A percent-encoded segment must come back as the literal key S3 signed,
+    // or the Head that gates provisioning looks for an object that isn't there.
+    #[test]
+    fn decodes_encoded_segments() {
+        let url = "https://bucket.s3.amazonaws.com/apps/x/deploys/y/files/ssr%20bundle.zip?X-Amz-Signature=x";
+        assert_eq!(
+            artifact_key_from_presigned(url).unwrap(),
+            "apps/x/deploys/y/files/ssr bundle.zip"
+        );
+    }
+
+    #[test]
+    fn rejects_a_url_with_no_key() {
+        assert!(artifact_key_from_presigned("https://bucket.s3.amazonaws.com/").is_err());
+        assert!(artifact_key_from_presigned("not a url").is_err());
     }
 }

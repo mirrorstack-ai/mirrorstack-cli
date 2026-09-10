@@ -644,6 +644,7 @@ mod tests {
             env: "prod",
             note: None,
             runtime: None,
+            ssr_artifact_key: None,
             files: &[],
         };
 
