@@ -119,3 +119,11 @@ MIRRORSTACK_API_URL=http://localhost:8081 \
 MIRRORSTACK_WEB_URL=http://localhost:3000 \
 cargo run -- login
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+[Apache-2.0](LICENSE)
