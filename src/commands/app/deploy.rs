@@ -438,16 +438,35 @@ fn upload_ssr_artifact(
 
     let presigned = match presigned {
         Ok(presigned) => presigned,
-        // 🔴 FALL BACK ON A MISSING ROUTE, NEVER ON A MISSING APP. Both are
-        // 404s, and only the BODY tells them apart: an unrouted path gets
-        // chi's plain-text "404 page not found" (ApiError::Unexpected), while
-        // a real missing or non-owned app gets the JSON envelope
-        // (ApiError::Server, code `not_found`). Matching on the status alone
-        // would send an app-not-found down the staging path to fail again,
-        // several steps later, blaming the artifact.
-        Err(ApiError::Unexpected { status: 404, .. }) => {
+        // 🔴 A PLATFORM WITHOUT THIS ROUTE ANSWERS 401, NOT 404. Under
+        // `/v1/apps` the platform AUTHENTICATES BEFORE IT ROUTES, so a path it
+        // does not serve is refused by the auth middleware and never reaches
+        // chi's not-found handler. Measured against production:
+        //
+        //   POST /v1/apps/<app>/deploys/zzz-not-a-route/qqq → 401 JSON token_missing
+        //   POST /v1/apps/<app>/deploys                     → 401 JSON token_missing
+        //   POST /v1/definitely-not-a-service/zzz           → 404 text/plain
+        //
+        // Only OUTSIDE the authenticated subtree does an unknown path 404.
+        // This code first shipped falling back on the plain-text 404 alone,
+        // which was verified against a bare chi router in a unit test and is
+        // simply not what the deployed stack does — every SSR deploy against a
+        // platform without the route died reporting "the OIDC deploy grant
+        // expired or was revoked", which was neither true nor actionable.
+        //
+        // So 401 is ambiguous here — "no such route" and "bad credential" are
+        // the same response — and no amount of inspecting it will say which.
+        // Rather than guess, TRY THE OTHER PATH AND LET ITS ANSWER DECIDE: a
+        // missing route means the legacy staging create succeeds, while a dead
+        // credential means it fails the same way and ITS error is the one the
+        // caller sees. Correct either way, and it cannot mistake one for the
+        // other, because it never has to tell them apart.
+        //
+        // A 404 still falls back too: it is what a platform outside the
+        // authenticated subtree would answer, and what the unit tests cover.
+        Err(ApiError::Unauthenticated) | Err(ApiError::Unexpected { status: 404, .. }) => {
             eprintln!(
-                "  {} this platform has no SSR artifact presign route yet; using the legacy staging upload (bundles are capped at 25 MB until it ships)",
+                "  {} the platform did not accept the SSR artifact presign; trying the legacy staging upload (bundles are capped at 25 MB on that path)",
                 style("note:").yellow()
             );
             return stage_ssr_artifact_legacy(args, app, creds, apps_base, client, bundle);
@@ -1279,6 +1298,128 @@ mod tests {
         assert!(
             !captured.lock().expect("captured mutex").is_empty(),
             "the bundle never reached the legacy staging upload"
+        );
+    }
+
+    /// 🔴 THE REGRESSION. The deployed platform authenticates BEFORE it routes
+    /// under `/v1/apps`, so a platform without the presign route answers 401,
+    /// not chi's plain-text 404. Falling back only on the 404 made every SSR
+    /// deploy against such a platform die reporting an expired OIDC grant.
+    #[test]
+    fn deploy_ssr_falls_back_when_an_unknown_route_is_refused_by_auth_as_401() {
+        let dir = TempDir::new().unwrap();
+        ssr_fixture(dir.path());
+        let (upload_url, captured) = spawn_upload_capture();
+
+        let mut server = Server::new();
+        // Exactly what /v1/apps answers for a path it does not serve.
+        let _presign = server
+            .mock("POST", "/v1/apps/a-1/deploys/ssr-artifact/presign")
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({"error": {"code": "token_missing", "message": "authorization header required"}})
+                    .to_string(),
+            )
+            .create();
+        let _stage = server
+            .mock("POST", "/v1/apps/a-1/deploys")
+            .match_body(mockito::Matcher::Regex(r#""files":\[\{"#.to_string()))
+            .with_status(201)
+            .with_body(
+                json!({
+                    "deploy_id": "staging",
+                    "uploads": [{
+                        "path": "ssr-bundle.zip",
+                        "url": format!("{upload_url}/apps/a-1/deploys/staging/files/ssr-bundle.zip"),
+                        "headers": {}
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        let _create = server
+            .mock("POST", "/v1/apps/a-1/deploys")
+            .match_body(mockito::Matcher::Regex(r#""runtime":"ssr""#.to_string()))
+            .with_status(201)
+            .with_body(json!({"deploy_id": "d-1", "uploads": []}).to_string())
+            .create();
+        let _finalize = server
+            .mock("POST", "/v1/apps/a-1/deploys/d-1/finalize")
+            .with_status(200)
+            .with_body(json!({"status": "ready"}).to_string())
+            .create();
+        let _activate = server
+            .mock("POST", "/v1/apps/a-1/stages/prod/activate")
+            .with_status(200)
+            .with_body(json!({"active_deploy_id": "d-1"}).to_string())
+            .create();
+
+        let client = http::client(Duration::from_secs(15)).unwrap();
+        deploy_ssr(
+            &test_args(),
+            dir.path(),
+            &test_app(),
+            &mut test_creds(),
+            &server.url(),
+            &client,
+        )
+        .expect("a 401 from an unrouted presign must fall back, not abort");
+
+        assert!(
+            !captured.lock().expect("captured mutex").is_empty(),
+            "the bundle never reached the legacy staging upload"
+        );
+    }
+
+    /// The other half of that ambiguity: when the credential really IS dead,
+    /// BOTH calls 401 and the caller must still be told so. The fallback never
+    /// has to tell the two apart — it lets the second call answer.
+    #[test]
+    fn deploy_ssr_reports_the_credential_when_the_fallback_is_refused_too() {
+        let dir = TempDir::new().unwrap();
+        ssr_fixture(dir.path());
+
+        let mut server = Server::new();
+        let _presign = server
+            .mock("POST", "/v1/apps/a-1/deploys/ssr-artifact/presign")
+            .with_status(401)
+            .with_body(
+                json!({"error": {"code": "invalid_token", "message": "invalid token"}}).to_string(),
+            )
+            .create();
+        let staging = server
+            .mock("POST", "/v1/apps/a-1/deploys")
+            // at_least(1), not exactly 1: a user credential refreshes and
+            // retries once on 401, so the count is the auth layer's business.
+            // What matters is that the fallback was ATTEMPTED at all.
+            .expect_at_least(1)
+            .with_status(401)
+            .with_body(
+                json!({"error": {"code": "invalid_token", "message": "invalid token"}}).to_string(),
+            )
+            .create();
+
+        let client = http::client(Duration::from_secs(15)).unwrap();
+        let err = deploy_ssr(
+            &test_args(),
+            dir.path(),
+            &test_app(),
+            &mut test_creds(),
+            &server.url(),
+            &client,
+        )
+        .expect_err("a dead credential must still fail");
+
+        // The staging attempt is what turns the ambiguous 401 into a verdict,
+        // so it must actually have been made.
+        staging.assert();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("session")
+                || rendered.contains("expired")
+                || rendered.contains("invalid"),
+            "the credential failure was not reported: {rendered}"
         );
     }
 
