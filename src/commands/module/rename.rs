@@ -225,7 +225,7 @@ fn validate_rename(from: &str, to: &str) -> Result<()> {
 /// Find the nearest `go.work` at or above the module directory. A module with
 /// no workspace ancestor owns its own `.env`, matching deploy's standalone
 /// metadata rule.
-fn workspace_root(module_dir: &Path) -> PathBuf {
+pub(super) fn workspace_root(module_dir: &Path) -> PathBuf {
     module_dir
         .ancestors()
         .find(|dir| dir.join("go.work").is_file())

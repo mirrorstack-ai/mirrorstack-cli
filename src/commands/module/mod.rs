@@ -27,9 +27,10 @@ mod changelog;
 mod deploy;
 mod init;
 mod readme;
+mod redeploy;
 mod register;
 mod release_plan;
-mod rename;
+pub(super) mod rename;
 mod scaffold;
 pub(crate) mod version_client;
 mod version_move;
@@ -70,6 +71,14 @@ enum ModuleCommand {
     /// derived by the platform from the module's own identity, never
     /// supplied by the caller.
     Deploy(DeployArgs),
+    /// Re-provision a version that is ALREADY deployed, recording nothing.
+    ///
+    /// The platform writes a module Lambda's injected environment — its
+    /// per-module credential, its dispatch URL — only when the version is
+    /// deployed, so this is the verb for wanting just that. Unlike `deploy` it
+    /// records no version and uploads no artifact: it re-deploys the artifact
+    /// already released for the version you name.
+    Redeploy(redeploy::RedeployArgs),
     /// Move one app's installed module onto another published version of
     /// that module. Forward by default; moving backwards needs an explicit
     /// --allow-downgrade. Omit --to to pick from the published versions.
@@ -143,6 +152,7 @@ pub fn run(args: ModuleArgs) -> Result<()> {
         ModuleCommand::Register(r) => register::run(r),
         ModuleCommand::Rename(r) => rename::run(r),
         ModuleCommand::Deploy(d) => deploy::run(d),
+        ModuleCommand::Redeploy(r) => redeploy::run(r),
         ModuleCommand::Move(m) => version_move::run(m),
     }
 }
