@@ -1544,7 +1544,52 @@ pub(crate) fn web_pipeline(web_dir: &Path, watch: bool) -> Option<WebPipeline> {
         .then_some(WebPipeline::LegacyEsbuild)
 }
 
-/// `npm install --silent` then the discovered module-owned script or legacy
+/// The install step for a module's `web/`, as a command nobody has run yet.
+///
+/// 🔴 pnpm, NOT npm, AND THE DIFFERENCE IS NOT COSMETIC. Every module's `web/`
+/// carries `pnpm-lock.yaml` and no `package-lock.json`: npm ignores that
+/// lockfile, resolves the tree afresh, and leaves a `package-lock.json` behind
+/// in the module's source. Worse, npm does not read the `pnpm` block in
+/// package.json — and a module depends on it. ai-assistant declares
+///
+///     "pnpm": { "supportedArchitectures": { "os": ["current", "linux"], … } }
+///
+/// so that the Linux dev runner, which bind-mounts this very `node_modules`,
+/// finds esbuild's linux-arm64 binary next to the host's darwin one. Installed
+/// with npm, that binary is absent and the runner fails to start esbuild — far
+/// from here, with nothing pointing back at the installer.
+///
+/// `--frozen-lockfile` only when a lockfile is present: a module scaffolded
+/// without one would otherwise be refused by pnpm instead of installed.
+fn web_install_command(web_dir: &Path) -> Command {
+    let mut cmd = Command::new("pnpm");
+    cmd.arg("install");
+    if web_dir.join("pnpm-lock.yaml").is_file() {
+        cmd.arg("--frozen-lockfile");
+    }
+    cmd.arg("--silent");
+    cmd
+}
+
+/// The build/watch step, as a command nobody has run yet. A declared script
+/// runs through pnpm for the same reason the install does — the script bodies
+/// themselves say `pnpm build:css && …`, so pnpm is already required on PATH.
+fn web_pipeline_command(pipeline: WebPipeline, watch: bool) -> Command {
+    match pipeline {
+        WebPipeline::DeclaredScript(script) => {
+            let mut c = Command::new("pnpm");
+            c.args(["run", script]);
+            c
+        }
+        WebPipeline::LegacyEsbuild => {
+            let mut c = Command::new("node");
+            c.args(web_build_args(watch));
+            c
+        }
+    }
+}
+
+/// `pnpm install` then the discovered module-owned script or legacy
 /// esbuild config. Watch mode selects the declared `watch` script (or adds
 /// `--watch` to the legacy config); one-shot mode selects `build`. Output is
 /// prefixed `[<slug>:web]` and stays terminal-only.
@@ -1558,15 +1603,21 @@ fn spawn_web_builder(
     stop: Arc<AtomicBool>,
 ) {
     thread::spawn(move || {
-        let install = Command::new("npm")
-            .args(["install", "--silent"])
+        let install = web_install_command(&web_dir)
             .current_dir(&web_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
         if !matches!(install, Ok(s) if s.success()) {
+            // Name what actually starts. The old text said "starting esbuild
+            // anyway" on a path where the declared script is what runs, so an
+            // operator reading the line went looking at the wrong stage.
+            let next = match pipeline {
+                WebPipeline::DeclaredScript(script) => script,
+                WebPipeline::LegacyEsbuild => "esbuild",
+            };
             eprintln!(
-                "{} {slug}: npm install failed — starting esbuild anyway",
+                "{} {slug}: pnpm install failed — starting {next} anyway",
                 warn_prefix()
             );
         }
@@ -1576,19 +1627,9 @@ fn spawn_web_builder(
         let label: &'static str = Box::leak(format!("{slug}:web").into_boxed_str());
         // Prefer the module's own script so every stage it declares runs, not
         // just the esbuild one. LR_PORT is set on the parent, so it reaches
-        // esbuild through npm exactly as it did when we spawned node directly.
-        let mut cmd = match pipeline {
-            WebPipeline::DeclaredScript(script) => {
-                let mut c = Command::new("npm");
-                c.args(["run", script]);
-                c
-            }
-            WebPipeline::LegacyEsbuild => {
-                let mut c = Command::new("node");
-                c.args(web_build_args(watch));
-                c
-            }
-        };
+        // esbuild through the script runner exactly as it did when we spawned
+        // node directly.
+        let mut cmd = web_pipeline_command(pipeline, watch);
         let spawned = cmd
             .current_dir(&web_dir)
             .env("LR_PORT", lr_port.to_string())
@@ -2163,6 +2204,77 @@ mod tests {
         .unwrap();
         assert_eq!(declared_web_script(tmp.path(), false), None);
         assert_eq!(web_pipeline(tmp.path(), false), None);
+    }
+
+    /// 🔴 THE INSTALLER MUST BE pnpm, AND THIS TEST IS THE ONLY THING SAYING SO.
+    /// npm "works" here — it installs a tree, the build runs, the terminal looks
+    /// healthy — while ignoring `pnpm-lock.yaml` and, more sharply, the `pnpm`
+    /// block in package.json. ai-assistant declares
+    /// `pnpm.supportedArchitectures` so the Linux dev runner's bind-mounted
+    /// node_modules carries esbuild's linux-arm64 binary; with npm that binary
+    /// is simply absent and esbuild fails to start INSIDE the container, with
+    /// nothing pointing back at the installer. Nothing else in this repo would
+    /// notice the regression.
+    #[test]
+    fn the_web_installer_is_pnpm_and_honours_a_present_lockfile() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // No lockfile: install, but do not demand a frozen one — pnpm refuses
+        // --frozen-lockfile when there is nothing to freeze, which would turn a
+        // freshly scaffolded module into a failed dev start.
+        let loose = web_install_command(tmp.path());
+        assert_eq!(loose.get_program(), "pnpm");
+        let args: Vec<_> = loose
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["install", "--silent"]);
+
+        // With a lockfile: install exactly what it pins.
+        std::fs::write(
+            tmp.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n",
+        )
+        .unwrap();
+        let frozen = web_install_command(tmp.path());
+        assert_eq!(frozen.get_program(), "pnpm");
+        let args: Vec<_> = frozen
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["install", "--frozen-lockfile", "--silent"]);
+    }
+
+    /// The declared script runs through pnpm too. The script BODIES say
+    /// `pnpm build:css && …`, so a module's pipeline already requires pnpm on
+    /// PATH; running the outer script with npm only splits the toolchain in
+    /// half for no gain.
+    #[test]
+    fn a_declared_script_runs_through_pnpm_and_the_legacy_path_still_runs_node() {
+        let declared = web_pipeline_command(WebPipeline::DeclaredScript("watch"), true);
+        assert_eq!(declared.get_program(), "pnpm");
+        let args: Vec<_> = declared
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["run", "watch"]);
+
+        // The fallback is unchanged: it must keep working for modules
+        // scaffolded before the scripts existed.
+        let legacy = web_pipeline_command(WebPipeline::LegacyEsbuild, true);
+        assert_eq!(legacy.get_program(), "node");
+        let args: Vec<_> = legacy
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["esbuild.config.mjs", "--watch"]);
+
+        let legacy_once = web_pipeline_command(WebPipeline::LegacyEsbuild, false);
+        let args: Vec<_> = legacy_once
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(args, vec!["esbuild.config.mjs"]);
     }
 
     #[test]
