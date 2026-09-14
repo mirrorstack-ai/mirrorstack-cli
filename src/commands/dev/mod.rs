@@ -58,6 +58,7 @@ pub(crate) mod client;
 mod cron;
 mod log_shipper;
 pub(crate) mod module_meta;
+pub(crate) mod preview;
 mod proxy;
 pub(crate) mod release_session;
 mod reload;
