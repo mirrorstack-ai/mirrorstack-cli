@@ -968,6 +968,83 @@ pub fn list_app_installs(
     Err(unexpected_body_error(resp))
 }
 
+/// One installed module's live serving state, as returned by
+/// `GET /v1/dispatch/apps/{appId}/modules/status`.
+///
+/// 🔴 THIS IS THE ONLY READ-ONLY SOURCE OF A MODULE'S LIVE VERSION. The
+/// owner-scoped `/v1/modules` family exposes RECORDED and PUBLISHED versions
+/// but never the transport row, so the version a module is actually serving is
+/// reachable only here — it is an app-scoped serving fact, not a module
+/// property, because resolution runs through the app's installed version.
+/// `serving_version` comes straight off that row (`module_deploys` joined to
+/// `module_versions`), preference-ordered active → draining → disabled, so it
+/// is the semver string a re-provision takes as `--version`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppModuleStatus {
+    pub module_id: String,
+    /// True while the module is served by a live `mirrorstack dev` tunnel.
+    /// A tunnel does not replace the deploy row: both can be present, and the
+    /// tunnel wins for routing.
+    #[serde(default)]
+    pub tunnel_online: bool,
+    #[serde(default)]
+    pub local_url: String,
+    /// The version the TUNNEL session declares — present only while one is
+    /// connected, and unrelated to what is deployed.
+    #[serde(default)]
+    pub version: String,
+    /// `active` | `draining` | `disabled`, or `none` for a module that has
+    /// never been deployed. Never empty.
+    #[serde(default)]
+    pub deploy_status: String,
+    /// The semver the transport row points at. Empty when `deploy_status` is
+    /// `none`.
+    #[serde(default)]
+    pub serving_version: String,
+    #[serde(default)]
+    pub installs: u32,
+}
+
+/// GET /v1/dispatch/apps/{appId}/modules/status — every module installed in
+/// the app with its live serving state, batched in one call.
+///
+/// Scoped to app MEMBERSHIP (viewer and up), deliberately not to module
+/// ownership: an operator who can see the app can see what it is serving.
+/// `app_id` must be the app UUID. A non-member and an unknown app both answer
+/// 404, so this returns `Ok(None)` for either rather than pretending to know
+/// which.
+pub fn list_app_module_status(
+    http: &Client,
+    dispatch_base: &str,
+    access_token: &str,
+    app_id: &str,
+) -> Result<Option<Vec<AppModuleStatus>>, ApiError> {
+    let endpoint = format!(
+        "{}/v1/dispatch/apps/{}/modules/status",
+        dispatch_base.trim_end_matches('/'),
+        app_id
+    );
+
+    let resp = http
+        .get(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(Some(resp.json::<Vec<AppModuleStatus>>()?));
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(unexpected_body_error(resp))
+}
+
 /// One published version of a module, as returned by
 /// `GET /v1/modules/{moduleId}/version-history`. The changelog map the
 /// platform also returns is deliberately not modelled — the CLI lists
