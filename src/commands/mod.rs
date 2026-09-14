@@ -96,6 +96,13 @@ enum Command {
     /// Run modules locally with supporting services. Scans go.work for
     /// monorepo mode; falls back to single-module if only main.go exists.
     Dev(dev::DevArgs),
+    /// Serve a module's review harness on localhost — its real settings or
+    /// nav surface in the console's own frame, answered from fixtures.
+    ///
+    /// No platform, no database, no container: `dev` runs the module, this
+    /// renders the page. Needs a `preview` script in the module's
+    /// web/package.json.
+    Preview(dev::preview::PreviewArgs),
 }
 
 impl Cli {
@@ -108,6 +115,7 @@ impl Cli {
             Command::Apps(args) => app::run(args),
             Command::Module(args) => module::run(args),
             Command::Dev(args) => dev::run(args),
+            Command::Preview(args) => dev::preview::run(args),
         }
     }
 }
