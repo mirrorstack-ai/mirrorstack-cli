@@ -143,31 +143,41 @@ fn join(statuses: Vec<api::AppModuleStatus>, installs: Vec<api::AppInstall>) -> 
                     .filter(|slug| !slug.is_empty())
                     .unwrap_or_else(|| s.module_id.clone()),
                 module_id: s.module_id.clone(),
-                installed: install.map(|i| i.installed_version.clone()).unwrap_or_default(),
+                installed: install
+                    .map(|i| i.installed_version.clone())
+                    .unwrap_or_default(),
                 serving: s.serving_version,
                 status: s.deploy_status,
                 // A live tunnel declares its OWN version, which is not
                 // what is deployed and is frequently ahead of it — that
                 // difference is the reason to print it rather than just
                 // "online".
-                tunnel: s.tunnel_online.then(|| {
-                    match (s.version.as_str(), s.local_url.as_str()) {
+                tunnel: s
+                    .tunnel_online
+                    .then(|| match (s.version.as_str(), s.local_url.as_str()) {
                         ("", "") => "online".to_string(),
                         ("", url) => url.to_string(),
                         (ver, "") => format!("online {ver}"),
                         (ver, url) => format!("{ver} @ {url}"),
-                    }
-                }),
+                    }),
                 installs: s.installs,
             }
         })
         .collect();
-    rows.sort_by(|a, b| a.slug.cmp(&b.slug).then_with(|| a.module_id.cmp(&b.module_id)));
+    rows.sort_by(|a, b| {
+        a.slug
+            .cmp(&b.slug)
+            .then_with(|| a.module_id.cmp(&b.module_id))
+    });
     rows
 }
 
 fn print_table(app_slug: &str, rows: &[Row]) {
-    println!("{} — {} installed modules\n", style(app_slug).bold(), rows.len());
+    println!(
+        "{} — {} installed modules\n",
+        style(app_slug).bold(),
+        rows.len()
+    );
     println!(
         "  {:22} {:11} {:11} {:9} {}",
         style("MODULE").dim(),
@@ -194,7 +204,11 @@ fn print_table(app_slug: &str, rows: &[Row]) {
         println!(
             "  {:22} {:11} {:11} {:9} {}",
             r.slug,
-            if r.installed.is_empty() { "—" } else { &r.installed },
+            if r.installed.is_empty() {
+                "—"
+            } else {
+                &r.installed
+            },
             serving,
             status,
             r.tunnel.as_deref().unwrap_or("")
@@ -314,7 +328,10 @@ mod tests {
             ],
         );
         let reversed_order: Vec<&str> = reversed.iter().map(|r| r.slug.as_str()).collect();
-        assert_eq!(reversed_order, order, "the join's order depends on arrival order");
+        assert_eq!(
+            reversed_order, order,
+            "the join's order depends on arrival order"
+        );
     }
 
     /// A module in the status list but absent from the install list still has
@@ -324,13 +341,26 @@ mod tests {
     #[test]
     fn a_module_missing_from_the_install_list_still_appears_and_sorts() {
         let rows = join(
-            vec![status("zz-orphan", "1.0.0", "active"), status("id-ai", "1.0.0", "active")],
+            vec![
+                status("zz-orphan", "1.0.0", "active"),
+                status("id-ai", "1.0.0", "active"),
+            ],
             vec![install("id-ai", "ai-assistant", "1.0.0")],
         );
-        assert_eq!(rows.len(), 2, "an unjoined module was dropped from the report");
+        assert_eq!(
+            rows.len(),
+            2,
+            "an unjoined module was dropped from the report"
+        );
         assert_eq!(rows[0].slug, "ai-assistant");
-        assert_eq!(rows[1].slug, "zz-orphan", "fell back to something other than the id");
-        assert_eq!(rows[1].installed, "", "invented a pin for a module with no install row");
+        assert_eq!(
+            rows[1].slug, "zz-orphan",
+            "fell back to something other than the id"
+        );
+        assert_eq!(
+            rows[1].installed, "",
+            "invented a pin for a module with no install row"
+        );
     }
 
     /// `deploy_status: none` is a real, expected state — a tunnel-only module
@@ -355,7 +385,10 @@ mod tests {
     fn app_not_visible_names_both_causes_without_choosing() {
         let err = app_not_visible("twkpa-edu").to_string();
         assert!(err.contains("does not exist"), "{err}");
-        assert!(err.contains("not a \nmember") || err.contains("not a member"), "{err}");
+        assert!(
+            err.contains("not a \nmember") || err.contains("not a member"),
+            "{err}"
+        );
         assert!(err.contains("twkpa-edu"), "{err}");
     }
 
