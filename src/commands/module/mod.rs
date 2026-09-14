@@ -32,6 +32,7 @@ mod register;
 mod release_plan;
 pub(super) mod rename;
 mod scaffold;
+mod transports;
 pub(crate) mod version_client;
 mod version_move;
 pub(crate) mod web_bundle;
@@ -79,6 +80,14 @@ enum ModuleCommand {
     /// records no version and uploads no artifact: it re-deploys the artifact
     /// already released for the version you name.
     Redeploy(redeploy::RedeployArgs),
+    /// Report what each module installed in an app is actually SERVING.
+    ///
+    /// Read-only, and the read half of a re-stamp: `redeploy` requires
+    /// --version because it must never guess which version is live, and this
+    /// is where that version comes from. App-scoped because transport
+    /// resolution runs through the app's installed version, so "what is this
+    /// module serving" is only answerable per app.
+    Transports(transports::TransportsArgs),
     /// Move one app's installed module onto another published version of
     /// that module. Forward by default; moving backwards needs an explicit
     /// --allow-downgrade. Omit --to to pick from the published versions.
@@ -153,6 +162,7 @@ pub fn run(args: ModuleArgs) -> Result<()> {
         ModuleCommand::Rename(r) => rename::run(r),
         ModuleCommand::Deploy(d) => deploy::run(d),
         ModuleCommand::Redeploy(r) => redeploy::run(r),
+        ModuleCommand::Transports(t) => transports::run(t),
         ModuleCommand::Move(m) => version_move::run(m),
     }
 }
