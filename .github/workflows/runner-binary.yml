@@ -20,9 +20,22 @@ permissions:
 jobs:
   runner-binary:
     name: Build (aarch64-musl)
-    # ARM64 because the artifact must be an aarch64 ELF, and the org's
-    # self-hosted runners carry self-hosted/Linux/ARM64/docker/dgx-spark.
-    runs-on: [self-hosted, dgx-spark]
+    # 🔴 THE ORG VARIABLE, NOT A HARDCODED LABEL SET. This asked for
+    # [self-hosted, dgx-spark] and sat queued for 70 minutes: the runners carry
+    # that label, but nothing else in the org requests it, and the autoscaler
+    # sizes the pool from the runner list rather than from the queue — so a job
+    # no live convention serves creates no pressure and waits forever.
+    #
+    # `vars.RUNNER_LABELS` is ["self-hosted","ARM64"] today and every other
+    # self-hosted job in the org resolves through it, which is the point: the
+    # label set has changed more than once and a workflow that names it
+    # literally goes stale silently. The fallback is GitHub-hosted ARM64, which
+    # also satisfies this job — it needs aarch64 and docker, both of which
+    # ubuntu-24.04-arm has.
+    #
+    # I hardcoded dgx-spark by copying the pinned submodule checkouts, which are
+    # days behind; api-platform's main has used this expression for a while.
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS || '["ubuntu-24.04-arm"]') }}
     timeout-minutes: 30 # a cold build measured 1m40s locally; generous for a contended runner
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
