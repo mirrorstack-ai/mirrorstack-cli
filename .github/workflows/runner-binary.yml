@@ -1,0 +1,87 @@
+# 🔴 THE DEV TUNNEL'S LINUX RUNNER, BUILT IN CI INSTEAD OF ON A LAPTOP.
+#
+# `mirrorstack dev --tunnel` bind-mounts a `.mirrorstack-linux` binary into its
+# container, and client.rs compares the host CLI's version to that binary's by
+# EXACT STRING. They are one pair: when the host CLI moves, that file must move
+# with it or the next tunnel RESTART dies on the skew — while an already-running
+# tunnel keeps serving, which is what hides the skew until the worst moment.
+#
+# Its own file rather than a job in ci.yml: ci.yml runs on every push and PR,
+# and a dispatch-only job sitting inside it is a job every reader has to check
+# the `if:` of. Nothing here shares a step with the CI jobs.
+name: Dev tunnel runner binary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runner-binary:
+    name: Build (aarch64-musl)
+    # ARM64 because the artifact must be an aarch64 ELF, and the org's
+    # self-hosted runners carry self-hosted/Linux/ARM64/docker/dgx-spark.
+    runs-on: [self-hosted, dgx-spark]
+    timeout-minutes: 30 # a cold build measured 1m40s locally; generous for a contended runner
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # A runner labelled dgx-spark that is not actually aarch64 would produce a
+      # working binary for the wrong machine, and the tunnel would then fail at
+      # exec with a message about the file format, not about this build.
+      - name: Refuse a non-aarch64 runner
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          [ "$arch" = "aarch64" ] || { echo "::error::runner is $arch, not aarch64"; exit 1; }
+
+      # The same pinned image ms-app-modules' scripts/build-dev-runner.sh uses,
+      # so a CI build and a local build cannot drift. Checkout and upload run on
+      # the HOST, never inside it: alpine has no glibc, so the JS actions cannot
+      # execute there.
+      - name: Build in the pinned rust:alpine image
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          "${CONTAINER_CLI}" run --rm \
+            --volume "$PWD:/src:ro" \
+            --volume "$PWD/out:/out" \
+            --workdir /src \
+            "${RUST_ALPINE}" \
+            sh -c '
+              set -eu
+              apk add --no-cache musl-dev >/dev/null
+              rustup target add aarch64-unknown-linux-musl >/dev/null
+              CARGO_TARGET_DIR=/tmp/target cargo build --locked --release \
+                --target aarch64-unknown-linux-musl
+              cp /tmp/target/aarch64-unknown-linux-musl/release/mirrorstack /out/mirrorstack-linux
+              chmod 0755 /out/mirrorstack-linux
+            '
+        env:
+          CONTAINER_CLI: docker
+          RUST_ALPINE: rust:1.96-alpine@sha256:a41f7740f8b45d45795624eec13a8b42263cc700f19f7e4e86e04d3dda08a479
+
+      # A green build says a file was written. These say WHAT was written: a
+      # dynamically linked binary runs on this runner and dies inside the
+      # tunnel's container, which is the exact failure this job exists to stop.
+      - name: Assert a static aarch64 ELF, and name its version
+        run: |
+          set -euo pipefail
+          file out/mirrorstack-linux | tee elf.txt
+          grep -q 'ELF 64-bit LSB .*ARM aarch64' elf.txt \
+            || { echo "::error::not an aarch64 ELF"; exit 1; }
+          grep -qE 'statically linked|static-pie linked' elf.txt \
+            || { echo "::error::not statically linked — it will not exec in the tunnel container"; exit 1; }
+          # The version string IS the pair: printing it lets whoever swaps the
+          # file check it against the host CLI instead of assuming they match.
+          ./out/mirrorstack-linux --version | tee version.txt
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: mirrorstack-linux-aarch64-musl
+          path: |
+            out/mirrorstack-linux
+            version.txt
+          if-no-files-found: error
+          retention-days: 14
