@@ -13,6 +13,15 @@ name: Dev tunnel runner binary
 
 on:
   workflow_dispatch:
+    inputs:
+      runner:
+        description: "Where to build"
+        required: false
+        default: "self-hosted"
+        type: choice
+        options:
+          - self-hosted
+          - github-arm
 
 permissions:
   contents: read
@@ -35,7 +44,20 @@ jobs:
     #
     # I hardcoded dgx-spark by copying the pinned submodule checkouts, which are
     # days behind; api-platform's main has used this expression for a while.
-    runs-on: ${{ fromJSON(vars.RUNNER_LABELS || '["ubuntu-24.04-arm"]') }}
+    # 🔴 THE SELF-HOSTED POOL CAN BE PRESENT AND STILL NOT SERVE THIS JOB.
+    # Measured 2026-09-16: four dgx-spark runners online and IDLE, carrying
+    # exactly self-hosted+ARM64, this job queued 30 minutes with those labels
+    # and never assigned — while ms-app-modules ran on the same runners with the
+    # same labels 20 minutes earlier. The label set was not the cause after all.
+    #
+    # So the build no longer depends on diagnosing that: `runner: github-arm`
+    # dispatches it onto GitHub-hosted aarch64, which satisfies the job's two
+    # real needs (aarch64 and docker) and cannot be starved by the pool. The
+    # default stays self-hosted so normal runs cost nothing.
+    runs-on: >-
+      ${{ inputs.runner == 'github-arm'
+          && fromJSON('["ubuntu-24.04-arm"]')
+          || fromJSON(vars.RUNNER_LABELS || '["ubuntu-24.04-arm"]') }}
     timeout-minutes: 30 # a cold build measured 1m40s locally; generous for a contended runner
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
