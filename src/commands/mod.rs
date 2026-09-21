@@ -46,6 +46,24 @@ pub(crate) const ENV_DISPATCH_URL: &str = "MIRRORSTACK_DISPATCH_URL";
 /// GitHub Actions OIDC audience used for app deploy-grant exchange.
 pub(crate) const ENV_OIDC_AUDIENCE: &str = "MIRRORSTACK_OIDC_AUDIENCE";
 
+static DOTENV: std::sync::OnceLock<(std::path::PathBuf, Vec<String>)> = std::sync::OnceLock::new();
+
+/// Remember the `.env` that was loaded and the keys it actually supplied.
+pub(crate) fn record_dotenv(path: std::path::PathBuf, keys: Vec<String>) {
+    let _ = DOTENV.set((path, keys));
+}
+
+/// Where `env_var`'s current value came from, or `None` when it is unset.
+pub(crate) fn env_source(env_var: &str) -> Option<String> {
+    std::env::var_os(env_var)?;
+    Some(match DOTENV.get() {
+        Some((path, keys)) if keys.iter().any(|k| k == env_var) => {
+            format!(".env file {}", path.display())
+        }
+        _ => "the process environment".to_string(),
+    })
+}
+
 /// Look up a base URL from `env_var`, falling back to `default` when unset.
 pub(crate) fn resolve_base(env_var: &str, default: &str) -> String {
     std::env::var(env_var).unwrap_or_else(|_| default.into())

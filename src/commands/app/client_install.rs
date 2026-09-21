@@ -1044,7 +1044,11 @@ fn write_owner_manifest(owner_dir: &Path, owner: &str) -> Result<()> {
 /// message hid.
 fn not_found_error(app: &str, apps_base: &str, env_override: Option<String>) -> anyhow::Error {
     let source = match env_override {
-        Some(v) => format!("{ENV_APPS_API_URL}={v}"),
+        Some(v) => format!(
+            "{ENV_APPS_API_URL}={v} from {}",
+            crate::commands::env_source(ENV_APPS_API_URL)
+                .unwrap_or_else(|| "the process environment".into())
+        ),
         None => "the default".to_string(),
     };
     anyhow!(
