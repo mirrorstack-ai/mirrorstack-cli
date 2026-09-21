@@ -1038,6 +1038,21 @@ fn write_owner_manifest(owner_dir: &Path, owner: &str) -> Result<()> {
     Ok(())
 }
 
+/// The "app not found" message, naming the endpoint that answered 404 and
+/// where the base came from: a stray `.env` (found by walking up from the cwd)
+/// can point `MIRRORSTACK_APPS_API_URL` somewhere that 404s, which the bare
+/// message hid.
+fn not_found_error(app: &str, apps_base: &str, env_override: Option<String>) -> anyhow::Error {
+    let source = match env_override {
+        Some(v) => format!("{ENV_APPS_API_URL}={v}"),
+        None => "the default".to_string(),
+    };
+    anyhow!(
+        "app '{app}' not found (or you are not a member): GET {}/v1/apps/{app} returned 404 (base from {source})",
+        apps_base.trim_end_matches('/')
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1817,19 +1832,18 @@ mod tests {
             "this bundle is bound to a different app than the one you meant"
         )));
     }
-}
 
-/// The "app not found" message, naming the endpoint that answered 404 and
-/// where the base came from: a stray `.env` (found by walking up from the cwd)
-/// can point `MIRRORSTACK_APPS_API_URL` somewhere that 404s, which the bare
-/// message hid.
-fn not_found_error(app: &str, apps_base: &str, env_override: Option<String>) -> anyhow::Error {
-    let source = match env_override {
-        Some(v) => format!("{ENV_APPS_API_URL}={v}"),
-        None => "the default".to_string(),
-    };
-    anyhow!(
-        "app '{app}' not found (or you are not a member): GET {}/v1/apps/{app} returned 404 (base from {source})",
-        apps_base.trim_end_matches('/')
-    )
+    #[test]
+    fn not_found_names_endpoint_and_default_source() {
+        let m = super::not_found_error("a", "https://x.test/", None).to_string();
+        assert!(m.contains("GET https://x.test/v1/apps/a returned 404"));
+        assert!(m.contains("the default"));
+    }
+
+    #[test]
+    fn not_found_names_env_override() {
+        let m = super::not_found_error("a", "https://x.test", Some("https://x.test".into()))
+            .to_string();
+        assert!(m.contains("MIRRORSTACK_APPS_API_URL=https://x.test"));
+    }
 }
