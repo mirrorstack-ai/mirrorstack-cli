@@ -225,9 +225,10 @@ fn resolve_app_and_auth(
             let app = match user.with_retry(|tok| api::get_app(client, apps_base, tok, &args.app)) {
                 Ok(Some(app)) => app,
                 Ok(None) => {
-                    return Err(anyhow!(
-                        "app '{}' not found (or you are not a member)",
-                        args.app
+                    return Err(not_found_error(
+                        &args.app,
+                        apps_base,
+                        std::env::var(ENV_APPS_API_URL).ok(),
                     ));
                 }
                 Err(ApiError::Unauthenticated) => return Err(session_expired()),
@@ -1816,4 +1817,19 @@ mod tests {
             "this bundle is bound to a different app than the one you meant"
         )));
     }
+}
+
+/// The "app not found" message, naming the endpoint that answered 404 and
+/// where the base came from: a stray `.env` (found by walking up from the cwd)
+/// can point `MIRRORSTACK_APPS_API_URL` somewhere that 404s, which the bare
+/// message hid.
+fn not_found_error(app: &str, apps_base: &str, env_override: Option<String>) -> anyhow::Error {
+    let source = match env_override {
+        Some(v) => format!("{ENV_APPS_API_URL}={v}"),
+        None => "the default".to_string(),
+    };
+    anyhow!(
+        "app '{app}' not found (or you are not a member): GET {}/v1/apps/{app} returned 404 (base from {source})",
+        apps_base.trim_end_matches('/')
+    )
 }
