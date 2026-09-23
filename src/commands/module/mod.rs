@@ -6,7 +6,7 @@
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Subcommand};
@@ -308,6 +308,38 @@ where
     let result = f();
     pb.finish_and_clear();
     result
+}
+
+/// Report a deploy phase as a durable start/finish pair when a user can see
+/// stderr. Piped output retains the existing quiet-spinner behavior.
+fn with_timeline_step<T, E, F>(message: &str, f: F) -> std::result::Result<T, E>
+where
+    F: FnOnce() -> std::result::Result<T, E>,
+{
+    if !std::io::stderr().is_terminal() {
+        return with_spinner(message, f);
+    }
+
+    let started = Instant::now();
+    eprintln!("  {} {message}…", style("→").cyan());
+    match f() {
+        Ok(value) => {
+            eprintln!(
+                "  {} {message} ({:.1}s)",
+                ok_mark(),
+                started.elapsed().as_secs_f64()
+            );
+            Ok(value)
+        }
+        Err(error) => {
+            eprintln!(
+                "  {} {message} failed ({:.1}s)",
+                warn_prefix(),
+                started.elapsed().as_secs_f64()
+            );
+            Err(error)
+        }
+    }
 }
 
 /// Same regex as the platform service and api-client-shared:
