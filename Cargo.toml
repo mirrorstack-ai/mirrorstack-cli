@@ -40,6 +40,11 @@ flate2 = "1"
 tar = "0.4"
 fs2 = "0.4"
 libc = "0.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+postgres = "0.19"
+tokio-postgres-rustls = "0.13"
+hmac = "0.12"
+uuid = { version = "1", features = ["v5"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_JobObjects", "Win32_System_Threading"] }

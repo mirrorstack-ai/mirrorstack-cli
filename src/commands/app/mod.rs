@@ -21,6 +21,7 @@ use super::{
 mod client_install;
 mod deploy;
 mod deploy_auth;
+mod import;
 mod ssr;
 
 #[derive(Args)]
