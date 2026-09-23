@@ -167,7 +167,10 @@ fn connect(src: &Source) -> Result<Client> {
 /// watermark minus the 10-minute overlap (§5); `None` is the first, full run.
 pub fn extract(src: &Source, window_from: Option<&str>) -> Result<Snapshot> {
     if !valid_schema(&src.schema) {
-        return Err(anyhow!("alpha schema {:?} is not a schema name", src.schema));
+        return Err(anyhow!(
+            "alpha schema {:?} is not a schema name",
+            src.schema
+        ));
     }
     let mut client = connect(src)?;
     // Belt and braces: the role is read-only (§3.1), the session and the
@@ -182,9 +185,7 @@ pub fn extract(src: &Source, window_from: Option<&str>) -> Result<Snapshot> {
         "SET LOCAL statement_timeout = '30s'; SET LOCAL search_path TO {}",
         src.schema
     ))?;
-    let snapshot_at: String = tx
-        .query_one(concat!("SELECT ", ts!("now()")), &[])?
-        .get(0);
+    let snapshot_at: String = tx.query_one(concat!("SELECT ", ts!("now()")), &[])?.get(0);
     let from = window_from.map(str::to_string);
     let to = Some(snapshot_at.clone());
     let win = [&from as &(dyn ToSql + Sync), &to];

@@ -27,6 +27,8 @@ pub enum Refusal {
     KeyLength(usize),
     MissingObject(String),
     NoHls,
+    /// S3 failed mid-copy; the next run retries the video.
+    CopyFailed(String),
 }
 
 impl Refusal {
@@ -42,6 +44,7 @@ impl Refusal {
             Refusal::KeyLength(_) => "key_not_16_bytes",
             Refusal::MissingObject(_) => "media_missing_object",
             Refusal::NoHls => "hls_missing",
+            Refusal::CopyFailed(_) => "media_copy_failed",
         }
     }
 }
@@ -53,7 +56,8 @@ impl std::fmt::Display for Refusal {
             | Refusal::QualityNotAllowed(s)
             | Refusal::Plaintext(s)
             | Refusal::BadSegment(s)
-            | Refusal::MissingObject(s) => write!(f, "{} ({s})", self.reason()),
+            | Refusal::MissingObject(s)
+            | Refusal::CopyFailed(s) => write!(f, "{} ({s})", self.reason()),
             Refusal::KeyLength(n) => write!(f, "{} ({n} bytes)", self.reason()),
             _ => f.write_str(self.reason()),
         }
@@ -131,7 +135,9 @@ pub fn variant_files(q: &str, src: &str) -> Result<Vec<String>, Refusal> {
         return Err(Refusal::Plaintext(q.to_string()));
     }
     if files.is_empty() {
-        return Err(Refusal::MissingObject(format!("{q}/index.m3u8 lists no segments")));
+        return Err(Refusal::MissingObject(format!(
+            "{q}/index.m3u8 lists no segments"
+        )));
     }
     Ok(files)
 }
@@ -219,7 +225,10 @@ mod tests {
         assert!(m.text.contains("\n144p/index.m3u8\n"));
         assert!(m.text.contains("\n1080p/index.m3u8\n"));
         assert!(!m.text.contains("original"));
-        assert!(m.text.contains("#EXT-X-STREAM-INF:BANDWIDTH=300000,RESOLUTION=256x144"));
+        assert!(
+            m.text
+                .contains("#EXT-X-STREAM-INF:BANDWIDTH=300000,RESOLUTION=256x144")
+        );
         assert!(m.text.ends_with('\n'));
     }
 
@@ -255,16 +264,28 @@ mod tests {
     #[test]
     fn variant_refusals() {
         let plain = "#EXTM3U\n#EXTINF:6,\nindex_00001.ts\n";
-        assert_eq!(variant_files("720p", plain), Err(Refusal::Plaintext("720p".into())));
+        assert_eq!(
+            variant_files("720p", plain),
+            Err(Refusal::Plaintext("720p".into()))
+        );
         let none = "#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:6,\nindex_00001.ts\n";
-        assert!(matches!(variant_files("720p", none), Err(Refusal::Plaintext(_))));
+        assert!(matches!(
+            variant_files("720p", none),
+            Err(Refusal::Plaintext(_))
+        ));
         let url = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"k\"\n#EXTINF:6,\nhttps://cdn/x.ts\n";
-        assert!(matches!(variant_files("720p", url), Err(Refusal::BadSegment(_))));
+        assert!(matches!(
+            variant_files("720p", url),
+            Err(Refusal::BadSegment(_))
+        ));
     }
 
     #[test]
     fn layout_maps_alpha_names_onto_v2() {
-        let l = Layout::new("apps/k/video-abc/hls/", "_gated/videos/u/transcodes/alpha-import");
+        let l = Layout::new(
+            "apps/k/video-abc/hls/",
+            "_gated/videos/u/transcodes/alpha-import",
+        );
         assert_eq!(
             l.master(),
             (

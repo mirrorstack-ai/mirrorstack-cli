@@ -51,14 +51,22 @@ impl Maps {
 
     pub fn validate(&self) -> Result<()> {
         if uuid::Uuid::parse_str(&self.import_actor).is_err() {
-            return Err(anyhow!("import_actor must be the V2 user id of the import actor"));
+            return Err(anyhow!(
+                "import_actor must be the V2 user id of the import actor"
+            ));
         }
         for (alpha, mode) in &self.visibility {
             if !matches!(mode.as_str(), "public" | "auth" | "credit") {
-                return Err(anyhow!("visibility.{alpha}: {mode:?} is not public, auth or credit"));
+                return Err(anyhow!(
+                    "visibility.{alpha}: {mode:?} is not public, auth or credit"
+                ));
             }
         }
-        if let Some(r) = self.roles.keys().find(|r| self.approval_states.contains_key(*r)) {
+        if let Some(r) = self
+            .roles
+            .keys()
+            .find(|r| self.approval_states.contains_key(*r))
+        {
             return Err(anyhow!("{r} is in both roles and approval_states"));
         }
         Ok(())

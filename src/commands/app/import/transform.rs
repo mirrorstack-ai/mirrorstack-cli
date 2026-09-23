@@ -151,7 +151,10 @@ pub fn video_plan(v: &AlphaVideo) -> VideoPlan {
         alpha_hls_prefix: v.s3_hls_prefix.trim_end_matches('/').to_string(),
         v2_hls_prefix: format!("_gated/videos/{id}/transcodes/{IMPORT_JOB}"),
         alpha_cover,
-        v2_cover_key: format!("videos/{id}/manual-covers/{}/cover.{cover_ext}", token("cover")),
+        v2_cover_key: format!(
+            "videos/{id}/manual-covers/{}/cover.{cover_ext}",
+            token("cover")
+        ),
         alpha_source_key: Some(v.s3_source_key.clone()).filter(|k| !k.is_empty()),
         v2_source_key: format!(
             "videos/{id}/sources/{}/source.{}",
@@ -168,6 +171,8 @@ pub enum MediaOutcome {
         rungs: Vec<String>,
         /// The original exists with a non-zero size (D-2).
         original: bool,
+        /// A cover (or MediaConvert's frame grab) was copied.
+        cover: bool,
     },
     Refused(Refusal),
 }
@@ -248,8 +253,12 @@ pub fn dependents(snap: &Snapshot, ctx: &Ctx, plan: &mut Plan) {
             continue;
         }
         let vp = video_plan(v);
-        let (rungs, original) = match ctx.media.get(&v.id) {
-            Some(MediaOutcome::Ready { rungs, original }) => (rungs, *original),
+        let (rungs, original, cover) = match ctx.media.get(&v.id) {
+            Some(MediaOutcome::Ready {
+                rungs,
+                original,
+                cover,
+            }) => (rungs, *original, *cover),
             Some(MediaOutcome::Refused(r)) => {
                 plan.except("video", &v.id, r.reason());
                 continue;
@@ -262,20 +271,23 @@ pub fn dependents(snap: &Snapshot, ctx: &Ctx, plan: &mut Plan) {
         if !original {
             plan.except("video_original", &v.id, "original_missing");
         }
+        if !cover {
+            plan.except("video_cover", &v.id, "cover_missing");
+        }
         imported.insert(&v.id, v);
         let id = vp.v2_id.to_string();
         let instructor = Some(v.instructor.trim()).filter(|n| !n.is_empty());
         let instructor_id = instructor.map(|n| instructor_id(n).to_string());
-        if let (Some(name), Some(iid)) = (instructor, &instructor_id) {
-            if instructors.insert(iid.clone()) {
-                plan.push(
-                    "instructor",
-                    TargetRow::new(
-                        iid.clone(),
-                        json!({"id": iid, "name": name, "bio": v.instructor_bio}),
-                    ),
-                );
-            }
+        if let (Some(name), Some(iid)) = (instructor, &instructor_id)
+            && instructors.insert(iid.clone())
+        {
+            plan.push(
+                "instructor",
+                TargetRow::new(
+                    iid.clone(),
+                    json!({"id": iid, "name": name, "bio": v.instructor_bio}),
+                ),
+            );
         }
         plan.push(
             "video",
@@ -298,7 +310,7 @@ pub fn dependents(snap: &Snapshot, ctx: &Ctx, plan: &mut Plan) {
                     "publishedRenditions": rungs,
                     "publishedRenditionsKnown": true,
                     "version": 1,
-                    "coverKey": vp.v2_cover_key,
+                    "coverKey": cover.then_some(&vp.v2_cover_key),
                     "instructorId": instructor_id,
                 }),
             ),
@@ -316,7 +328,11 @@ pub fn dependents(snap: &Snapshot, ctx: &Ctx, plan: &mut Plan) {
         categories_policy(v, &id, ctx.maps, plan);
     }
 
-    let video = |alpha: &str| imported.get(alpha).map(|v| (video_id(&v.id).to_string(), *v));
+    let video = |alpha: &str| {
+        imported
+            .get(alpha)
+            .map(|v| (video_id(&v.id).to_string(), *v))
+    };
     let user = |alpha: &str| ctx.user_ids.get(alpha).cloned();
 
     plan.read("video_entitlement", snap.unlocks.len());
@@ -430,7 +446,11 @@ fn profile_roles(u: &AlphaUser, ctx: &Ctx, plan: &mut Plan) {
                 fields.insert(target.clone(), v);
             }
             None if maps.profile_fields.contains_key(&k) => {}
-            None => plan.except("user_profile", format!("{}/{k}", u.id), "unmapped_profile_field"),
+            None => plan.except(
+                "user_profile",
+                format!("{}/{k}", u.id),
+                "unmapped_profile_field",
+            ),
         }
     }
     if !fields.is_empty() {
@@ -482,7 +502,11 @@ fn profile_roles(u: &AlphaUser, ctx: &Ctx, plan: &mut Plan) {
 }
 
 fn sections(v: &AlphaVideo, id: &str, plan: &mut Plan) {
-    let list = match serde_json::from_str::<Value>(if v.sections.is_empty() { "[]" } else { &v.sections }) {
+    let list = match serde_json::from_str::<Value>(if v.sections.is_empty() {
+        "[]"
+    } else {
+        &v.sections
+    }) {
         Ok(Value::Array(list)) => list,
         _ => return plan.except("video_section", &v.id, "sections_not_a_list"),
     };
@@ -490,14 +514,21 @@ fn sections(v: &AlphaVideo, id: &str, plan: &mut Plan) {
     let video = Uuid::parse_str(id).unwrap_or_default();
     for (pos, section) in list.into_iter().enumerate() {
         let Value::Object(mut fields) = section else {
-            plan.except("video_section", format!("{}/{pos}", v.id), "section_not_an_object");
+            plan.except(
+                "video_section",
+                format!("{}/{pos}", v.id),
+                "section_not_an_object",
+            );
             continue;
         };
         let sid = Uuid::new_v5(&video, pos.to_string().as_bytes()).to_string();
         fields.insert("id".into(), json!(sid));
         fields.insert("videoId".into(), json!(id));
         fields.insert("position".into(), json!(pos));
-        plan.push("video_section", TargetRow::new(format!("{}/{pos}", v.id), Value::Object(fields)));
+        plan.push(
+            "video_section",
+            TargetRow::new(format!("{}/{pos}", v.id), Value::Object(fields)),
+        );
     }
 }
 
