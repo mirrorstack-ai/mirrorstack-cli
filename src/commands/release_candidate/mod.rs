@@ -150,49 +150,108 @@ impl ReleaseCandidate {
 }
 
 pub(crate) fn build(request: CandidateRequest<'_>) -> Result<ReleaseCandidate> {
-    build_with(&SystemRunner, request)
+    build_with_progress(request, |_, _| {})
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BuildPhase {
+    Snapshot,
+    ReplaceCheck,
+    ManifestProbe,
+    WebInstall,
+    WebBuild,
+    GoBuild,
+}
+
+impl BuildPhase {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Snapshot => "Snapshot",
+            Self::ReplaceCheck => "Replace check",
+            Self::ManifestProbe => "Manifest probe",
+            Self::WebInstall => "Web install",
+            Self::WebBuild => "Web build",
+            Self::GoBuild => "Go build",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BuildPhaseStatus {
+    Started,
+    Finished,
+    Failed,
+}
+
+pub(crate) fn build_with_progress(
+    request: CandidateRequest<'_>,
+    mut progress: impl FnMut(BuildPhase, BuildPhaseStatus),
+) -> Result<ReleaseCandidate> {
+    build_with_progress_runner(&SystemRunner, request, &mut progress)
+}
+
+#[cfg(test)]
 fn build_with(
     runner: &dyn ProcessRunner,
     request: CandidateRequest<'_>,
 ) -> Result<ReleaseCandidate> {
-    let source = SourceSnapshot::create(request.module_dir)?;
-    let replace_view = source.fresh_view("replace-check")?;
-    let replace_go = GoEnvironment::new("replace-check")?;
-    validate_local_replaces(runner, &replace_view, &replace_go)?;
-    replace_view
-        .verify_inputs()
-        .context("release candidate: local-replace inspection changed its frozen phase inputs")?;
+    build_with_progress_runner(runner, request, &mut |_, _| {})
+}
 
-    let manifest_view = source.fresh_view("manifest")?;
-    let manifest_go = GoEnvironment::new("manifest")?;
-    let (manifest_evidence, manifest) = run_manifest_probe(
-        runner,
-        &manifest_view.module_dir(),
-        &manifest_go,
-        source.source_sha256(),
-        request.source_version_key,
-        request.module_id,
-    )?;
-    validate_manifest_identity(&manifest, request.module_id, request.slug)?;
-    manifest_view
-        .verify_inputs()
-        .context("release candidate: SDK manifest probe changed its frozen phase inputs")?;
+fn build_with_progress_runner(
+    runner: &dyn ProcessRunner,
+    request: CandidateRequest<'_>,
+    progress: &mut dyn FnMut(BuildPhase, BuildPhaseStatus),
+) -> Result<ReleaseCandidate> {
+    let source = run_build_phase(progress, BuildPhase::Snapshot, || {
+        SourceSnapshot::create(request.module_dir)
+    })?;
+    // One isolated environment serves this candidate only. It deliberately
+    // never inherits the developer's Go caches, but lets the manifest probe
+    // warm modules and compiled packages for the artifact build.
+    let go = GoEnvironment::new()?;
+
+    run_build_phase(progress, BuildPhase::ReplaceCheck, || {
+        let replace_view = source.fresh_view("replace-check")?;
+        validate_local_replaces(runner, &replace_view, &go)?;
+        replace_view
+            .verify_inputs()
+            .context("release candidate: local-replace inspection changed its frozen phase inputs")
+    })?;
+
+    let (manifest_evidence, manifest) =
+        run_build_phase(progress, BuildPhase::ManifestProbe, || {
+            let manifest_view = source.fresh_view("manifest")?;
+            let manifest = run_manifest_probe(
+                runner,
+                &manifest_view.module_dir(),
+                &go,
+                source.source_sha256(),
+                request.source_version_key,
+                request.module_id,
+            )?;
+            validate_manifest_identity(&manifest.1, request.module_id, request.slug)?;
+            manifest_view
+                .verify_inputs()
+                .context("release candidate: SDK manifest probe changed its frozen phase inputs")?;
+            Ok(manifest)
+        })?;
 
     let web_view = source.fresh_web_view()?;
-    let web = build_web(runner, &web_view, &request, &manifest)?;
+    let web = build_web(runner, &web_view, &request, &manifest, progress)?;
     web_view
         .verify_inputs()
         .context("release candidate: web build changed its frozen canonical inputs")?;
 
-    let artifact_view = source.fresh_view("artifact")?;
-    let artifact_go = GoEnvironment::new("artifact")?;
     let (artifact_dir, artifact_path, artifact_evidence) =
-        build_linux_artifact(runner, &artifact_view.module_dir(), &artifact_go)?;
-    artifact_view
-        .verify_inputs()
-        .context("release candidate: Go build changed its frozen phase inputs")?;
+        run_build_phase(progress, BuildPhase::GoBuild, || {
+            let artifact_view = source.fresh_view("artifact")?;
+            let artifact = build_linux_artifact(runner, &artifact_view.module_dir(), &go)?;
+            artifact_view
+                .verify_inputs()
+                .context("release candidate: Go build changed its frozen phase inputs")?;
+            Ok(artifact)
+        })?;
 
     source.verify_unchanged().context(
         "release candidate: live source changed during manifest/web/artifact preparation",
@@ -216,6 +275,24 @@ fn build_with(
         artifact_path,
         _receipt_path: receipt_path,
     })
+}
+
+fn run_build_phase<T>(
+    progress: &mut dyn FnMut(BuildPhase, BuildPhaseStatus),
+    phase: BuildPhase,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    progress(phase, BuildPhaseStatus::Started);
+    let result = operation();
+    progress(
+        phase,
+        if result.is_ok() {
+            BuildPhaseStatus::Finished
+        } else {
+            BuildPhaseStatus::Failed
+        },
+    );
+    result
 }
 
 #[derive(Deserialize)]
@@ -405,6 +482,7 @@ fn build_web(
     view: &BuildView,
     request: &CandidateRequest<'_>,
     manifest: &serde_json::Value,
+    progress: &mut dyn FnMut(BuildPhase, BuildPhaseStatus),
 ) -> Result<Option<WebEvidence>> {
     let module_dir = view.module_dir();
     let web_dir = module_dir.join("web");
@@ -427,27 +505,37 @@ fn build_web(
 
     let manager = package_manager(&web_dir)?;
     web_dependencies::validate(view, &web_dir, manager)?;
-    let install = web_spec(manager.program(), &web_dir, manager)
+    let pnpm_store = match manager {
+        PackageManager::Pnpm => Some(pnpm_store_dir(&web_dir)?),
+        PackageManager::Npm(_) => None,
+    };
+    let install = web_spec(manager.program(), &web_dir, manager, pnpm_store.as_deref())?
         // Dependency installation needs the module's devDependencies (the
         // shared CSS compiler and esbuild live there), independent of an
         // ambient production shell.
         .env("NODE_ENV", "development")
-        .args(manager.install_args())
+        .args(manager.install_args(pnpm_store.as_deref())?)
         .timeout(Duration::from_secs(600))
         .limits(1024 * 1024, 1024 * 1024);
-    run_checked(runner, &install, "frozen web dependency install")?;
+    run_build_phase(progress, BuildPhase::WebInstall, || {
+        run_checked(runner, &install, "frozen web dependency install")
+    })?;
 
     let build = match pipeline {
-        WebPipeline::DeclaredScript(script) => web_spec(manager.program(), &web_dir, manager)
-            .env("NODE_ENV", "production")
-            .args(manager.run_args(script)),
-        WebPipeline::LegacyEsbuild => web_spec("node", &web_dir, manager)
+        WebPipeline::DeclaredScript(script) => {
+            web_spec(manager.program(), &web_dir, manager, pnpm_store.as_deref())?
+                .env("NODE_ENV", "production")
+                .args(manager.run_args(script))
+        }
+        WebPipeline::LegacyEsbuild => web_spec("node", &web_dir, manager, pnpm_store.as_deref())?
             .env("NODE_ENV", "production")
             .args([OsString::from("esbuild.config.mjs")]),
     }
     .timeout(Duration::from_secs(600))
     .limits(1024 * 1024, 1024 * 1024);
-    run_checked(runner, &build, "one-shot web release build")?;
+    run_build_phase(progress, BuildPhase::WebBuild, || {
+        run_checked(runner, &build, "one-shot web release build")
+    })?;
 
     let dist = web_dir.join("dist/index.js");
     let dist_relative = dist.strip_prefix(view.root()).map_err(|_| {
@@ -554,36 +642,50 @@ impl PackageManager {
         }
     }
 
-    fn install_args(self) -> Vec<OsString> {
+    fn install_args(self, pnpm_store: Option<&Path>) -> Result<Vec<OsString>> {
         match self {
-            Self::Pnpm => [
-                "install",
-                "--frozen-lockfile",
-                "--prod=false",
-                "--ignore-scripts=false",
-                "--ignore-workspace",
-                "--ignore-pnpmfile",
-                "--lockfile=true",
-                "--lockfile-dir=.",
-                "--merge-git-branch-lockfiles=false",
-                "--fix-lockfile=false",
-                "--modules-dir=node_modules",
-                "--virtual-store-dir=node_modules/.pnpm",
-                "--store-dir=.tmp/release-pnpm-store",
-                "--package-import-method=copy",
-                "--verify-store-integrity=true",
-                "--side-effects-cache=false",
-            ]
-            .into_iter()
-            .map(Into::into)
-            .collect(),
-            Self::Npm(_) => vec![
+            Self::Pnpm => {
+                let store = pnpm_store.ok_or_else(|| {
+                    anyhow!("release candidate: pnpm install is missing its stable store path")
+                })?;
+                let mut args = [
+                    "install",
+                    "--frozen-lockfile",
+                    "--prod=false",
+                    "--ignore-scripts=false",
+                    "--ignore-workspace",
+                    "--ignore-pnpmfile",
+                    "--lockfile=true",
+                    "--lockfile-dir=.",
+                    "--merge-git-branch-lockfiles=false",
+                    "--fix-lockfile=false",
+                    "--modules-dir=node_modules",
+                    "--virtual-store-dir=node_modules/.pnpm",
+                ]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+                let mut store_arg = OsString::from("--store-dir=");
+                store_arg.push(store.as_os_str());
+                args.push(store_arg);
+                args.extend(
+                    [
+                        "--package-import-method=copy",
+                        "--verify-store-integrity=true",
+                        "--side-effects-cache=false",
+                    ]
+                    .into_iter()
+                    .map(OsString::from),
+                );
+                Ok(args)
+            }
+            Self::Npm(_) => Ok(vec![
                 "ci".into(),
                 "--include=dev".into(),
                 "--ignore-scripts=false".into(),
                 "--workspaces=false".into(),
                 "--package-lock=true".into(),
-            ],
+            ]),
         }
     }
 
@@ -679,11 +781,11 @@ struct GoEnvironment {
 }
 
 impl GoEnvironment {
-    fn new(phase: &str) -> Result<Self> {
+    fn new() -> Result<Self> {
         let root = tempfile::Builder::new()
-            .prefix(&format!("mirrorstack-release-go-{phase}-"))
+            .prefix("mirrorstack-release-go-")
             .tempdir()
-            .with_context(|| format!("release candidate: create {phase} Go environment"))?;
+            .context("release candidate: create isolated Go environment")?;
         let module_cache = root.path().join("modcache");
         let build_cache = root.path().join("buildcache");
         fs::create_dir_all(&module_cache)
@@ -702,8 +804,8 @@ fn go_spec(program: &str, cwd: PathBuf, go: &GoEnvironment) -> ProcessSpec {
     let spec = ProcessSpec::new(program, cwd)
         // Deliberate public-module release policy: one fixed proxy and the
         // public checksum database, no private/no-sum bypasses, no inherited
-        // workspace/toolchain/experiment/architecture knobs, and isolated
-        // per-phase caches. This is reproducible input policy, not a sandbox
+        // workspace/toolchain/experiment/architecture knobs, and an isolated
+        // per-release cache. This is reproducible input policy, not a sandbox
         // for a malicious same-UID local toolchain.
         .env("GOWORK", "off")
         .env("GOENV", "off")
@@ -741,7 +843,12 @@ fn go_spec(program: &str, cwd: PathBuf, go: &GoEnvironment) -> ProcessSpec {
     .fold(spec, ProcessSpec::env_remove)
 }
 
-fn web_spec(program: &str, cwd: &Path, manager: PackageManager) -> ProcessSpec {
+fn web_spec(
+    program: &str,
+    cwd: &Path,
+    manager: PackageManager,
+    pnpm_store: Option<&Path>,
+) -> Result<ProcessSpec> {
     let isolated_config_home = cwd.join(".tmp/release-package-config");
     let isolated_user_config = isolated_config_home.join("npm-user.rc");
     let isolated_global_config = isolated_config_home.join("npm-global.rc");
@@ -772,38 +879,44 @@ fn web_spec(program: &str, cwd: &Path, manager: PackageManager) -> ProcessSpec {
         .env("npm_config_package_lock", "true")
         .env("NPM_CONFIG_PACKAGE_LOCK", "true");
     let spec = match manager {
-        PackageManager::Pnpm => spec
-            .env("npm_config_pnpmfile", disabled_pnpmfile.as_os_str())
-            .env("NPM_CONFIG_PNPMFILE", disabled_pnpmfile.as_os_str())
-            .env("npm_config_global_pnpmfile", disabled_pnpmfile.as_os_str())
-            .env("NPM_CONFIG_GLOBAL_PNPMFILE", disabled_pnpmfile.as_os_str())
-            .env("npm_config_ignore_workspace", "true")
-            .env("NPM_CONFIG_IGNORE_WORKSPACE", "true")
-            .env("npm_config_ignore_pnpmfile", "true")
-            .env("NPM_CONFIG_IGNORE_PNPMFILE", "true")
-            .env("npm_config_lockfile", "true")
-            .env("NPM_CONFIG_LOCKFILE", "true")
-            .env("npm_config_lockfile_dir", ".")
-            .env("NPM_CONFIG_LOCKFILE_DIR", ".")
-            .env("npm_config_git_branch_lockfile", "false")
-            .env("NPM_CONFIG_GIT_BRANCH_LOCKFILE", "false")
-            .env("npm_config_merge_git_branch_lockfiles", "false")
-            .env("NPM_CONFIG_MERGE_GIT_BRANCH_LOCKFILES", "false")
-            .env("npm_config_modules_dir", "node_modules")
-            .env("NPM_CONFIG_MODULES_DIR", "node_modules")
-            .env("npm_config_virtual_store_dir", "node_modules/.pnpm")
-            .env("NPM_CONFIG_VIRTUAL_STORE_DIR", "node_modules/.pnpm")
-            .env("npm_config_store_dir", ".tmp/release-pnpm-store")
-            .env("NPM_CONFIG_STORE_DIR", ".tmp/release-pnpm-store")
-            .env("npm_config_package_import_method", "copy")
-            .env("NPM_CONFIG_PACKAGE_IMPORT_METHOD", "copy")
-            .env("npm_config_verify_store_integrity", "true")
-            .env("NPM_CONFIG_VERIFY_STORE_INTEGRITY", "true")
-            .env("npm_config_side_effects_cache", "false")
-            .env("NPM_CONFIG_SIDE_EFFECTS_CACHE", "false"),
+        PackageManager::Pnpm => {
+            let store = pnpm_store.ok_or_else(|| {
+                anyhow!("release candidate: pnpm command is missing its stable store path")
+            })?;
+            spec.env("npm_config_pnpmfile", disabled_pnpmfile.as_os_str())
+                .env("NPM_CONFIG_PNPMFILE", disabled_pnpmfile.as_os_str())
+                .env("npm_config_global_pnpmfile", disabled_pnpmfile.as_os_str())
+                .env("NPM_CONFIG_GLOBAL_PNPMFILE", disabled_pnpmfile.as_os_str())
+                .env("npm_config_ignore_workspace", "true")
+                .env("NPM_CONFIG_IGNORE_WORKSPACE", "true")
+                .env("npm_config_ignore_pnpmfile", "true")
+                .env("NPM_CONFIG_IGNORE_PNPMFILE", "true")
+                .env("npm_config_lockfile", "true")
+                .env("NPM_CONFIG_LOCKFILE", "true")
+                .env("npm_config_lockfile_dir", ".")
+                .env("NPM_CONFIG_LOCKFILE_DIR", ".")
+                .env("npm_config_git_branch_lockfile", "false")
+                .env("NPM_CONFIG_GIT_BRANCH_LOCKFILE", "false")
+                .env("npm_config_merge_git_branch_lockfiles", "false")
+                .env("NPM_CONFIG_MERGE_GIT_BRANCH_LOCKFILES", "false")
+                .env("npm_config_modules_dir", "node_modules")
+                .env("NPM_CONFIG_MODULES_DIR", "node_modules")
+                .env("npm_config_virtual_store_dir", "node_modules/.pnpm")
+                .env("NPM_CONFIG_VIRTUAL_STORE_DIR", "node_modules/.pnpm")
+                .env("npm_config_store_dir", store.as_os_str())
+                .env("NPM_CONFIG_STORE_DIR", store.as_os_str())
+                // Copying from the verified store is intentional: a release
+                // view stays self-contained even when its cache outlives it.
+                .env("npm_config_package_import_method", "copy")
+                .env("NPM_CONFIG_PACKAGE_IMPORT_METHOD", "copy")
+                .env("npm_config_verify_store_integrity", "true")
+                .env("NPM_CONFIG_VERIFY_STORE_INTEGRITY", "true")
+                .env("npm_config_side_effects_cache", "false")
+                .env("NPM_CONFIG_SIDE_EFFECTS_CACHE", "false")
+        }
         PackageManager::Npm(_) => spec,
     };
-    [
+    Ok([
         "NODE_OPTIONS",
         "npm_config_node_options",
         "NPM_CONFIG_NODE_OPTIONS",
@@ -832,7 +945,30 @@ fn web_spec(program: &str, cwd: &Path, manager: PackageManager) -> ProcessSpec {
         "NPM_CONFIG_INCLUDE",
     ]
     .into_iter()
-    .fold(spec, ProcessSpec::env_remove)
+    .fold(spec, ProcessSpec::env_remove))
+}
+
+fn pnpm_store_dir(web_dir: &Path) -> Result<PathBuf> {
+    let cache_dir = dirs::cache_dir().ok_or_else(|| {
+        anyhow!("release candidate: locate the per-user cache directory for the pnpm store")
+    })?;
+    pnpm_store_dir_for_lockfile(&cache_dir, &web_dir.join("pnpm-lock.yaml"))
+}
+
+fn pnpm_store_dir_for_lockfile(cache_dir: &Path, lockfile: &Path) -> Result<PathBuf> {
+    let lockfile_bytes = fs::read(lockfile).with_context(|| {
+        format!(
+            "release candidate: read pnpm lockfile {}",
+            lockfile.display()
+        )
+    })?;
+    // A lockfile-keyed store can outlive one ephemeral release view without
+    // mixing cache policy across dependency graphs. Pnpm still verifies every
+    // store entry before it copies it into the isolated view.
+    Ok(cache_dir
+        .join("mirrorstack-cli")
+        .join("release-pnpm-store")
+        .join(sha256_hex(&lockfile_bytes)))
 }
 
 fn run_checked(
@@ -1507,29 +1643,107 @@ mod tests {
                     .removed
                     .contains(&"NPM_CONFIG_IGNORE_SCRIPTS".to_string())
         }));
+        let store = pnpm_store_dir(&module.join("web")).unwrap();
+        let expected_install_args = vec![
+            "install".to_string(),
+            "--frozen-lockfile".to_string(),
+            "--prod=false".to_string(),
+            "--ignore-scripts=false".to_string(),
+            "--ignore-workspace".to_string(),
+            "--ignore-pnpmfile".to_string(),
+            "--lockfile=true".to_string(),
+            "--lockfile-dir=.".to_string(),
+            "--merge-git-branch-lockfiles=false".to_string(),
+            "--fix-lockfile=false".to_string(),
+            "--modules-dir=node_modules".to_string(),
+            "--virtual-store-dir=node_modules/.pnpm".to_string(),
+            format!("--store-dir={}", store.display()),
+            "--package-import-method=copy".to_string(),
+            "--verify-store-integrity=true".to_string(),
+            "--side-effects-cache=false".to_string(),
+        ];
         assert!(seen.iter().any(|spec| {
             spec.program == "pnpm"
-                && spec.args
-                    == [
-                        "install",
-                        "--frozen-lockfile",
-                        "--prod=false",
-                        "--ignore-scripts=false",
-                        "--ignore-workspace",
-                        "--ignore-pnpmfile",
-                        "--lockfile=true",
-                        "--lockfile-dir=.",
-                        "--merge-git-branch-lockfiles=false",
-                        "--fix-lockfile=false",
-                        "--modules-dir=node_modules",
-                        "--virtual-store-dir=node_modules/.pnpm",
-                        "--store-dir=.tmp/release-pnpm-store",
-                        "--package-import-method=copy",
-                        "--verify-store-integrity=true",
-                        "--side-effects-cache=false",
-                    ]
+                && spec.args == expected_install_args
                 && spec.env.get("NODE_ENV").map(String::as_str) == Some("development")
+                && spec.env.get("npm_config_store_dir").map(String::as_str) == store.to_str()
         }));
+    }
+
+    #[test]
+    fn manifest_and_artifact_share_the_release_go_cache() {
+        let (_root, module) = fixture(false, false);
+        let runner = FakeRunner::default();
+        build_with(&runner, request(&module)).unwrap();
+
+        let seen = runner.seen.lock().unwrap();
+        let manifest_cache = seen
+            .iter()
+            .find(|spec| spec.program == "go" && spec.args.first().is_some_and(|arg| arg == "run"))
+            .and_then(|spec| spec.env.get("GOMODCACHE"))
+            .expect("manifest probe GOMODCACHE");
+        let artifact_cache = seen
+            .iter()
+            .find(|spec| {
+                spec.program == "go" && spec.args.first().is_some_and(|arg| arg == "build")
+            })
+            .and_then(|spec| spec.env.get("GOMODCACHE"))
+            .expect("artifact build GOMODCACHE");
+
+        assert_eq!(manifest_cache, artifact_cache);
+    }
+
+    #[test]
+    fn candidate_build_reports_each_executed_phase() {
+        let (_root, module) = fixture(true, false);
+        let runner = FakeRunner::default();
+        let mut events = Vec::new();
+        build_with_progress_runner(&runner, request(&module), &mut |phase, status| {
+            events.push((phase, status));
+        })
+        .unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                (BuildPhase::Snapshot, BuildPhaseStatus::Started),
+                (BuildPhase::Snapshot, BuildPhaseStatus::Finished),
+                (BuildPhase::ReplaceCheck, BuildPhaseStatus::Started),
+                (BuildPhase::ReplaceCheck, BuildPhaseStatus::Finished),
+                (BuildPhase::ManifestProbe, BuildPhaseStatus::Started),
+                (BuildPhase::ManifestProbe, BuildPhaseStatus::Finished),
+                (BuildPhase::WebInstall, BuildPhaseStatus::Started),
+                (BuildPhase::WebInstall, BuildPhaseStatus::Finished),
+                (BuildPhase::WebBuild, BuildPhaseStatus::Started),
+                (BuildPhase::WebBuild, BuildPhaseStatus::Finished),
+                (BuildPhase::GoBuild, BuildPhaseStatus::Started),
+                (BuildPhase::GoBuild, BuildPhaseStatus::Finished),
+            ]
+        );
+    }
+
+    #[test]
+    fn pnpm_store_path_is_stable_and_outside_ephemeral_web_views() {
+        let (_root, module) = fixture(true, false);
+        let source = SourceSnapshot::create(&module).unwrap();
+        let first = source.fresh_web_view().unwrap();
+        let second = source.fresh_web_view().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let first_store = pnpm_store_dir_for_lockfile(
+            cache.path(),
+            &first.module_dir().join("web/pnpm-lock.yaml"),
+        )
+        .unwrap();
+        let second_store = pnpm_store_dir_for_lockfile(
+            cache.path(),
+            &second.module_dir().join("web/pnpm-lock.yaml"),
+        )
+        .unwrap();
+
+        assert_eq!(first_store, second_store);
+        assert!(first_store.starts_with(cache.path()));
+        assert!(!first_store.starts_with(first.root()));
+        assert!(!first_store.starts_with(second.root()));
     }
 
     #[test]
@@ -1710,7 +1924,7 @@ mod tests {
 
     #[test]
     fn release_tool_environments_remove_ambient_build_selectors() {
-        let go = GoEnvironment::new("env-test").unwrap();
+        let go = GoEnvironment::new().unwrap();
         let spec = go_spec("go", PathBuf::from("."), &go);
         assert_eq!(
             spec.env.get(std::ffi::OsStr::new("GOFLAGS")).unwrap(),
@@ -1731,8 +1945,10 @@ mod tests {
             );
         }
 
-        let web =
-            web_spec("pnpm", Path::new("."), PackageManager::Pnpm).env("NODE_ENV", "production");
+        let store = PathBuf::from("stable-pnpm-store");
+        let web = web_spec("pnpm", Path::new("."), PackageManager::Pnpm, Some(&store))
+            .unwrap()
+            .env("NODE_ENV", "production");
         assert_eq!(
             web.env.get(std::ffi::OsStr::new("NODE_ENV")).unwrap(),
             "production"
@@ -1766,6 +1982,13 @@ mod tests {
                 .join(".tmp/release-package-config")
                 .as_os_str()
         );
+        for name in ["npm_config_store_dir", "NPM_CONFIG_STORE_DIR"] {
+            assert_eq!(
+                web.env.get(std::ffi::OsStr::new(name)).unwrap(),
+                store.as_os_str(),
+                "{name}"
+            );
+        }
         for name in [
             "NODE_PATH",
             "ESBUILD_BINARY_PATH",
