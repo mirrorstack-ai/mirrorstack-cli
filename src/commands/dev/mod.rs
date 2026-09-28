@@ -437,6 +437,11 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         );
     }
 
+    // Every outer run starts compose, client or not: refuse a missing runner
+    // binary here, before tunnels open, instead of letting Docker bind an
+    // empty directory over `/usr/local/bin/mirrorstack`.
+    client::preflight_compose_runner(root)?;
+
     // Compose files created before the outer/inner split commonly hardcode
     // `mirrorstack dev --all --watch`. Publish the host's explicit choice over
     // the bind-mounted control directory so both `--watch` and
