@@ -67,6 +67,14 @@ const MAX_SOURCE_FILE_BYTES: u64 = 32 * 1024 * 1024;
 const COMPOSE_RUNNING_RUNNER_PS_ARGS: [&str; 6] =
     ["compose", "ps", "--status", "running", "--quiet", "runner"];
 const COMPOSE_ALL_RUNNER_PS_ARGS: [&str; 5] = ["compose", "ps", "--all", "--quiet", "runner"];
+const RUNNER_BINARY: &str = ".mirrorstack-linux";
+// The project files `docker compose` discovers in its working directory.
+const COMPOSE_FILES: [&str; 4] = [
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yaml",
+    "docker-compose.yml",
+];
 
 #[derive(Debug)]
 pub(crate) struct ClientArtifact {
@@ -719,14 +727,46 @@ fn write_runner_handshake(root: &Path, run_id: &str) -> Result<()> {
 }
 
 fn runner_compatibility_error(root: &Path, detail: &str) -> anyhow::Error {
+    let build_script = root.join("scripts").join("build-dev-runner.sh");
+    let build = if build_script.is_file() {
+        format!(
+            "Run `{} /path/to/mirrorstack-cli` with this mirrorstack-cli checkout",
+            build_script.display()
+        )
+    } else {
+        "Build a Linux `mirrorstack` binary from this mirrorstack-cli checkout, replace that file"
+            .to_string()
+    };
     anyhow!(
-        "module client runner is incompatible: {detail}. The compose runner's bind-mounted `{}` is missing or was built from a different mirrorstack-cli release. Build a Linux `mirrorstack` binary from this mirrorstack-cli checkout, replace that file, then rerun `mirrorstack dev --tunnel`",
-        root.join(".mirrorstack-linux").display()
+        "compose runner is incompatible: {detail}. The compose runner's bind-mounted `{}` is missing or was built from a different mirrorstack-cli release. {build}, then rerun `mirrorstack dev`",
+        root.join(RUNNER_BINARY).display()
     )
 }
 
+/// Fail before `compose up` when the workspace's compose file bind-mounts
+/// `.mirrorstack-linux` into the runner but no usable binary is there. Docker
+/// otherwise creates an empty directory at the missing bind source and the
+/// runner dies with `exec: "mirrorstack": executable file not found in $PATH`
+/// — a run with no module client never reached `validate_runner_binary`
+/// (core-v2#1727). That leftover directory is removed so the next run, after
+/// the binary is built, is not refused for it; `remove_dir` only removes an
+/// empty directory, so anything with content is left for the error.
+pub(super) fn preflight_compose_runner(root: &Path) -> Result<()> {
+    let binds_runner = COMPOSE_FILES.iter().any(|name| {
+        fs::read_to_string(root.join(name)).is_ok_and(|text| text.contains(RUNNER_BINARY))
+    });
+    if !binds_runner {
+        return Ok(());
+    }
+    let path = root.join(RUNNER_BINARY);
+    if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+        let _ = fs::remove_dir(&path);
+    }
+    validate_runner_binary(root)
+}
+
 fn validate_runner_binary(root: &Path) -> Result<()> {
-    let path = root.join(".mirrorstack-linux");
+    let path = root.join(RUNNER_BINARY);
     let metadata = fs::symlink_metadata(&path).map_err(|error| {
         let detail = if error.kind() == std::io::ErrorKind::NotFound {
             "the compose runner binary does not exist".to_string()
@@ -2338,6 +2378,45 @@ mod tests {
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o644
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compose_runner_preflight_clears_dockers_empty_bind_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(RUNNER_BINARY);
+        preflight_compose_runner(temp.path())
+            .expect("a workspace without a runner bind needs no binary");
+
+        fs::write(
+            temp.path().join("docker-compose.yml"),
+            "services:\n  runner:\n    volumes:\n      - ./.mirrorstack-linux:/usr/local/bin/mirrorstack:ro\n",
+        )
+        .unwrap();
+        fs::create_dir(&path).unwrap();
+        let missing = preflight_compose_runner(temp.path())
+            .expect_err("compose must not start without the runner binary")
+            .to_string();
+        assert!(missing.contains("does not exist"), "{missing}");
+        assert!(
+            !path.exists(),
+            "Docker's empty bind directory must not outlive the failed run"
+        );
+
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("keep"), b"").unwrap();
+        let populated = preflight_compose_runner(temp.path())
+            .expect_err("a populated directory is never deleted")
+            .to_string();
+        assert!(populated.contains("regular file"), "{populated}");
+        assert!(path.join("keep").exists());
+        fs::remove_dir_all(&path).unwrap();
+
+        fs::write(&path, b"linux binary").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        preflight_compose_runner(temp.path()).unwrap();
     }
 
     #[cfg(unix)]
