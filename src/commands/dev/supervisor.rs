@@ -68,12 +68,13 @@ use super::tunnel;
 use super::{ok_mark, warn_prefix};
 use crate::{api, credentials, http};
 
-/// Consecutive failed reconnect attempts before a module is declared
-/// permanently offline. With [`RECONNECT_BACKOFF_CAP`] this is roughly three
-/// minutes of trying — long enough to ride out a laptop lid, a Wi-Fi hop or a
-/// dispatch redeploy, short enough that a genuinely broken session goes loud
-/// while the developer is still at the keyboard.
-const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+/// Consecutive failed reconnect attempts before the module says, loudly, that
+/// it is offline. With [`RECONNECT_BACKOFF_CAP`] this is roughly three minutes
+/// of trying — long enough to ride out a laptop lid, a Wi-Fi hop or a dispatch
+/// redeploy, short enough that a genuinely broken session goes loud while the
+/// developer is still at the keyboard. It does NOT end the retrying: only a
+/// terminal failure or teardown does.
+const LOUD_AFTER_ATTEMPTS: u32 = 10;
 
 /// First backoff step. Doubles per attempt up to [`RECONNECT_BACKOFF_CAP`].
 const RECONNECT_BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -436,58 +437,87 @@ fn reconnect(
     ctx: &ReconnectCtx,
     runtime: &tokio::runtime::Runtime,
 ) -> Option<tokio::sync::oneshot::Receiver<tunnel::TunnelExit>> {
-    for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
-        let delay = reconnect_delay(attempt, rand::random::<f64>());
-        eprintln!(
-            "{} [{}] tunnel reconnect attempt {attempt}/{MAX_RECONNECT_ATTEMPTS} in {:.1}s…",
-            warn_prefix(),
-            style(&target.slug).cyan(),
-            delay.as_secs_f64()
-        );
-        if !sleep_unless_stopped(sup, delay) {
+    let tunnel::TunnelSession { handle, exit } = retry_until_session(
+        sup,
+        target,
+        |attempt| {
+            let delay = reconnect_delay(attempt, rand::random::<f64>());
+            eprintln!(
+                "{} [{}] tunnel reconnect attempt {attempt} in {:.1}s…",
+                warn_prefix(),
+                style(&target.slug).cyan(),
+                delay.as_secs_f64()
+            );
+            delay
+        },
+        || attempt_reconnect(sup, target, ctx, runtime),
+    )?;
+    let session_id = handle.session_id.clone();
+    // Install and rewrite the token file in one operation — see
+    // `Supervisor::publish` for why neither half can stand alone.
+    // Nothing may be announced as reconnected before it returns.
+    match sup.publish(handle, &target.token_file, &ctx.releases) {
+        // Teardown won the race. It closed what we opened and
+        // touched nothing on disk, so leave quietly.
+        Publish::Refused => return None,
+        Publish::PublicationFailed(e) => {
+            mark_dead(sup, target, &unusable_session_reason(target, &e));
             return None;
         }
+        Publish::Installed => {}
+    }
+    // The dev-bundle CDN pointer is stored per session and died
+    // with the old one; the share watcher's content-hash gate
+    // would never notice, since the bytes did not change.
+    ctx.share.invalidate(&target.slug);
+    ctx.clients.replace(&target.slug, &session_id);
+    eprintln!(
+        "{} [{}] tunnel reconnected (session {})",
+        ok_mark(),
+        style(&target.slug).cyan(),
+        style(&session_id).dim()
+    );
+    Some(exit)
+}
 
-        match attempt_reconnect(sup, target, ctx, runtime) {
-            Ok(tunnel::TunnelSession { handle, exit }) => {
-                let session_id = handle.session_id.clone();
-                // Install and rewrite the token file in one operation — see
-                // `Supervisor::publish` for why neither half can stand alone.
-                // Nothing may be announced as reconnected before it returns.
-                match sup.publish(handle, &target.token_file, &ctx.releases) {
-                    // Teardown won the race. It closed what we opened and
-                    // touched nothing on disk, so leave quietly.
-                    Publish::Refused => return None,
-                    Publish::PublicationFailed(e) => {
-                        mark_dead(sup, target, &unusable_session_reason(target, &e));
-                        return None;
-                    }
-                    Publish::Installed => {}
-                }
-                // The dev-bundle CDN pointer is stored per session and died
-                // with the old one; the share watcher's content-hash gate
-                // would never notice, since the bytes did not change.
-                ctx.share.invalidate(&target.slug);
-                ctx.clients.replace(&target.slug, &session_id);
-                eprintln!(
-                    "{} [{}] tunnel reconnected (session {})",
-                    ok_mark(),
-                    style(&target.slug).cyan(),
-                    style(&session_id).dim()
-                );
-                return Some(exit);
-            }
+/// The retry policy, separate from what an attempt does so it can be driven
+/// without a network.
+///
+/// A TERMINAL outcome (expired login, rejected register) marks the module dead
+/// at once — retrying cannot fix those. A TRANSIENT failure never does: the
+/// first ten of them (~3 minutes of backoff) used to declare the tunnel
+/// permanently offline, so a VPN toggle, a laptop lid or a dispatch redeploy
+/// longer than that left a live `mirrorstack dev --tunnel` nagging "still
+/// offline" for as long as it ran, even after the network came back. Now the
+/// attempt that crosses [`LOUD_AFTER_ATTEMPTS`] says so loudly and the loop
+/// keeps going at the capped backoff until it connects or teardown stops it.
+///
+/// `before_attempt` announces and returns the wait for attempt `n` (1-based).
+fn retry_until_session(
+    sup: &Supervisor,
+    target: &TunnelTarget,
+    mut before_attempt: impl FnMut(u32) -> Duration,
+    mut attempt: impl FnMut() -> std::result::Result<tunnel::TunnelSession, AttemptOutcome>,
+) -> Option<tunnel::TunnelSession> {
+    for n in 1u32.. {
+        if !sleep_unless_stopped(sup, before_attempt(n)) {
+            return None;
+        }
+        match attempt() {
+            Ok(session) => return Some(session),
             Err(outcome) => {
-                let terminal = outcome.is_terminal();
                 eprintln!(
-                    "{} [{}] tunnel reconnect attempt {attempt} failed: {}",
+                    "{} [{}] tunnel reconnect attempt {n} failed: {}",
                     warn_prefix(),
                     style(&target.slug).cyan(),
                     outcome.message()
                 );
-                if terminal {
+                if outcome.is_terminal() {
                     mark_dead(sup, target, outcome.message());
                     return None;
+                }
+                if n == LOUD_AFTER_ATTEMPTS {
+                    announce_still_trying(target, n);
                 }
             }
         }
@@ -495,11 +525,6 @@ fn reconnect(
             return None;
         }
     }
-    mark_dead(
-        sup,
-        target,
-        &format!("no successful reconnect in {MAX_RECONNECT_ATTEMPTS} attempts"),
-    );
     None
 }
 
@@ -582,6 +607,24 @@ fn mark_dead(sup: &Supervisor, target: &TunnelTarget, reason: &str) {
     eprintln!("  with 403 unknown_sender, so its events reach no subscriber.");
     eprintln!(
         "  {} restart `mirrorstack dev --tunnel` to recover.",
+        style("Fix:").bold()
+    );
+    eprintln!();
+}
+
+/// The not-yet-dead counterpart of [`mark_dead`]: the loud banner for a tunnel
+/// that has been unreachable for minutes but is still being retried.
+fn announce_still_trying(target: &TunnelTarget, attempts: u32) {
+    eprintln!();
+    eprintln!(
+        "{} [{}] TUNNEL OFFLINE — {attempts} reconnect attempts failed; still retrying every {}s",
+        warn_prefix(),
+        style(&target.slug).cyan().bold(),
+        RECONNECT_BACKOFF_CAP.as_secs()
+    );
+    eprintln!("  Calls routed to this module fail with 503 tunnel_offline until it reconnects.");
+    eprintln!(
+        "  {} check the network/VPN; it recovers on its own, Ctrl-C to stop.",
         style("Fix:").bold()
     );
     eprintln!();
@@ -785,7 +828,7 @@ impl SharedCredentials {
     /// it rotates away from, so after one `mirrorstack whoami` in a second
     /// terminal this cached refresh token answers 401 for good. Without the
     /// re-read the next server close ends the whole run on attempt 1 of
-    /// [`MAX_RECONNECT_ATTEMPTS`] with "session expired — run `mirrorstack
+    /// [`LOUD_AFTER_ATTEMPTS`] with "session expired — run `mirrorstack
     /// login`" while `credentials.json` holds a perfectly good pair.
     ///
     /// Exactly ONE re-read per call, and only when disk carries a refresh token
@@ -1045,13 +1088,13 @@ mod tests {
         assert_eq!(at(5), Duration::from_secs(16));
         // 32s would exceed the cap.
         assert_eq!(at(6), RECONNECT_BACKOFF_CAP);
-        assert_eq!(at(MAX_RECONNECT_ATTEMPTS), RECONNECT_BACKOFF_CAP);
+        assert_eq!(at(LOUD_AFTER_ATTEMPTS), RECONNECT_BACKOFF_CAP);
     }
 
     #[test]
     fn backoff_never_shrinks_and_never_runs_away() {
         let mut prev = Duration::ZERO;
-        for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
+        for attempt in 1..=LOUD_AFTER_ATTEMPTS {
             let d = reconnect_delay(attempt, 0.5);
             assert!(d >= prev, "attempt {attempt} went backwards");
             assert!(d <= RECONNECT_BACKOFF_CAP);
@@ -1083,7 +1126,7 @@ mod tests {
     #[test]
     fn total_retry_window_is_minutes_not_seconds() {
         // The budget has to survive a laptop lid or a dispatch redeploy.
-        let total: Duration = (1..=MAX_RECONNECT_ATTEMPTS)
+        let total: Duration = (1..=LOUD_AFTER_ATTEMPTS)
             .map(|a| reconnect_delay(a, 0.5))
             .sum();
         assert!(
@@ -1597,6 +1640,63 @@ mod tests {
             &tgt,
             "supervision stopped without a reason"
         ));
+        assert!(sup.dead.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_long_outage_keeps_retrying_instead_of_going_permanently_dead() {
+        // The incident: network down for longer than the old ten-attempt
+        // budget. The tunnel must still be retrying (not dead) past it, so
+        // it can come back when the network does.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tgt = target("ai-template", dir.path());
+        let sup = supervisor("ai-template", None);
+        let mut calls = 0u32;
+
+        let out = retry_until_session(
+            &sup,
+            &tgt,
+            |_| Duration::ZERO,
+            || {
+                calls += 1;
+                if calls == LOUD_AFTER_ATTEMPTS + 5 {
+                    sup.begin_stop();
+                }
+                Err(AttemptOutcome::Retry("network unreachable".into()))
+            },
+        );
+
+        assert!(out.is_none(), "teardown ends the loop");
+        assert_eq!(
+            calls,
+            LOUD_AFTER_ATTEMPTS + 5,
+            "kept trying past the old budget"
+        );
+        assert!(
+            !sup.dead.load(Ordering::SeqCst),
+            "a transient outage is never recorded as permanent"
+        );
+    }
+
+    #[test]
+    fn a_terminal_failure_still_goes_dead_on_the_first_attempt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tgt = target("ai-template", dir.path());
+        let sup = supervisor("ai-template", None);
+        let mut calls = 0u32;
+
+        let out = retry_until_session(
+            &sup,
+            &tgt,
+            |_| Duration::ZERO,
+            || {
+                calls += 1;
+                Err(AttemptOutcome::Terminal("session expired".into()))
+            },
+        );
+
+        assert!(out.is_none());
+        assert_eq!(calls, 1);
         assert!(sup.dead.load(Ordering::SeqCst));
     }
 }
