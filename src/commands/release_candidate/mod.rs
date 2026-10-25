@@ -303,19 +303,36 @@ fn record_go_version(
 }
 
 /// `go1.26.10` -> (1, 26, 10); `go1.27` -> (1, 27, 0); `go1.27rc1` -> (1, 27, 0).
-/// A `devel` or otherwise unrecognised string is None, so it is refused.
+/// Same grammar as the platform's validator (api-platform#887), so a version
+/// accepted here is never rejected at publish: pre-releases are `go1.N{rc,beta}K`
+/// with no patch, parts are canonical decimals. Anything else (`devel`,
+/// suffixes, leading zeros) is None and refused.
 fn parse_go_version(version: &str) -> Option<(u64, u64, u64)> {
-    let mut parts = version.strip_prefix("go")?.split('.');
-    let mut next = |required: bool| -> Option<u64> {
-        match parts.next() {
-            Some(part) => {
-                let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
-                digits.parse().ok()
+    let mut rest = version.strip_prefix("go")?;
+    let mut prerelease = false;
+    for tag in ["rc", "beta"] {
+        if let Some(at) = rest.find(tag).filter(|&at| at > 0) {
+            let k = &rest[at + tag.len()..];
+            if k.is_empty() || !k.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
             }
-            None => (!required).then_some(0),
+            rest = &rest[..at];
+            prerelease = true;
         }
-    };
-    Some((next(true)?, next(true)?, next(false)?))
+    }
+    let parts: Vec<&str> = rest.split('.').collect();
+    if !(2..=3).contains(&parts.len()) || (prerelease && parts.len() != 2) {
+        return None;
+    }
+    let mut out = [0u64; 3];
+    for (slot, part) in out.iter_mut().zip(&parts) {
+        let n: u64 = part.parse().ok()?;
+        if n.to_string() != *part {
+            return None;
+        }
+        *slot = n;
+    }
+    Some((out[0], out[1], out[2]))
 }
 
 #[derive(Deserialize)]
@@ -1775,6 +1792,7 @@ mod tests {
             "go1.26.11",
             "go1.27",
             "go1.27rc1",
+            "go1.28beta2",
             "go1.30.0",
             "go2.0",
         ] {
@@ -1783,12 +1801,20 @@ mod tests {
         for bad in [
             "go1.26.9",
             "go1.26",
+            "go1.26rc1",
             "go1.25.99",
             "go1.9.99",
             "devel go1.28-abc",
             "",
             "1.26.10",
             "go1",
+            "go1.26.10-1",
+            "go1.26.10rc1",
+            "go1.27rc",
+            "go1.026.10",
+            "go1.26.10.1",
+            "go1.x.y",
+            "go1.26.10 X:nocoverageredesign",
         ] {
             assert!(enforce_go_floor(bad).is_err(), "{bad}");
         }
