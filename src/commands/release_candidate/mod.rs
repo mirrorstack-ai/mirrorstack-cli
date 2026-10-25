@@ -31,6 +31,10 @@ use source::{BuildView, SourceSnapshot};
 pub(crate) const CANDIDATE_PROTOCOL: &str = "mirrorstack.release-candidate/v1";
 const MANIFEST_PROTOCOL: &str = "mirrorstack.release-manifest/v1";
 const MANIFEST_TOOL_MODE: &str = "release-manifest-v1";
+/// Oldest Go toolchain a module release may be built with (Zero-Day decision
+/// OD7, 2026-10-25). The platform enforces the same floor on the recorded
+/// `go_version`; raise both together.
+const GO_VERSION_FLOOR: &str = "go1.26.10";
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_MANIFEST_STDOUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WEB_BYTES: u64 = 32 * 1024 * 1024;
@@ -158,6 +162,7 @@ fn build_with(
     request: CandidateRequest<'_>,
 ) -> Result<ReleaseCandidate> {
     let source = SourceSnapshot::create(request.module_dir)?;
+    let go_version = check_go_floor(runner, &source)?;
     let replace_view = source.fresh_view("replace-check")?;
     let replace_go = GoEnvironment::new("replace-check")?;
     validate_local_replaces(runner, &replace_view, &replace_go)?;
@@ -176,6 +181,7 @@ fn build_with(
         request.module_id,
     )?;
     validate_manifest_identity(&manifest, request.module_id, request.slug)?;
+    let manifest_evidence = record_go_version(manifest_evidence, &manifest, &go_version)?;
     manifest_view
         .verify_inputs()
         .context("release candidate: SDK manifest probe changed its frozen phase inputs")?;
@@ -216,6 +222,100 @@ fn build_with(
         artifact_path,
         _receipt_path: receipt_path,
     })
+}
+
+/// Refuse a build below [`GO_VERSION_FLOOR`] and return the version of the
+/// toolchain that will build the manifest and the artifact (`GOTOOLCHAIN=local`,
+/// so no silent download swaps it).
+fn check_go_floor(runner: &dyn ProcessRunner, source: &SourceSnapshot) -> Result<String> {
+    let view = source.fresh_view("go-version")?;
+    let go = GoEnvironment::new("go-version")?;
+    let spec = go_spec("go", view.module_dir(), &go)
+        .args(["env", "GOVERSION"])
+        .timeout(Duration::from_secs(30))
+        .limits(4 * 1024, 64 * 1024);
+    let output = run_checked(runner, &spec, "go env GOVERSION")?;
+    // `go1.26.10 X:experiment` -> `go1.26.10`: the platform validates a bare
+    // version token.
+    let version = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    enforce_go_floor(&version)?;
+    Ok(version)
+}
+
+fn enforce_go_floor(version: &str) -> Result<()> {
+    let have = parse_go_version(version).ok_or_else(|| {
+        anyhow!("release candidate: cannot read the Go toolchain version from `{version}`")
+    })?;
+    let floor = parse_go_version(GO_VERSION_FLOOR).expect("GO_VERSION_FLOOR is a Go version");
+    if have < floor {
+        return Err(anyhow!(
+            "release candidate: Go toolchain {version} is below the required floor {GO_VERSION_FLOOR}; upgrade Go and rebuild"
+        ));
+    }
+    Ok(())
+}
+
+/// Record the build toolchain in the manifest as `go_version`. The SDK's bytes
+/// are the platform's opaque evidence, so the field is appended to its single
+/// canonical JSON line instead of re-serialising the document. A manifest that
+/// already carries one must agree with the toolchain.
+fn record_go_version(
+    evidence: ManifestEvidence,
+    manifest: &serde_json::Value,
+    go_version: &str,
+) -> Result<ManifestEvidence> {
+    if let Some(declared) = manifest.get("go_version") {
+        if declared.as_str() == Some(go_version) {
+            return Ok(evidence);
+        }
+        return Err(anyhow!(
+            "release candidate: SDK manifest declares go_version {declared}, but the build toolchain is {go_version}"
+        ));
+    }
+    let bytes = STANDARD
+        .decode(&evidence.base64)
+        .context("release candidate: decode SDK manifest_base64")?;
+    let body = bytes
+        .strip_suffix(b"}\n")
+        .ok_or_else(|| anyhow!("release candidate: SDK manifest is not one JSON object line"))?;
+    let mut recorded = body.to_vec();
+    recorded.extend_from_slice(
+        format!(
+            ",\"go_version\":{}}}\n",
+            serde_json::Value::from(go_version)
+        )
+        .as_bytes(),
+    );
+    if recorded.len() > MAX_MANIFEST_BYTES {
+        return Err(anyhow!(
+            "release candidate: SDK manifest with go_version is {} bytes (cap: {MAX_MANIFEST_BYTES})",
+            recorded.len()
+        ));
+    }
+    Ok(ManifestEvidence {
+        sha256: sha256_hex(&recorded),
+        base64: STANDARD.encode(&recorded),
+    })
+}
+
+/// `go1.26.10` -> (1, 26, 10); `go1.27` -> (1, 27, 0); `go1.27rc1` -> (1, 27, 0).
+/// A `devel` or otherwise unrecognised string is None, so it is refused.
+fn parse_go_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.strip_prefix("go")?.split('.');
+    let mut next = |required: bool| -> Option<u64> {
+        match parts.next() {
+            Some(part) => {
+                let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().ok()
+            }
+            None => (!required).then_some(0),
+        }
+    };
+    Some((next(true)?, next(true)?, next(false)?))
 }
 
 #[derive(Deserialize)]
@@ -1017,6 +1117,7 @@ mod tests {
         mutate_manifest_view: bool,
         mutate_live_on_artifact: Option<PathBuf>,
         replaces: serde_json::Value,
+        go_version: String,
     }
 
     struct RealNpmRunner {
@@ -1043,6 +1144,7 @@ mod tests {
                 mutate_manifest_view: false,
                 mutate_live_on_artifact: None,
                 replaces: serde_json::json!(null),
+                go_version: GO_VERSION_FLOOR.to_string(),
             }
         }
     }
@@ -1075,6 +1177,9 @@ mod tests {
                     .collect(),
             });
 
+            if program == "go" && args.starts_with(&["env".into(), "GOVERSION".into()]) {
+                return success(format!("{}\n", self.go_version).into_bytes());
+            }
             if program == "go" && args.starts_with(&["mod".into(), "edit".into()]) {
                 return success(
                     serde_json::to_vec(&serde_json::json!({"Replace": self.replaces})).unwrap(),
@@ -1608,6 +1713,85 @@ mod tests {
             "a watch session must not attest web bytes, got {:?}",
             candidate.receipt.web
         );
+    }
+
+    #[test]
+    fn manifest_records_the_go_version() {
+        let (_root, module) = fixture(false, false);
+        let runner = FakeRunner {
+            go_version: "go1.27.1 X:nocoverageredesign".into(),
+            ..FakeRunner::default()
+        };
+        let candidate = build_with(&runner, request(&module)).unwrap();
+        let evidence = &candidate.receipt.manifest;
+        let bytes = STANDARD.decode(&evidence.base64).unwrap();
+        assert_eq!(sha256_hex(&bytes), evidence.sha256);
+        assert!(bytes.ends_with(b"\n") && !bytes[..bytes.len() - 1].contains(&b'\n'));
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(manifest["go_version"], "go1.27.1");
+        assert_eq!(manifest["slug"], "user-core");
+    }
+
+    #[test]
+    fn manifest_go_version_must_match_the_toolchain() {
+        let evidence = ManifestEvidence {
+            sha256: sha256_hex(b"{}\n"),
+            base64: STANDARD.encode(b"{\"id\":\"m1\"}\n"),
+        };
+        let manifest = serde_json::json!({"id": "m1", "go_version": "go1.25.1"});
+        assert!(record_go_version(evidence.clone(), &manifest, "go1.26.10").is_err());
+        let manifest = serde_json::json!({"id": "m1", "go_version": "go1.26.10"});
+        assert_eq!(
+            record_go_version(evidence.clone(), &manifest, "go1.26.10").unwrap(),
+            evidence
+        );
+    }
+
+    #[test]
+    fn build_below_the_go_floor_is_refused_before_any_build() {
+        let (_root, module) = fixture(false, false);
+        let runner = FakeRunner {
+            go_version: "go1.26.9".into(),
+            ..FakeRunner::default()
+        };
+        let error = build_with(&runner, request(&module)).err().unwrap();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("go1.26.9") && message.contains(GO_VERSION_FLOOR),
+            "{message}"
+        );
+        let seen = runner.seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .all(|spec| spec.args.first().is_none_or(|arg| arg == "env")),
+            "no other command may run below the floor: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn go_floor_comparison() {
+        for ok in [
+            "go1.26.10",
+            "go1.26.11",
+            "go1.27",
+            "go1.27rc1",
+            "go1.30.0",
+            "go2.0",
+        ] {
+            assert!(enforce_go_floor(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "go1.26.9",
+            "go1.26",
+            "go1.25.99",
+            "go1.9.99",
+            "devel go1.28-abc",
+            "",
+            "1.26.10",
+            "go1",
+        ] {
+            assert!(enforce_go_floor(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
