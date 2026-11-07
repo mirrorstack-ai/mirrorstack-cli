@@ -31,6 +31,7 @@ mod redeploy;
 mod register;
 mod release_plan;
 pub(super) mod rename;
+mod resync;
 mod scaffold;
 mod transports;
 pub(crate) mod version_client;
@@ -92,6 +93,14 @@ enum ModuleCommand {
     /// that module. Forward by default; moving backwards needs an explicit
     /// --allow-downgrade. Omit --to to pick from the published versions.
     Move(version_move::MoveArgs),
+    /// Force the platform to re-read an installed module's current manifest
+    /// and re-project its facts (contributions, capabilities) into the app.
+    ///
+    /// For a dev-mounted module whose manifest changed after install — the
+    /// host keeps serving the old contribution payload through a hot rebuild
+    /// and even a full tunnel restart until something forces this re-read.
+    /// No version pin or deploy status is touched.
+    Resync(resync::ResyncArgs),
 }
 
 #[derive(Args)]
@@ -164,6 +173,7 @@ pub fn run(args: ModuleArgs) -> Result<()> {
         ModuleCommand::Redeploy(r) => redeploy::run(r),
         ModuleCommand::Transports(t) => transports::run(t),
         ModuleCommand::Move(m) => version_move::run(m),
+        ModuleCommand::Resync(r) => resync::run(r),
     }
 }
 

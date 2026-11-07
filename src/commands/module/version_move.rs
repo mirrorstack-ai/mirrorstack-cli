@@ -218,7 +218,7 @@ pub(super) fn run(args: MoveArgs) -> Result<()> {
 /// ergonomic case; the platform UUID is accepted too because two installed
 /// modules from different owners can legitimately share a slug, and then the
 /// slug alone is not an answer.
-fn find_install<'a>(
+pub(super) fn find_install<'a>(
     installs: &'a [AppInstall],
     module: &str,
     app_slug: &str,
