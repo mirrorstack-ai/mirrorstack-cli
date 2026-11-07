@@ -36,6 +36,9 @@ pub(crate) const PREVIEW_SCRIPT: &str = "preview";
 pub(crate) const DEFAULT_PREVIEW_PORT: u16 = 5174;
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack preview\n  mirrorstack preview --module media --port 5174"
+)]
 pub struct PreviewArgs {
     /// Working directory containing go.work. Default: cwd.
     #[arg(long)]

@@ -21,6 +21,7 @@ use super::{
 };
 
 #[derive(Args)]
+#[command(after_help = "Examples:\n  mirrorstack login\n  mirrorstack login --no-browser")]
 pub struct LoginArgs {
     /// Skip the browser handoff and paste the code shown on the page (SSH/headless).
     #[arg(long)]

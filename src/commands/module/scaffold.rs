@@ -26,6 +26,7 @@ const GO_MOD: &str = include_str!("../../../templates/module/go.mod.tmpl");
 const SQL_INIT: &str = include_str!("../../../templates/module/sql/app/0001_init.up.sql.tmpl");
 const GITIGNORE: &str = include_str!("../../../templates/module/.gitignore.tmpl");
 const CHANGELOG: &str = include_str!("../../../templates/module/CHANGELOG.md.tmpl");
+const AGENTS_MD: &str = include_str!("../../../templates/module/AGENTS.md.tmpl");
 
 // Placeholder tokens. Kept in one place so the contract between the .tmpl
 // files and this renderer is auditable from a single grep.
@@ -127,6 +128,7 @@ pub(super) fn write_tree(target: &Path, inputs: &Inputs<'_>) -> Result<()> {
     // deploy. The seeded heading is `## 0.1.0` — canonical, no `v`, no `-dev`
     // — because the deploy promotes the Versions key before looking it up.
     write_file(target, "CHANGELOG.md", CHANGELOG, inputs)?;
+    write_file(target, "AGENTS.md", AGENTS_MD, inputs)?;
     write_env_file(target, inputs)?;
     Ok(())
 }
@@ -393,6 +395,7 @@ mod tests {
             "CHANGELOG.md",
             "sql/app/0001_init.up.sql",
             ".gitignore",
+            "AGENTS.md",
             ".env",
         ] {
             let p = target.join(rel);
@@ -429,6 +432,32 @@ mod tests {
         let env = fs::read_to_string(target.join(".env")).unwrap();
         assert!(env.starts_with("MS_MODULE_ID_RELAY_TEST_MODULE="));
         assert!(!env.starts_with("MS_MODULE_ID="));
+    }
+
+    #[test]
+    fn write_tree_agents_md_carries_slug_and_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("media");
+        write_tree(&target, &ins("media", "Media")).unwrap();
+        let agents = fs::read_to_string(target.join("AGENTS.md")).unwrap();
+        assert!(
+            agents.contains("media"),
+            "AGENTS.md missing slug: {agents:?}"
+        );
+        assert!(
+            agents.contains("Media"),
+            "AGENTS.md missing name: {agents:?}"
+        );
+        assert!(!agents.contains("__MS_SLUG__"));
+        assert!(!agents.contains("__MS_NAME__"));
+    }
+
+    #[test]
+    fn agents_md_stays_under_thirty_lines() {
+        assert!(
+            AGENTS_MD.lines().count() < 30,
+            "AGENTS.md.tmpl grew past the 30-line budget"
+        );
     }
 
     #[test]
