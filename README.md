@@ -33,6 +33,9 @@ mirrorstack apps client install --app my-app                    # Install every 
 mirrorstack apps client install --app my-app --frozen           # CI: install exactly the manifest, fail on drift
 mirrorstack apps client install --app my-app --dev              # Keep reinstalling as tunnels publish new revisions
 mirrorstack apps client install --app my-app --oidc --frozen    # CI, no login: authenticate with the job's GitHub Actions identity
+mirrorstack dev --tunnel                                        # Dev tunnel reachable from your sandbox/dev device only
+mirrorstack dev --tunnel --shared                                # ...reachable by every member of an app with this module's route-local switch on; also publishes the web bundle to the CDN
+mirrorstack dev --tunnel --share                                 # Deprecated alias for --shared; will be removed in a later release
 mirrorstack --help             # Show help
 mirrorstack --version          # Show CLI version
 ```
