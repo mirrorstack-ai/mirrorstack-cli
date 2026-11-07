@@ -19,6 +19,8 @@ mirrorstack login              # Opens the browser and completes automatically o
 mirrorstack login --no-browser # Sign in on SSH/headless (paste the code shown on the page)
 mirrorstack logout             # Revoke the current session and wipe local credentials
 mirrorstack whoami             # Print the currently signed-in user
+mirrorstack doctor             # Check Go/git/node/pnpm/docker, sign-in, and platform reachability
+mirrorstack doctor --json      # …the same checks, machine-readable
 mirrorstack app module init    # Register a new module on the platform
 mirrorstack app module rename  # Safely rename a module slug without changing its ID
 mirrorstack module deploy      # Cross-compile Linux/arm64, package a bootstrap zip, and upload it

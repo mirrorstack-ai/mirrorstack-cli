@@ -21,7 +21,7 @@ use super::dev::release_session::{ConfirmedWeb, load_for_module};
 use super::dev::{WebPipeline, web_pipeline};
 use super::module::artifact;
 
-mod process;
+pub(crate) mod process;
 pub(crate) mod source;
 mod web_dependencies;
 
@@ -33,8 +33,10 @@ const MANIFEST_PROTOCOL: &str = "mirrorstack.release-manifest/v1";
 const MANIFEST_TOOL_MODE: &str = "release-manifest-v1";
 /// Oldest Go toolchain a module release may be built with (Zero-Day decision
 /// OD7, 2026-10-25). The platform enforces the same floor on the recorded
-/// `go_version`; raise both together.
-const GO_VERSION_FLOOR: &str = "go1.26.10";
+/// `go_version`; raise both together. `pub(crate)` so `mirrorstack doctor`
+/// (`commands::doctor`) can name the same floor in its own Go check — see
+/// mirrorstack-cli#155.
+pub(crate) const GO_VERSION_FLOOR: &str = "go1.26.10";
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_MANIFEST_STDOUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WEB_BYTES: u64 = 32 * 1024 * 1024;
@@ -307,7 +309,7 @@ fn record_go_version(
 /// accepted here is never rejected at publish: pre-releases are `go1.N{rc,beta}K`
 /// with no patch, parts are canonical decimals. Anything else (`devel`,
 /// suffixes, leading zeros) is None and refused.
-fn parse_go_version(version: &str) -> Option<(u64, u64, u64)> {
+pub(crate) fn parse_go_version(version: &str) -> Option<(u64, u64, u64)> {
     let mut rest = version.strip_prefix("go")?;
     let mut prerelease = false;
     for tag in ["rc", "beta"] {

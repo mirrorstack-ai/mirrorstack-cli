@@ -50,6 +50,13 @@ const SDK_VERSION_TOKEN: &str = "__MS_SDK_VERSION__";
 /// Bump this in the same PR that adopts a new SDK API in the templates.
 const SCAFFOLD_SDK_VERSION: &str = "v0.4.6";
 
+/// Oldest `app-module-sdk` a module may deploy with. This is the one place
+/// the floor is written (mirrorstack-cli#151); `mirrorstack doctor`
+/// (`commands::doctor`, mirrorstack-cli#155) reuses this exact constant name
+/// to name the same floor in its `go.mod` check rather than hardcoding its
+/// own copy.
+pub(crate) const MIN_SDK_FOR_DEPLOY: &str = "v0.4.12";
+
 /// Runtime placeholder the SDK's db.Querier wrapper resolves against
 /// `Config.ID` on every query, at request time (see
 /// app-module-sdk/internal/core/db_placeholder.go). Scaffolded SQL emits
