@@ -74,6 +74,14 @@ enum MutationOutcome {
 
 trait ReleaseOperations {
     fn read_state(&mut self) -> Result<RemoteRelease>;
+    /// Check that any web/client project the module declares was actually
+    /// built, before the first mutating action. The default is a no-op so a
+    /// resume of an already-fully-deployed version — where `web/dist` may
+    /// since have been deleted — never runs this before the read that proves
+    /// "no POST was sent".
+    fn preflight_outputs(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn record_version(&mut self) -> Result<MutationOutcome>;
     fn capture_web_bundle(&mut self) -> Result<MutationOutcome>;
     fn upload_artifact(&mut self) -> Result<MutationOutcome>;
@@ -316,6 +324,7 @@ fn drive_release(
 ) -> Result<DriveResult> {
     let mut state = operations.read_state()?;
     let mut attempts = Vec::new();
+    let mut preflighted = false;
     for _ in 0..MAX_RELEASE_TRANSITIONS {
         let action = release_plan::plan(&local, &state)?;
         if action == Action::Done {
@@ -326,6 +335,14 @@ fn drive_release(
                 release: *release,
                 attempts,
             });
+        }
+
+        // Lazy and once: a version that is already fully deployed must take
+        // the Done branch above and never reach here, even if `web/dist` has
+        // since been deleted.
+        if !preflighted {
+            operations.preflight_outputs()?;
+            preflighted = true;
         }
 
         attempts.push(action);
@@ -613,6 +630,50 @@ impl ApiReleaseOperations<'_> {
     }
 }
 
+/// Refuse to record a version when the module declares a web or client
+/// project but nothing built it. Calls the same locators the upload legs
+/// call later (`web_bundle::locate`, `version_client::locate`), so a pass
+/// here and a later upload cannot disagree.
+fn preflight_outputs(module_dir: &Path, slug: &str, version: &str) -> Result<()> {
+    match web_bundle::locate(module_dir) {
+        Ok(Some(bundle_path)) => preflight_web_bundle_size(&bundle_path, slug, version)?,
+        Ok(None) => {}
+        Err(_) => {
+            return Err(anyhow!(
+                "refusing to record {slug}@{version}: the module has a web project but nothing built it (no {}). Nothing was sent to the platform. Build it and run deploy again.",
+                web_bundle::WEB_BUNDLE_REL
+            ));
+        }
+    }
+    if version_client::locate(module_dir).is_err() {
+        return Err(anyhow!(
+            "refusing to record {slug}@{version}: the module has a client project but nothing built it (no {}). Nothing was sent to the platform. Build it and run deploy again.",
+            version_client::CLIENT_DIST_REL
+        ));
+    }
+    Ok(())
+}
+
+fn preflight_web_bundle_size(bundle_path: &Path, slug: &str, version: &str) -> Result<()> {
+    let size = std::fs::metadata(bundle_path)
+        .with_context(|| format!("preflight: read metadata for {}", bundle_path.display()))?
+        .len();
+    if size == 0 {
+        return Err(anyhow!(
+            "refusing to record {slug}@{version}: web bundle at {} is empty. Nothing was sent to the platform. Build it and run deploy again.",
+            bundle_path.display()
+        ));
+    }
+    if size > web_bundle::MAX_WEB_BUNDLE_BYTES {
+        return Err(anyhow!(
+            "refusing to record {slug}@{version}: web bundle at {} is {size} bytes, over the {}-byte cap. Nothing was sent to the platform. Build it and run deploy again.",
+            bundle_path.display(),
+            web_bundle::MAX_WEB_BUNDLE_BYTES
+        ));
+    }
+    Ok(())
+}
+
 fn mutation_error(
     error: ApiError,
     race_codes: &[&str],
@@ -765,6 +826,10 @@ impl ReleaseOperations for ApiReleaseOperations<'_> {
         self.last_version_id = Some(state.version.id.clone());
         self.observed_web_url = Some(actual_web_url);
         Ok(self.convert_state(&state))
+    }
+
+    fn preflight_outputs(&mut self) -> Result<()> {
+        preflight_outputs(self.module_dir, self.slug, self.version)
     }
 
     fn record_version(&mut self) -> Result<MutationOutcome> {
@@ -1440,6 +1505,7 @@ mod release_preparation_tests {
     use super::*;
 
     use std::collections::VecDeque;
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -1519,6 +1585,7 @@ mod release_preparation_tests {
         attempts: Vec<Action>,
         deploy_modes: Vec<api::ModuleDeployMode>,
         settlement_polls: Vec<usize>,
+        module_dir: PathBuf,
     }
 
     impl FakeOperations {
@@ -1529,7 +1596,13 @@ mod release_preparation_tests {
                 attempts: Vec::new(),
                 deploy_modes: Vec::new(),
                 settlement_polls: Vec::new(),
+                module_dir: PathBuf::from("unused-test-module-dir"),
             }
+        }
+
+        fn with_module_dir(mut self, module_dir: &Path) -> Self {
+            self.module_dir = module_dir.to_path_buf();
+            self
         }
 
         fn mutate(&mut self, action: Action) -> Result<MutationOutcome> {
@@ -1550,6 +1623,10 @@ mod release_preparation_tests {
             self.reads
                 .pop_front()
                 .ok_or_else(|| anyhow!("unexpected owner-state read"))
+        }
+
+        fn preflight_outputs(&mut self) -> Result<()> {
+            preflight_outputs(&self.module_dir, SLUG, VERSION)
         }
 
         fn record_version(&mut self) -> Result<MutationOutcome> {
@@ -1723,6 +1800,74 @@ mod release_preparation_tests {
             operations.deploy_modes,
             vec![api::ModuleDeployMode::LocalSimulation]
         );
+    }
+
+    #[test]
+    fn unbuilt_web_or_client_stops_before_any_record_version_call() {
+        for missing_dir in ["web", "client"] {
+            let module_dir = tempfile::tempdir().unwrap();
+            fs::create_dir_all(module_dir.path().join(format!("{missing_dir}/src"))).unwrap();
+
+            let mut operations = FakeOperations::new(
+                vec![RemoteRelease::Absent],
+                vec![(Action::RecordVersion, MutationOutcome::Applied)],
+            )
+            .with_module_dir(module_dir.path());
+            let error = drive_release(&mut operations, planner_local(false))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("refusing to record"), "{error}");
+            assert!(error.contains("Nothing was sent to the platform"), "{error}");
+            assert!(operations.attempts.is_empty(), "{missing_dir}: {error}");
+        }
+    }
+
+    #[test]
+    fn headless_and_fully_built_modules_deploy_as_before() {
+        let done = planner_state("ready", Some(planner_deploy("artifact", "active")));
+
+        // Headless: no web/ or client/ directory at all.
+        let headless_dir = tempfile::tempdir().unwrap();
+        let ready = planner_state("ready", None);
+        let mut headless = FakeOperations::new(
+            vec![ready.clone(), done.clone()],
+            vec![(Action::Deploy, MutationOutcome::Applied)],
+        )
+        .with_module_dir(headless_dir.path());
+        let result = drive_release(&mut headless, planner_local(false)).unwrap();
+        assert_eq!(result.attempts, vec![Action::Deploy]);
+
+        // Both outputs built.
+        let built_dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(built_dir.path().join("web/dist")).unwrap();
+        fs::write(
+            built_dir.path().join(web_bundle::WEB_BUNDLE_REL),
+            b"export function mount(){}",
+        )
+        .unwrap();
+        fs::create_dir_all(built_dir.path().join("client/dist")).unwrap();
+        let mut built = FakeOperations::new(
+            vec![ready, done],
+            vec![(Action::Deploy, MutationOutcome::Applied)],
+        )
+        .with_module_dir(built_dir.path());
+        let result = drive_release(&mut built, planner_local(false)).unwrap();
+        assert_eq!(result.attempts, vec![Action::Deploy]);
+    }
+
+    #[test]
+    fn fully_deployed_version_reports_no_post_even_if_web_dist_was_deleted() {
+        let module_dir = tempfile::tempdir().unwrap();
+        // A web project that used to build, but whose dist/ is now gone — the
+        // preflight must never run on this path, since no mutation is planned.
+        fs::create_dir_all(module_dir.path().join("web/src")).unwrap();
+
+        let done = planner_state("ready", Some(planner_deploy("artifact", "active")));
+        let mut operations =
+            FakeOperations::new(vec![done], vec![]).with_module_dir(module_dir.path());
+        let result = drive_release(&mut operations, planner_local(false)).unwrap();
+        assert!(result.attempts.is_empty());
+        assert!(operations.attempts.is_empty());
     }
 
     #[test]
