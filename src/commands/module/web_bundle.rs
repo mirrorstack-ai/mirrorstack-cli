@@ -27,7 +27,7 @@ pub(crate) const WEB_BUNDLE_REL: &str = "web/dist/index.js";
 /// here so an oversize bundle fails before a credential is minted rather than
 /// after the bytes are on the wire; the platform re-checks regardless, since
 /// a client-side bound is a courtesy and never an enforcement.
-const MAX_WEB_BUNDLE_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_WEB_BUNDLE_BYTES: u64 = 32 * 1024 * 1024;
 
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
