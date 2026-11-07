@@ -48,7 +48,21 @@ const SDK_VERSION_TOKEN: &str = "__MS_SDK_VERSION__";
 /// there instead of in a new user's first five minutes.
 ///
 /// Bump this in the same PR that adopts a new SDK API in the templates.
-const SCAFFOLD_SDK_VERSION: &str = "v0.4.6";
+/// Must stay `>= MIN_SDK_FOR_DEPLOY` below — `scaffold_pin_meets_the_deploy_floor`
+/// enforces that so a bump here can never reopen the gap this issue closed.
+const SCAFFOLD_SDK_VERSION: &str = "v0.4.20";
+
+/// The oldest `app-module-sdk` release a scaffolded module can be deployed
+/// against. `module deploy`'s release-manifest probe
+/// (`release_candidate::MANIFEST_TOOL_MODE`, `"release-manifest-v1"`,
+/// `src/commands/release_candidate/mod.rs`) first shipped in the SDK at this
+/// tag (SDK CHANGELOG, v0.4.12, 2026-08-30). An older SDK never answers the
+/// probe, so `module deploy` waits out its timeout and fails with no
+/// actionable error — see the deploy guide. This constant is the one place
+/// that floor is recorded; a deploy-time check against an already-scaffolded
+/// module's go.mod is plan key DV57, not this issue.
+#[allow(dead_code)] // only a test reads this until DV57 adds the deploy-time check
+const MIN_SDK_FOR_DEPLOY: &str = "v0.4.12";
 
 /// Runtime placeholder the SDK's db.Querier wrapper resolves against
 /// `Config.ID` on every query, at request time (see
@@ -180,6 +194,28 @@ fn render(body: &str, inputs: &Inputs<'_>) -> String {
         .replace(SDK_VERSION_TOKEN, SCAFFOLD_SDK_VERSION)
 }
 
+/// `v0.4.12` -> (0, 4, 12). SDK tags are plain `vMAJOR.MINOR.PATCH` — the SDK
+/// CHANGELOG has never cut a pre-release — so unlike
+/// `release_candidate::parse_go_version` there is no `rc`/`beta` grammar to
+/// strip, just the three decimal parts compared with `Ord`.
+#[allow(dead_code)] // only a test calls this until DV57 adds the deploy-time check
+fn parse_sdk_version(version: &str) -> Option<(u64, u64, u64)> {
+    let rest = version.strip_prefix('v')?;
+    let parts: Vec<&str> = rest.split('.').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let mut out = [0u64; 3];
+    for (slot, part) in out.iter_mut().zip(&parts) {
+        let n: u64 = part.parse().ok()?;
+        if n.to_string() != *part {
+            return None;
+        }
+        *slot = n;
+    }
+    Some((out[0], out[1], out[2]))
+}
+
 /// Convert a platform UUID (`bb8a3f8b-1234-5678-9abc-def012345678`) into a
 /// valid Postgres identifier and `Config.ID`: strip hyphens, prepend a
 /// literal `m` so the result always starts with a letter (UUIDs may begin
@@ -296,6 +332,38 @@ mod tests {
                 "github.com/mirrorstack-ai/app-module-sdk {SCAFFOLD_SDK_VERSION}"
             )),
             "go.mod must pin SDK v0.2.0 to match scaffolded API surface"
+        );
+    }
+
+    #[test]
+    fn scaffold_pin_meets_the_deploy_floor() {
+        // A freshly scaffolded module must be deployable without the manual
+        // SDK upgrade the issue describes: SCAFFOLD_SDK_VERSION is what
+        // go.mod.tmpl ships, MIN_SDK_FOR_DEPLOY is the oldest SDK that
+        // answers module deploy's release-manifest-v1 probe. Needs no Go
+        // toolchain — it only compares the two version strings.
+        let pin = parse_sdk_version(SCAFFOLD_SDK_VERSION).expect("SCAFFOLD_SDK_VERSION parses");
+        let floor = parse_sdk_version(MIN_SDK_FOR_DEPLOY).expect("MIN_SDK_FOR_DEPLOY parses");
+        assert!(
+            pin >= floor,
+            "SCAFFOLD_SDK_VERSION {SCAFFOLD_SDK_VERSION} is below MIN_SDK_FOR_DEPLOY \
+             {MIN_SDK_FOR_DEPLOY} — a freshly scaffolded module cannot pass module \
+             deploy's release-manifest-v1 probe"
+        );
+    }
+
+    #[test]
+    fn parse_sdk_version_reports_v0_4_6_below_the_deploy_floor() {
+        // Control for the test above: v0.4.6 was the stale pin this issue
+        // replaces and predates the SDK release that first spoke
+        // release-manifest-v1, so it must compare below the floor. Without
+        // this, scaffold_pin_meets_the_deploy_floor could pass merely
+        // because the comparison runs backwards.
+        let old_pin = parse_sdk_version("v0.4.6").expect("v0.4.6 parses");
+        let floor = parse_sdk_version(MIN_SDK_FOR_DEPLOY).expect("MIN_SDK_FOR_DEPLOY parses");
+        assert!(
+            old_pin < floor,
+            "v0.4.6 must compare below MIN_SDK_FOR_DEPLOY {MIN_SDK_FOR_DEPLOY}"
         );
     }
 
