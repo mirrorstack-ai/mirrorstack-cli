@@ -24,6 +24,10 @@ pub struct Identity {
     pub profile_url: Option<String>,
     #[serde(default)]
     pub slug: Option<String>,
+    /// Only populated by [`me_detail`]'s `?detail=true` — the plain [`me`]
+    /// call `whoami` uses never asks for it.
+    #[serde(default)]
+    pub developer_mode: Option<bool>,
 }
 
 #[derive(Debug, Error)]
@@ -118,6 +122,30 @@ pub fn tunnel_token(
 
 pub fn me(http: &Client, api_base: &str, access_token: &str) -> Result<Identity, ApiError> {
     let endpoint = format!("{}/v1/auth/me", api_base.trim_end_matches('/'));
+
+    let resp = http
+        .get(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<Identity>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(unexpected_body_error(resp))
+}
+
+/// GET /v1/auth/me?detail=true — like [`me`] but also asks for fields gated
+/// behind `detail`, currently just `developer_mode`
+/// (api-platform `internal/account/service/identity.go:59`). Used by
+/// `mirrorstack doctor`, which reports both the signed-in account and
+/// whether developer mode is on from the one call.
+pub fn me_detail(http: &Client, api_base: &str, access_token: &str) -> Result<Identity, ApiError> {
+    let endpoint = format!("{}/v1/auth/me?detail=true", api_base.trim_end_matches('/'));
 
     let resp = http
         .get(&endpoint)
@@ -2374,6 +2402,30 @@ mod tests {
         let id = me(&test_client(), &server.url(), "AT").expect("ok");
         assert_eq!(id.email, "user@example.com");
         assert_eq!(id.slug.as_deref(), Some("test-user"));
+    }
+
+    #[test]
+    fn me_detail_decodes_developer_mode() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("GET", "/v1/auth/me")
+            .match_query(mockito::Matcher::UrlEncoded("detail".into(), "true".into()))
+            .match_header("authorization", "Bearer AT")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "id": "u-1",
+                    "email": "user@example.com",
+                    "name": "Test User",
+                    "developer_mode": true
+                })
+                .to_string(),
+            )
+            .create();
+
+        let id = me_detail(&test_client(), &server.url(), "AT").expect("ok");
+        assert_eq!(id.email, "user@example.com");
+        assert_eq!(id.developer_mode, Some(true));
     }
 
     #[test]

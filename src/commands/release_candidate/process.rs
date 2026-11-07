@@ -20,7 +20,7 @@ const CLEANUP_GRACE: Duration = Duration::from_secs(2);
 const MAX_STDIN_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
-pub(super) struct ProcessSpec {
+pub(crate) struct ProcessSpec {
     pub program: OsString,
     pub args: Vec<OsString>,
     pub cwd: PathBuf,
@@ -33,7 +33,7 @@ pub(super) struct ProcessSpec {
 }
 
 impl ProcessSpec {
-    pub(super) fn new(program: impl Into<OsString>, cwd: impl Into<PathBuf>) -> Self {
+    pub(crate) fn new(program: impl Into<OsString>, cwd: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
             args: Vec::new(),
@@ -47,12 +47,12 @@ impl ProcessSpec {
         }
     }
 
-    pub(super) fn arg(mut self, arg: impl Into<OsString>) -> Self {
+    pub(crate) fn arg(mut self, arg: impl Into<OsString>) -> Self {
         self.args.push(arg.into());
         self
     }
 
-    pub(super) fn args<I, S>(mut self, args: I) -> Self
+    pub(crate) fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
@@ -61,31 +61,31 @@ impl ProcessSpec {
         self
     }
 
-    pub(super) fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+    pub(crate) fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         let key = key.into();
         self.env_remove.remove(&key);
         self.env.insert(key, value.into());
         self
     }
 
-    pub(super) fn env_remove(mut self, key: impl Into<OsString>) -> Self {
+    pub(crate) fn env_remove(mut self, key: impl Into<OsString>) -> Self {
         let key = key.into();
         self.env.remove(&key);
         self.env_remove.insert(key);
         self
     }
 
-    pub(super) fn stdin(mut self, stdin: Vec<u8>) -> Self {
+    pub(crate) fn stdin(mut self, stdin: Vec<u8>) -> Self {
         self.stdin = stdin;
         self
     }
 
-    pub(super) fn timeout(mut self, timeout: Duration) -> Self {
+    pub(crate) fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    pub(super) fn limits(mut self, stdout: usize, stderr: usize) -> Self {
+    pub(crate) fn limits(mut self, stdout: usize, stderr: usize) -> Self {
         self.stdout_limit = stdout;
         self.stderr_limit = stderr;
         self
@@ -93,17 +93,17 @@ impl ProcessSpec {
 }
 
 #[derive(Debug)]
-pub(super) struct ProcessOutput {
+pub(crate) struct ProcessOutput {
     pub success: bool,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
 
-pub(super) trait ProcessRunner {
+pub(crate) trait ProcessRunner {
     fn run(&self, spec: &ProcessSpec) -> Result<ProcessOutput>;
 }
 
-pub(super) struct SystemRunner;
+pub(crate) struct SystemRunner;
 
 impl ProcessRunner for SystemRunner {
     fn run(&self, spec: &ProcessSpec) -> Result<ProcessOutput> {

@@ -31,7 +31,7 @@ mod redeploy;
 mod register;
 mod release_plan;
 pub(super) mod rename;
-mod scaffold;
+pub(crate) mod scaffold;
 mod transports;
 pub(crate) mod version_client;
 mod version_move;
