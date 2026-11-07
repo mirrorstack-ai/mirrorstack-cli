@@ -110,7 +110,7 @@ pub struct DevArgs {
     /// required for them.
     #[arg(long)]
     tunnel: bool,
-    /// Base URL for tunnel routing. Default: http://localhost.
+    /// Base URL for tunnel routing. Default: http://localhost:9080.
     #[arg(long)]
     local_url: Option<String>,
     /// Run all registered modules directly (used inside Docker runner).
@@ -1821,7 +1821,7 @@ fn open_tunnels(
             }
             Err(tunnel::RegisterError::ModuleNotYours) => {
                 return Err(anyhow!(
-                    "dev: module {} isn't owned by you — only the module owner can open a dev tunnel.\nIf you scaffolded with `mirrorstack app module init`, your `Config.ID` should match the platform's record; re-check it under `mirrorstack app module list`.",
+                    "dev: module {} isn't owned by you — only the module owner can open a dev tunnel.\nIf you scaffolded with `mirrorstack app module init`, your `Config.ID` should match the platform's record; re-check the MS_MODULE_ID_<SLUG> key in your workspace .env.",
                     m.dir.display()
                 ));
             }

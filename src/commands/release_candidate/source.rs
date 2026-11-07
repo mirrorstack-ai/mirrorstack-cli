@@ -125,11 +125,6 @@ impl SourceSnapshot {
                 )
             })?
             .to_path_buf();
-        if module_relative.as_os_str().is_empty() {
-            return Err(anyhow!(
-                "release candidate: --dir must name a module directory inside the Git worktree, not the worktree root"
-            ));
-        }
 
         let baseline = Builder::new()
             .prefix("mirrorstack-release-source-")
@@ -1405,6 +1400,24 @@ mod tests {
         assert!(snapshot.module_dir().join("main.go").is_file());
         assert!(snapshot.module_dir().join("untracked.go").is_file());
         assert_eq!(snapshot.source_sha256().len(), 64);
+        snapshot.verify_unchanged().unwrap();
+    }
+
+    #[test]
+    fn module_at_git_worktree_root_is_accepted() {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "-q"]);
+        fs::write(
+            root.path().join("go.mod"),
+            "module example.com/module\n\ngo 1.23\n",
+        )
+        .unwrap();
+        fs::write(root.path().join("main.go"), "package main\n").unwrap();
+        git(root.path(), &["add", "."]);
+
+        let snapshot = SourceSnapshot::create(root.path()).unwrap();
+        assert!(snapshot.module_dir().join("main.go").is_file());
+        assert!(snapshot.module_dir().join("go.mod").is_file());
         snapshot.verify_unchanged().unwrap();
     }
 
