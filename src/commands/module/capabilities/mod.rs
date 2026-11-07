@@ -15,6 +15,9 @@ pub(crate) mod wire;
 use index::{Report, Severity};
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack module capabilities\n  mirrorstack module capabilities --app my-app --json"
+)]
 pub struct CapabilitiesArgs {
     /// Workspace directory containing go.work. Defaults to the nearest go.work at or above the cwd.
     #[arg(long)]

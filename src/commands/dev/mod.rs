@@ -101,6 +101,9 @@ const PASSTHROUGH_ENV: [&str; 16] = [
 ];
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack dev\n  mirrorstack dev --tunnel\n  mirrorstack dev --all --watch=false"
+)]
 pub struct DevArgs {
     /// Working directory containing go.work.
     #[arg(long)]

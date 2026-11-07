@@ -96,6 +96,9 @@ enum RuntimeArg {
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack apps web deploy --app my-app --dir ./out\n  mirrorstack apps web deploy --app my-app --dir ./out --runtime ssr"
+)]
 pub struct DeployArgs {
     /// App ID or slug the deploy belongs to.
     #[arg(long)]

@@ -17,6 +17,7 @@ use crate::http;
 use super::{DEFAULT_API_BASE, ENV_API_URL, ok_mark, resolve_base, warn_prefix};
 
 #[derive(Args)]
+#[command(after_help = "Examples:\n  mirrorstack logout")]
 pub struct LogoutArgs {}
 
 pub fn run(_args: LogoutArgs) -> Result<()> {

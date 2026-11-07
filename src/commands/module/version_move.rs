@@ -44,6 +44,9 @@ const DEV_INSTALL: &str = "dev";
 const MOVE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack module move --app my-app --module media --to 0.2.0\n  mirrorstack module move --app my-app --module media"
+)]
 pub struct MoveArgs {
     /// App whose install is being moved (id or slug).
     #[arg(long)]

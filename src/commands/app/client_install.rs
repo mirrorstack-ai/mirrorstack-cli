@@ -53,6 +53,9 @@ const ALLOWED_SUFFIXES: [&str; 9] = [
 const MIN_WATCH_INTERVAL_SECS: u64 = 2;
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack apps client install --app my-app\n  mirrorstack apps client install --app my-app --dev"
+)]
 pub struct InstallArgs {
     /// App ID or slug whose installed modules' clients to install.
     #[arg(long)]

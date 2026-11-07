@@ -39,6 +39,9 @@ use crate::{credentials, http};
 use super::rename::workspace_root;
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack module redeploy --version 1.0.0\n  mirrorstack module redeploy --module media --version 1.0.0 --status draining"
+)]
 pub struct RedeployArgs {
     /// Module slug. Defaults to Config.Slug parsed from ./main.go.
     #[arg(long)]
