@@ -443,6 +443,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn write_tree_gitignore_covers_secret_dir_and_runner_binary() {
+        // `mirrorstack dev` writes per-session tokens to .secret/ and mounts
+        // a .mirrorstack-linux runner binary — both are local-only and were
+        // previously unignored, so either could be committed by accident.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("media");
+        write_tree(&target, &ins("media", "Media")).unwrap();
+        let gitignore = fs::read_to_string(target.join(".gitignore")).unwrap();
+        for entry in [".secret/", ".mirrorstack-linux"] {
+            assert!(
+                gitignore.lines().any(|l| l.trim() == entry),
+                "scaffolded .gitignore must ignore {entry}: {gitignore:?}"
+            );
+        }
+    }
+
     /// Render the scaffold and BUILD it — at the pinned SDK release and again
     /// at the SDK's `main`.
     ///

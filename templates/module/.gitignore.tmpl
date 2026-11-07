@@ -3,3 +3,11 @@
 # mints its own ID; a checked-in .env would clobber whichever environment
 # registered second.
 .env
+
+# Per-session tokens `mirrorstack dev` writes while tunneling into the
+# platform. Never commit — they are short-lived and specific to one machine.
+.secret/
+
+# The `mirrorstack dev` Compose runner binary mounted into the container.
+# Never commit — it is a platform binary, not module source.
+.mirrorstack-linux

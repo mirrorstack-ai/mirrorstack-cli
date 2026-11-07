@@ -153,22 +153,58 @@ fn scaffold_if_requested(target: Option<&Path>, inputs: &scaffold::Inputs<'_>) -
     let Some(target) = target else { return Ok(()) };
     scaffold::write_tree(target, inputs)
         .with_context(|| format!("scaffold into {}", target.display()))?;
-    print_scaffold_summary(target);
+    print_scaffold_summary(target, inputs.slug);
     Ok(())
 }
 
-fn print_scaffold_summary(target: &Path) {
+/// A `Config.ID` the SDK will accept for a local `go run`. The SDK's
+/// `moduleIDPattern` (`^[a-z][a-z0-9_]{0,35}$`) forbids hyphens, but a slug
+/// (`slug_valid`) allows and commonly contains them — so the slug itself is
+/// not always a valid id. Hyphens are not allowed in a slug's own alphabet
+/// otherwise, so swapping them for underscores can't collide with an
+/// existing underscore and always lands inside the SDK's pattern (a slug is
+/// lowercase-letter-led, <=16 bytes, well under the 36-char cap).
+fn dev_module_id(slug: &str) -> String {
+    slug.replace('-', "_")
+}
+
+/// The run command the quickstart guide actually uses. `mirrorstack dev`
+/// needs a go.work workspace, a root `.env`, and a Compose file — none of
+/// which `init` writes — so it stops with "has no go.work" on a fresh
+/// scaffold. This runs the scaffolded module directly instead.
+fn run_line(slug: &str) -> String {
+    let id = dev_module_id(slug);
+    if cfg!(windows) {
+        format!("$env:MS_MODULE_ID = \"{id}\"; go run .")
+    } else {
+        format!("MS_MODULE_ID={id} go run .")
+    }
+}
+
+/// The `next:` line's content, without styling — kept separate from
+/// `print_scaffold_summary` so the run-line choice is unit-testable without
+/// capturing stderr.
+fn next_line(target: &Path, slug: &str) -> String {
+    let run = run_line(slug);
+    if is_cwd(target) {
+        format!("go mod tidy && {run}")
+    } else {
+        format!("cd {} && go mod tidy && {run}", target.display())
+    }
+}
+
+fn print_scaffold_summary(target: &Path, slug: &str) {
     eprintln!(
         "{} scaffolded {}",
         ok_mark(),
         style(target.display()).cyan().bold()
     );
-    let next = if is_cwd(target) {
-        "go mod tidy && mirrorstack dev".to_string()
-    } else {
-        format!("cd {} && go mod tidy && mirrorstack dev", target.display())
-    };
-    eprintln!("  {} {next}", style("next:").dim());
+    eprintln!("  {} {}", style("next:").dim(), next_line(target, slug));
+    eprintln!(
+        "  {} `mirrorstack dev` needs a module workspace (go.work, .env, \
+         Compose file) — see the quickstart guide.",
+        style("note:").dim()
+    );
 }
 
 /// Robust check for "scaffold into the current dir." Catches both `.` and
@@ -243,5 +279,55 @@ fn print_already_exists(username: &str, slug: &str, id: Option<&str>) {
     );
     if let Some(id) = id {
         eprintln!("  {} {}", style("id:").dim(), id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_line_runs_the_module_directly_not_mirrorstack_dev() {
+        // `mirrorstack dev` needs a go.work workspace, a root .env, and a
+        // Compose file that `init` does not write — printing it as the next
+        // step sends a fresh scaffold straight into "has no go.work."
+        let next = next_line(Path::new("my-mod"), "my-mod");
+        assert!(
+            !next.contains("mirrorstack dev"),
+            "next step must not be mirrorstack dev: {next:?}"
+        );
+        if cfg!(windows) {
+            assert!(
+                next.contains(r#"$env:MS_MODULE_ID = "my_mod"; go run ."#),
+                "missing PowerShell run line: {next:?}"
+            );
+        } else {
+            assert!(
+                next.contains("MS_MODULE_ID=my_mod go run ."),
+                "missing sh run line: {next:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_module_id_swaps_hyphens_the_sdk_id_pattern_forbids() {
+        // The SDK's Config.ID regex (`^[a-z][a-z0-9_]{0,35}$`) rejects
+        // hyphens even though a slug may contain them (`a1-b2-c3` is a valid
+        // slug) — printing the raw slug as MS_MODULE_ID would crash the
+        // scaffold on first run for any hyphenated slug.
+        assert_eq!(dev_module_id("a1-b2-c3"), "a1_b2_c3");
+    }
+
+    #[test]
+    fn next_line_cds_into_target_when_not_cwd() {
+        let next = next_line(Path::new("widgets"), "widgets");
+        assert!(next.starts_with("cd widgets && go mod tidy && "));
+    }
+
+    #[test]
+    fn next_line_skips_cd_for_cwd_target() {
+        let next = next_line(Path::new("."), "widgets");
+        assert!(next.starts_with("go mod tidy && "));
+        assert!(!next.contains("cd "));
     }
 }
