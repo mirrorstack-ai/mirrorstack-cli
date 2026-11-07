@@ -1817,7 +1817,10 @@ mod release_preparation_tests {
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("refusing to record"), "{error}");
-            assert!(error.contains("Nothing was sent to the platform"), "{error}");
+            assert!(
+                error.contains("Nothing was sent to the platform"),
+                "{error}"
+            );
             assert!(operations.attempts.is_empty(), "{missing_dir}: {error}");
         }
     }
