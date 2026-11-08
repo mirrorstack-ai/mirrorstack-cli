@@ -1,0 +1,14 @@
+# D529 (mirrorstack-fleet#611): the paths only the owner merges. A PR that touches one needs the owner's code-owner
+# review (the org ruleset on the low-risk repos); any other path may be merged by the fleet's merge App after two
+# fleet reviews. Kept equal to mirrorstack-fleet fleet/basic/merge.py OWNER_PATH (GitHub matches these with case;
+# the fleet's own check is case-blind and also refuses such a PR).
+/.github/              @I-am-nothing
+migration              @I-am-nothing
+migrations             @I-am-nothing
+*.sql                  @I-am-nothing
+iam/                   @I-am-nothing
+security/              @I-am-nothing
+CODEOWNERS             @I-am-nothing
+*policy*.json          @I-am-nothing
+**/internal/auth/      @I-am-nothing
+**/internal/*/auth/    @I-am-nothing
