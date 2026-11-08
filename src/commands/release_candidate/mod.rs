@@ -35,6 +35,15 @@ const MANIFEST_TOOL_MODE: &str = "release-manifest-v1";
 /// OD7, 2026-10-25). The platform enforces the same floor on the recorded
 /// `go_version`; raise both together.
 const GO_VERSION_FLOOR: &str = "go1.26.10";
+/// Oldest `app-module-sdk` release `module deploy` will build from (issue
+/// #166, developer plan DV57 part 2/3). An SDK older than this never answers
+/// the SDK release manifest probe, so without this check a developer waits
+/// out that probe's 180s timeout to learn what this check reports in
+/// seconds. `module scaffold`'s pinned template version and the `doctor`
+/// verb should import this constant too (mirrorstack-cli#151) rather than
+/// redefine it.
+pub(crate) const MIN_SDK_FOR_DEPLOY: &str = "v0.4.12";
+const SDK_MODULE_PATH: &str = "github.com/mirrorstack-ai/app-module-sdk";
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_MANIFEST_STDOUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WEB_BYTES: u64 = 32 * 1024 * 1024;
@@ -162,6 +171,7 @@ fn build_with(
     request: CandidateRequest<'_>,
 ) -> Result<ReleaseCandidate> {
     let source = SourceSnapshot::create(request.module_dir)?;
+    enforce_sdk_floor_from_module(&source)?;
     let go_version = check_go_floor(runner, &source)?;
     let replace_view = source.fresh_view("replace-check")?;
     let replace_go = GoEnvironment::new("replace-check")?;
@@ -333,6 +343,139 @@ fn parse_go_version(version: &str) -> Option<(u64, u64, u64)> {
         *slot = n;
     }
     Some((out[0], out[1], out[2]))
+}
+
+/// Read the staged module's `go.mod` and enforce [`MIN_SDK_FOR_DEPLOY`]
+/// directly off its text — no `go` process involved, so a pinned-too-old SDK
+/// fails before the first subprocess of the build starts.
+fn enforce_sdk_floor_from_module(source: &SourceSnapshot) -> Result<()> {
+    let go_mod_path = source.module_dir().join("go.mod");
+    let go_mod_text = fs::read_to_string(&go_mod_path)
+        .with_context(|| format!("release candidate: read {}", go_mod_path.display()))?;
+    enforce_sdk_floor(&go_mod_text)
+}
+
+/// Refuse a `go.mod` that pins `app-module-sdk` below [`MIN_SDK_FOR_DEPLOY`].
+///
+/// A relative `replace` pointing the SDK at a local path is a developer
+/// working on the SDK itself, and is left alone. A pseudo-version is compared
+/// on its semantic base, since it names a commit built on top of that base
+/// release. Anything this cannot confidently parse — no requirement found, or
+/// a version string it does not recognize — is skipped, with a warning for
+/// the unparseable case: this check must never block a deploy by itself.
+fn enforce_sdk_floor(go_mod_text: &str) -> Result<()> {
+    if sdk_locally_replaced(go_mod_text) {
+        return Ok(());
+    }
+    let Some(have) = find_sdk_requirement(go_mod_text) else {
+        return Ok(());
+    };
+    let Some(have_base) = parse_sdk_version(&have) else {
+        eprintln!(
+            "{} release candidate: cannot parse app-module-sdk version `{have}` in go.mod; skipping the SDK floor check",
+            crate::commands::warn_prefix()
+        );
+        return Ok(());
+    };
+    let floor =
+        parse_sdk_version(MIN_SDK_FOR_DEPLOY).expect("MIN_SDK_FOR_DEPLOY is a valid semver");
+    if have_base < floor {
+        return Err(anyhow!(
+            "release candidate: go.mod pins app-module-sdk {have}, below the floor {MIN_SDK_FOR_DEPLOY}. Run: go get {SDK_MODULE_PATH}@latest && go mod tidy"
+        ));
+    }
+    Ok(())
+}
+
+/// Lines belonging to a top-level `go.mod` directive, from either its
+/// single-line form (`require foo v1`) or its parenthesized block form
+/// (`require (\n\tfoo v1\n)`), with the keyword stripped and `// `-comments
+/// removed. Block lines and single-line bodies come out identically shaped,
+/// so callers do not need to care which form a module author used.
+fn module_directive_lines<'a>(go_mod_text: &'a str, keyword: &str) -> Vec<&'a str> {
+    let mut lines = Vec::new();
+    let mut in_block = false;
+    for raw_line in go_mod_text.lines() {
+        let line = match raw_line.find("//") {
+            Some(index) => raw_line[..index].trim(),
+            None => raw_line.trim(),
+        };
+        if in_block {
+            if line == ")" {
+                in_block = false;
+            } else if !line.is_empty() {
+                lines.push(line);
+            }
+            continue;
+        }
+        let Some(rest) = line.strip_prefix(keyword) else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let rest = rest.trim();
+        if rest == "(" {
+            in_block = true;
+        } else if !rest.is_empty() {
+            lines.push(rest);
+        }
+    }
+    lines
+}
+
+/// The version token directly following [`SDK_MODULE_PATH`] on a `require`
+/// directive line, e.g. `app-module-sdk v0.4.6` -> `v0.4.6`.
+fn sdk_version_field(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix(SDK_MODULE_PATH)?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    rest.split_whitespace().next()
+}
+
+fn find_sdk_requirement(go_mod_text: &str) -> Option<String> {
+    module_directive_lines(go_mod_text, "require")
+        .into_iter()
+        .find_map(sdk_version_field)
+        .map(str::to_string)
+}
+
+/// True when a `replace` directive sends the SDK to a relative filesystem
+/// path (`./...` or `../...`) rather than another module version — a
+/// developer building against a local SDK checkout.
+fn sdk_locally_replaced(go_mod_text: &str) -> bool {
+    module_directive_lines(go_mod_text, "replace")
+        .into_iter()
+        .any(|line| {
+            let Some(rest) = line.strip_prefix(SDK_MODULE_PATH) else {
+                return false;
+            };
+            if !rest.starts_with(char::is_whitespace) {
+                return false;
+            }
+            let Some((_, target)) = rest.split_once("=>") else {
+                return false;
+            };
+            let target = target.split_whitespace().next().unwrap_or("");
+            target.starts_with("./") || target.starts_with("../")
+        })
+}
+
+/// `v0.4.12` -> (0, 4, 12); `v0.4.13-0.20261105120000-abcdef123456` (a
+/// pseudo-version) -> (0, 4, 13), its semantic base. Build metadata and
+/// pre-release/pseudo-version suffixes are both ignored past the first `-` or
+/// `+`, same as `go.mod` requires.
+fn parse_sdk_version(version: &str) -> Option<(u64, u64, u64)> {
+    let base = version.strip_prefix('v')?.split(['-', '+']).next()?;
+    let mut parts = base.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
 }
 
 #[derive(Deserialize)]
@@ -1818,6 +1961,99 @@ mod tests {
         ] {
             assert!(enforce_go_floor(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn build_below_the_sdk_floor_is_refused_before_any_go_command() {
+        let (_root, module) = fixture(false, false);
+        fs::write(
+            module.join("go.mod"),
+            "module example.com/module\n\ngo 1.23\n\nrequire github.com/mirrorstack-ai/app-module-sdk v0.4.6\n",
+        )
+        .unwrap();
+        let runner = FakeRunner::default();
+        let error = build_with(&runner, request(&module)).err().unwrap();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("go.mod pins app-module-sdk v0.4.6")
+                && message.contains(MIN_SDK_FOR_DEPLOY)
+                && message.contains(
+                    "go get github.com/mirrorstack-ai/app-module-sdk@latest && go mod tidy"
+                ),
+            "{message}"
+        );
+        assert!(
+            runner.seen.lock().unwrap().is_empty(),
+            "no go command may run below the SDK floor: {:?}",
+            runner.seen.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn sdk_floor_comparison() {
+        for bad in ["v0.4.6", "v0.4.11"] {
+            let go_mod = format!(
+                "module example.com/module\n\ngo 1.23\n\nrequire github.com/mirrorstack-ai/app-module-sdk {bad}\n"
+            );
+            let error = enforce_sdk_floor(&go_mod).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!("pins app-module-sdk {bad}"))
+                    && message.contains(MIN_SDK_FOR_DEPLOY),
+                "{message}"
+            );
+        }
+        for ok in ["v0.4.12", "v0.4.20", "v0.5.0"] {
+            let go_mod = format!(
+                "module example.com/module\n\ngo 1.23\n\nrequire github.com/mirrorstack-ai/app-module-sdk {ok}\n"
+            );
+            assert!(enforce_sdk_floor(&go_mod).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn sdk_floor_reads_the_block_form_require() {
+        let go_mod = "module example.com/module\n\ngo 1.23\n\nrequire (\n\tgithub.com/mirrorstack-ai/app-module-sdk v0.4.6\n\tgithub.com/other/dep v1.0.0 // indirect\n)\n";
+        let error = enforce_sdk_floor(go_mod).unwrap_err();
+        assert!(format!("{error:#}").contains("v0.4.6"));
+
+        let go_mod = "module example.com/module\n\ngo 1.23\n\nrequire (\n\tgithub.com/mirrorstack-ai/app-module-sdk v0.4.12\n)\n";
+        assert!(enforce_sdk_floor(go_mod).is_ok());
+    }
+
+    #[test]
+    fn sdk_floor_compares_a_pseudo_version_on_its_base() {
+        let go_mod = "module example.com/module\n\ngo 1.23\n\nrequire github.com/mirrorstack-ai/app-module-sdk v0.4.13-0.20261105120000-abcdef123456\n";
+        assert!(enforce_sdk_floor(go_mod).is_ok());
+
+        let go_mod = "module example.com/module\n\ngo 1.23\n\nrequire github.com/mirrorstack-ai/app-module-sdk v0.4.6-0.20260101000000-abcdef123456\n";
+        assert!(enforce_sdk_floor(go_mod).is_err());
+    }
+
+    #[test]
+    fn sdk_floor_skips_a_relative_local_replace() {
+        let go_mod = "module example.com/module\n\ngo 1.23\n\nrequire github.com/mirrorstack-ai/app-module-sdk v0.4.6\n\nreplace github.com/mirrorstack-ai/app-module-sdk => ../app-module-sdk\n";
+        assert!(enforce_sdk_floor(go_mod).is_ok());
+
+        let go_mod = "module example.com/module\n\ngo 1.23\n\nrequire github.com/mirrorstack-ai/app-module-sdk v0.4.6\n\nreplace (\n\tgithub.com/mirrorstack-ai/app-module-sdk => ./vendor/app-module-sdk\n)\n";
+        assert!(enforce_sdk_floor(go_mod).is_ok());
+
+        // A replace to another module (not a local path) still enforces the
+        // floor — only a filesystem path means a developer is on the SDK.
+        let go_mod = "module example.com/module\n\ngo 1.23\n\nrequire github.com/mirrorstack-ai/app-module-sdk v0.4.6\n\nreplace github.com/mirrorstack-ai/app-module-sdk => github.com/fork/app-module-sdk v0.4.6\n";
+        assert!(enforce_sdk_floor(go_mod).is_err());
+    }
+
+    #[test]
+    fn sdk_floor_skips_a_missing_requirement() {
+        let go_mod = "module example.com/module\n\ngo 1.23\n";
+        assert!(enforce_sdk_floor(go_mod).is_ok());
+    }
+
+    #[test]
+    fn sdk_floor_warns_and_skips_an_unparseable_version() {
+        let go_mod = "module example.com/module\n\ngo 1.23\n\nrequire github.com/mirrorstack-ai/app-module-sdk latest\n";
+        assert!(enforce_sdk_floor(go_mod).is_ok());
     }
 
     #[test]
