@@ -382,6 +382,15 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     let all_modules = workspace::discover_dev_modules(root)?;
     let metadata = read_workspace_metadata(root, &all_modules)?;
 
+    for dir in workspace::scan_unlisted_modules(root, &all_modules)? {
+        eprintln!(
+            "{} {} has a go.mod but is not in go.work — add ./{} to run it",
+            warn_prefix(),
+            dir.display(),
+            dir.display()
+        );
+    }
+
     let mut ready = Vec::new();
     let mut skipped = Vec::new();
     skipped.extend(metadata.missing_main.into_iter().map(|module| {
@@ -803,6 +812,15 @@ fn run_inner(root: &Path, args: &DevArgs) -> Result<()> {
     let watch = client::effective_watch(root, args.watch)?;
     let all_modules = workspace::discover_dev_modules(root)?;
     let metadata = read_workspace_metadata(root, &all_modules)?;
+
+    for dir in workspace::scan_unlisted_modules(root, &all_modules)? {
+        eprintln!(
+            "{} {} has a go.mod but is not in go.work — add ./{} to run it",
+            warn_prefix(),
+            dir.display(),
+            dir.display()
+        );
+    }
 
     // Ready modules carry their platform id so the shipper sink below
     // doesn't have to re-parse main.go per module.

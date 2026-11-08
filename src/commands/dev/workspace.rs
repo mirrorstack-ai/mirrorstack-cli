@@ -38,6 +38,38 @@ pub(super) fn discover_dev_modules(root: &Path) -> Result<Vec<WorkspaceModule>> 
     discover_module_entries(root)
 }
 
+/// Scan `root` for sibling directories that contain a `go.mod` but are not
+/// listed in any `use` directive of `go.work`. `go.work` is gitignored (it
+/// carries a machine-absolute SDK replace), so a merged module can go
+/// unnoticed on every machine until someone edits their own `go.work` — this
+/// is what lets `dev` warn about that drift instead of staying silent.
+pub(super) fn scan_unlisted_modules(
+    root: &Path,
+    modules: &[WorkspaceModule],
+) -> Result<Vec<PathBuf>> {
+    let mut unlisted = Vec::new();
+    let entries = fs::read_dir(root).with_context(|| format!("dev: scan {}", root.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("dev: scan {}", root.display()))?;
+        let path = entry.path();
+        if !path.is_dir() || !path.join("go.mod").is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let already_listed = modules.iter().any(|m| {
+            m.dir
+                .components()
+                .next()
+                .is_some_and(|c| c.as_os_str() == name)
+        });
+        if !already_listed {
+            unlisted.push(PathBuf::from(name));
+        }
+    }
+    unlisted.sort();
+    Ok(unlisted)
+}
+
 fn discover_module_entries(root: &Path) -> Result<Vec<WorkspaceModule>> {
     let go_work = root.join("go.work");
     let body =
@@ -196,5 +228,44 @@ use (
 
         let err = discover_modules(tmp.path()).unwrap_err();
         assert!(err.to_string().contains("no main.go"));
+    }
+
+    #[test]
+    fn scan_unlisted_modules_finds_module_missing_from_go_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.work"), "use ./oauth-core\n").unwrap();
+        std::fs::create_dir(tmp.path().join("oauth-core")).unwrap();
+        std::fs::write(tmp.path().join("oauth-core/go.mod"), "module oauth-core").unwrap();
+        std::fs::create_dir(tmp.path().join("video-core")).unwrap();
+        std::fs::write(tmp.path().join("video-core/go.mod"), "module video-core").unwrap();
+
+        let modules = discover_module_entries(tmp.path()).unwrap();
+        let unlisted = scan_unlisted_modules(tmp.path(), &modules).unwrap();
+        assert_eq!(unlisted, vec![PathBuf::from("video-core")]);
+    }
+
+    #[test]
+    fn scan_unlisted_modules_ignores_dirs_without_go_mod() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.work"), "use ./oauth-core\n").unwrap();
+        std::fs::create_dir(tmp.path().join("oauth-core")).unwrap();
+        std::fs::write(tmp.path().join("oauth-core/go.mod"), "module oauth-core").unwrap();
+        std::fs::create_dir(tmp.path().join("node_modules")).unwrap();
+
+        let modules = discover_module_entries(tmp.path()).unwrap();
+        let unlisted = scan_unlisted_modules(tmp.path(), &modules).unwrap();
+        assert!(unlisted.is_empty());
+    }
+
+    #[test]
+    fn scan_unlisted_modules_empty_when_all_listed() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("go.work"), "use ./oauth-core\n").unwrap();
+        std::fs::create_dir(tmp.path().join("oauth-core")).unwrap();
+        std::fs::write(tmp.path().join("oauth-core/go.mod"), "module oauth-core").unwrap();
+
+        let modules = discover_module_entries(tmp.path()).unwrap();
+        let unlisted = scan_unlisted_modules(tmp.path(), &modules).unwrap();
+        assert!(unlisted.is_empty());
     }
 }
