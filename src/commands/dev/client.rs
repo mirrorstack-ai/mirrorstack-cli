@@ -743,6 +743,12 @@ fn runner_compatibility_error(root: &Path, detail: &str) -> anyhow::Error {
     )
 }
 
+/// Whether any `docker compose`-recognized project file exists in `root`.
+/// `dev down` is a no-op when the project was never bootstrapped.
+pub(super) fn compose_file_present(root: &Path) -> bool {
+    COMPOSE_FILES.iter().any(|name| root.join(name).is_file())
+}
+
 /// Fail before `compose up` when the workspace's compose file bind-mounts
 /// `.mirrorstack-linux` into the runner but no usable binary is there. Docker
 /// otherwise creates an empty directory at the missing bind source and the
