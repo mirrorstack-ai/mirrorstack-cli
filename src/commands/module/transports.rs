@@ -73,26 +73,8 @@ pub(crate) fn run(args: TransportsArgs) -> Result<()> {
     let client = http::client(Duration::from_secs(60))?;
     let mut creds = credentials::load_or_login_hint()?;
 
-    // Resolve the ref first: the status endpoint resolves the app's tenant
-    // schema from a UUID, so a slug 404s there and would read as "no such
-    // app" rather than "pass the id".
-    let app = match credentials::with_refresh_retry(&mut creds, |token| {
-        api::get_app(&client, &apps_base, token, &args.app)
-    }) {
-        Ok(Some(app)) => app,
-        Ok(None) => return Err(app_not_visible(&args.app)),
-        Err(ApiError::Unauthenticated) => return Err(session_expired()),
-        Err(e) => return Err(e.into()),
-    };
-
-    let statuses = match credentials::with_refresh_retry(&mut creds, |token| {
-        api::list_app_module_status(&client, &dispatch_base, token, &app.id)
-    }) {
-        Ok(Some(rows)) => rows,
-        Ok(None) => return Err(app_not_visible(&args.app)),
-        Err(ApiError::Unauthenticated) => return Err(session_expired()),
-        Err(e) => return Err(e.into()),
-    };
+    let (app, statuses) =
+        resolve_app_and_statuses(&client, &apps_base, &dispatch_base, &mut creds, &args.app)?;
 
     // The install list carries the slug and the pinned version; the status
     // list carries what that pin is serving. Neither alone answers the
@@ -122,6 +104,41 @@ pub(crate) fn run(args: TransportsArgs) -> Result<()> {
 
     print_table(&app.slug, &rows);
     Ok(())
+}
+
+/// Resolve `app_ref` to its [`api::App`], then fetch its module status rows.
+/// Pulled out of [`run`] so a test can pin the two DIFFERENT 404 messages —
+/// the app lookup and the status lookup hit different endpoints and a 404
+/// from one does not mean the same thing as a 404 from the other.
+fn resolve_app_and_statuses(
+    client: &reqwest::blocking::Client,
+    apps_base: &str,
+    dispatch_base: &str,
+    creds: &mut credentials::Credentials,
+    app_ref: &str,
+) -> Result<(api::App, Vec<api::AppModuleStatus>)> {
+    // Resolve the ref first: the status endpoint resolves the app's tenant
+    // schema from a UUID, so a slug 404s there and would read as "no such
+    // app" rather than "pass the id".
+    let app = match credentials::with_refresh_retry(creds, |token| {
+        api::get_app(client, apps_base, token, app_ref)
+    }) {
+        Ok(Some(app)) => app,
+        Ok(None) => return Err(app_not_visible(app_ref)),
+        Err(ApiError::Unauthenticated) => return Err(session_expired()),
+        Err(e) => return Err(e.into()),
+    };
+
+    let statuses = match credentials::with_refresh_retry(creds, |token| {
+        api::list_app_module_status(client, dispatch_base, token, &app.id)
+    }) {
+        Ok(Some(rows)) => rows,
+        Ok(None) => return Err(module_status_not_found(&app)),
+        Err(ApiError::Unauthenticated) => return Err(session_expired()),
+        Err(e) => return Err(e.into()),
+    };
+
+    Ok((app, statuses))
 }
 
 /// Join the two lists on module id and order the result DETERMINISTICALLY.
@@ -225,6 +242,20 @@ fn app_not_visible(app_ref: &str) -> anyhow::Error {
         "app '{app_ref}' is not visible to this account — it does not exist, or you are not a \
          member of it. The platform answers both the same way on purpose, so this cannot tell \
          you which."
+    )
+}
+
+/// The app lookup already succeeded, so a 404 from the module status endpoint
+/// is NOT "app not visible" — it is the dispatch service refusing an app the
+/// caller can legitimately read. Naming the app distinguishes this from
+/// [`app_not_visible`] so a developer with a valid UUID can tell which call
+/// actually failed.
+fn module_status_not_found(app: &api::App) -> anyhow::Error {
+    anyhow!(
+        "found app {} ({}), but the module status endpoint answered 404; it may be a platform \
+         problem, report it with the request id",
+        app.slug,
+        app.id
     )
 }
 
@@ -390,6 +421,92 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("twkpa-edu"), "{err}");
+    }
+
+    fn test_creds() -> credentials::Credentials {
+        credentials::Credentials {
+            access_token: "AT".into(),
+            refresh_token: "RT".into(),
+            expires_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+        }
+    }
+
+    /// `get_app` 404s: the app lookup itself failed, so the ORIGINAL
+    /// "not visible" message applies and the status endpoint is never
+    /// reached.
+    #[test]
+    fn app_lookup_404_prints_the_old_message() {
+        let mut apps_server = mockito::Server::new();
+        let mut dispatch_server = mockito::Server::new();
+        let _apps_mock = apps_server
+            .mock("GET", "/v1/apps/twkpa-edu")
+            .with_status(404)
+            .create();
+        let _dispatch_mock = dispatch_server
+            .mock("GET", mockito::Matcher::Regex(r"^/v1/dispatch/.*".into()))
+            .expect(0)
+            .create();
+
+        let client = http::client(Duration::from_secs(5)).unwrap();
+        let mut creds = test_creds();
+        let err = resolve_app_and_statuses(
+            &client,
+            &apps_server.url(),
+            &dispatch_server.url(),
+            &mut creds,
+            "twkpa-edu",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("not visible"), "{err}");
+        assert!(err.contains("twkpa-edu"), "{err}");
+        _dispatch_mock.assert();
+    }
+
+    /// `get_app` succeeds but the dispatch status endpoint 404s: the app WAS
+    /// found, so the message must name it instead of reusing the
+    /// "not visible" text, which would be false here.
+    #[test]
+    fn module_status_404_after_a_found_app_names_the_app() {
+        let mut apps_server = mockito::Server::new();
+        let mut dispatch_server = mockito::Server::new();
+        let _apps_mock = apps_server
+            .mock("GET", "/v1/apps/twkpa-edu")
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "id": "a-123",
+                    "name": "TWKPA Edu",
+                    "slug": "twkpa-edu"
+                })
+                .to_string(),
+            )
+            .create();
+        let _dispatch_mock = dispatch_server
+            .mock("GET", "/v1/dispatch/apps/a-123/modules/status")
+            .with_status(404)
+            .create();
+
+        let client = http::client(Duration::from_secs(5)).unwrap();
+        let mut creds = test_creds();
+        let err = resolve_app_and_statuses(
+            &client,
+            &apps_server.url(),
+            &dispatch_server.url(),
+            &mut creds,
+            "twkpa-edu",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("found app"), "{err}");
+        assert!(err.contains("twkpa-edu"), "{err}");
+        assert!(err.contains("a-123"), "{err}");
+        assert!(
+            !err.contains("is not visible"),
+            "reused the app-not-found message for a different failure: {err}"
+        );
     }
 
     /// --app is required: an app-scoped report that defaulted to some app
