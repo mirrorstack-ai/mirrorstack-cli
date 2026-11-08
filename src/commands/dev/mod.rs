@@ -317,6 +317,11 @@ impl Drop for OuterSessionTeardown {
 const REBUILD_POLL: Duration = Duration::from_millis(2000);
 /// How often the supervisor checks the stop flag and child liveness.
 const SUPERVISE_TICK: Duration = Duration::from_millis(200);
+/// How long `kill_wait` gives a module to exit after SIGTERM before it
+/// escalates to SIGKILL.
+const TERMINATE_GRACE: Duration = Duration::from_secs(5);
+/// How often `kill_wait` polls the child during the SIGTERM grace period.
+const TERMINATE_POLL: Duration = Duration::from_millis(50);
 
 pub fn run(args: DevArgs) -> Result<()> {
     let cwd = args
@@ -1341,10 +1346,51 @@ fn supervise_module(spec: ModuleSpec) {
     }
 }
 
-/// Kill a child process and reap it (kill alone would leave a zombie).
+/// Stop a module child and reap it. SIGTERM first, so a `signal.Notify`
+/// shutdown hook in the module gets to run and flush buffered work; SIGKILL
+/// only if it hasn't exited within `TERMINATE_GRACE`. Windows has no
+/// SIGTERM, so `Child::kill` (TerminateProcess) is the only path there.
 fn kill_wait(c: &mut Child) {
+    kill_wait_with_grace(c, TERMINATE_GRACE, TERMINATE_POLL);
+}
+
+fn kill_wait_with_grace(c: &mut Child, grace: Duration, poll: Duration) {
+    #[cfg(unix)]
+    {
+        if signal_terminate(c.id()).is_ok() {
+            let deadline = Instant::now() + grace;
+            loop {
+                match c.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) if Instant::now() < deadline => {
+                        thread::sleep(poll);
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = (grace, poll);
+    }
     let _ = c.kill();
     let _ = c.wait();
+}
+
+/// Send SIGTERM to `pid`. Unix only — Windows has no SIGTERM equivalent.
+#[cfg(unix)]
+fn signal_terminate(pid: u32) -> std::io::Result<()> {
+    let pid =
+        i32::try_from(pid).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: pid is this child's own id (not a process group) and SIGTERM
+    // has no Rust memory-safety implications.
+    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Stop the compose project through Docker so the `compose up` frontend can
@@ -2695,6 +2741,71 @@ var _ = mirrorstack.Config{
         assert!(
             !lines.iter().any(|l| l.starts_with("MS_MODULE_ID_")),
             "child process env must not inherit a sibling's suffixed MS_MODULE_ID_* key: {lines:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_wait_lets_a_sigterm_handler_exit_cleanly() {
+        // Traps SIGTERM and exits on its own — the stand-in for a module's
+        // `signal.Notify` shutdown hook. kill_wait must observe this exit
+        // instead of escalating to SIGKILL.
+        let mut child = Command::new("sh")
+            .args(["-c", "trap 'exit 0' TERM; sleep 10 & wait"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Give the shell a moment to install its trap before signaling it —
+        // otherwise the SIGTERM can arrive before `trap` has run, hitting
+        // the default (terminate) disposition instead of the handler.
+        thread::sleep(Duration::from_millis(100));
+
+        let start = Instant::now();
+        kill_wait_with_grace(
+            &mut child,
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        );
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "expected the SIGTERM handler to exit well inside the grace period, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_wait_escalates_to_sigkill_after_grace_period() {
+        // Ignores SIGTERM outright, so kill_wait must fall through to
+        // SIGKILL once the (short, test-only) grace period elapses.
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' TERM; sleep 10 & wait"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // See the comment in the sibling test above: let the trap land
+        // before signaling the shell.
+        thread::sleep(Duration::from_millis(100));
+
+        let grace = Duration::from_millis(200);
+        let start = Instant::now();
+        kill_wait_with_grace(&mut child, grace, Duration::from_millis(20));
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= grace,
+            "expected kill_wait to wait out the grace period before escalating, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < grace + Duration::from_secs(2),
+            "expected SIGKILL escalation to follow promptly after the grace period, took {elapsed:?}"
+        );
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "expected the child to be reaped after SIGKILL escalation"
         );
     }
 }
