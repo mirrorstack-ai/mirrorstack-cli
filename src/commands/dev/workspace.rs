@@ -48,8 +48,7 @@ pub(super) fn scan_unlisted_modules(
     modules: &[WorkspaceModule],
 ) -> Result<Vec<PathBuf>> {
     let mut unlisted = Vec::new();
-    let entries =
-        fs::read_dir(root).with_context(|| format!("dev: scan {}", root.display()))?;
+    let entries = fs::read_dir(root).with_context(|| format!("dev: scan {}", root.display()))?;
     for entry in entries {
         let entry = entry.with_context(|| format!("dev: scan {}", root.display()))?;
         let path = entry.path();
