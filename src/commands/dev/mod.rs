@@ -1381,8 +1381,8 @@ fn kill_wait_with_grace(c: &mut Child, grace: Duration, poll: Duration) {
 /// Send SIGTERM to `pid`. Unix only — Windows has no SIGTERM equivalent.
 #[cfg(unix)]
 fn signal_terminate(pid: u32) -> std::io::Result<()> {
-    let pid = i32::try_from(pid)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let pid =
+        i32::try_from(pid).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     // SAFETY: pid is this child's own id (not a process group) and SIGTERM
     // has no Rust memory-safety implications.
     let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
@@ -2762,7 +2762,11 @@ var _ = mirrorstack.Config{
         thread::sleep(Duration::from_millis(100));
 
         let start = Instant::now();
-        kill_wait_with_grace(&mut child, Duration::from_secs(5), Duration::from_millis(20));
+        kill_wait_with_grace(
+            &mut child,
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        );
         let elapsed = start.elapsed();
 
         assert!(
