@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use clap::Args;
+use clap::{Args, Subcommand};
 use console::style;
 use rand::TryRngCore;
 use rand::rngs::OsRng;
@@ -99,6 +99,32 @@ const PASSTHROUGH_ENV: [&str; 16] = [
     "MS_PLATFORM_BROKER_BASE",
     "MS_PLATFORM_ASSERTION_PUBLIC_KEY",
 ];
+
+/// `mirrorstack dev` and its `down` teardown sub-subcommand.
+#[derive(Args)]
+pub struct DevCli {
+    #[command(subcommand)]
+    command: Option<DevCommand>,
+    #[command(flatten)]
+    args: DevArgs,
+}
+
+#[derive(Subcommand)]
+enum DevCommand {
+    /// Tear down the compose project — same as the Ctrl-C teardown, keeping
+    /// named volumes (Postgres data persists). Pass --volumes to wipe them.
+    Down(DownArgs),
+}
+
+#[derive(Args)]
+pub struct DownArgs {
+    /// Working directory containing go.work.
+    #[arg(long)]
+    dir: Option<PathBuf>,
+    /// Also remove named volumes — wipes Postgres data for a clean slate.
+    #[arg(long)]
+    volumes: bool,
+}
 
 #[derive(Args)]
 pub struct DevArgs {
@@ -318,7 +344,14 @@ const REBUILD_POLL: Duration = Duration::from_millis(2000);
 /// How often the supervisor checks the stop flag and child liveness.
 const SUPERVISE_TICK: Duration = Duration::from_millis(200);
 
-pub fn run(args: DevArgs) -> Result<()> {
+pub fn run(cli: DevCli) -> Result<()> {
+    match cli.command {
+        Some(DevCommand::Down(down_args)) => run_down(down_args),
+        None => run_dev(cli.args),
+    }
+}
+
+fn run_dev(args: DevArgs) -> Result<()> {
     let cwd = args
         .dir
         .clone()
@@ -336,6 +369,46 @@ pub fn run(args: DevArgs) -> Result<()> {
     } else {
         run_outer(&cwd, &args)
     }
+}
+
+/// `mirrorstack dev down [--volumes]`: explicit teardown outside the Ctrl-C
+/// path. Default keeps named volumes (Postgres data survives); --volumes
+/// wipes them for a clean slate. No-op friendly: a workspace that never
+/// started compose (no compose file yet) exits 0 with a hint instead of
+/// erroring on nothing to tear down.
+fn run_down(args: DownArgs) -> Result<()> {
+    let cwd = args
+        .dir
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
+
+    if !cwd.join("go.work").exists() {
+        return Err(anyhow!(
+            "{} has no go.work. Run from a module workspace or pass --dir.",
+            cwd.display()
+        ));
+    }
+
+    if !client::compose_file_present(&cwd) {
+        eprintln!(
+            "{} no compose file in {} — nothing to tear down. Run `mirrorstack dev` first.",
+            warn_prefix(),
+            cwd.display()
+        );
+        return Ok(());
+    }
+
+    stop_compose(&cwd, args.volumes)?;
+    eprintln!(
+        "{} containers and network removed{}",
+        ok_mark(),
+        if args.volumes {
+            ", named volumes wiped"
+        } else {
+            " (named volumes kept)"
+        }
+    );
+    Ok(())
 }
 
 // ── Outer mode: host runs `docker compose up` ───────────────────────
@@ -692,7 +765,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
                 Ok(publisher) => Some(publisher),
                 Err(error) => {
                     client_error = Some(error);
-                    if let Err(stop_error) = stop_compose(root) {
+                    if let Err(stop_error) = stop_compose(root, false) {
                         eprintln!(
                             "{} graceful compose teardown failed: {stop_error:#}",
                             warn_prefix()
@@ -1350,14 +1423,23 @@ fn kill_wait(c: &mut Child) {
 /// Stop the compose project through Docker so the `compose up` frontend can
 /// run its own shutdown path. Killing that frontend directly can leave the
 /// runner, database, and network alive after a client startup failure.
-fn stop_compose(root: &Path) -> Result<()> {
+fn stop_compose(root: &Path, volumes: bool) -> Result<()> {
+    let mut args = vec!["compose", "down", "--remove-orphans"];
+    if volumes {
+        args.push("-v");
+    }
     let status = Command::new("docker")
-        .args(["compose", "down", "--remove-orphans"])
+        .args(&args)
         .current_dir(root)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .context("dev: run docker compose down")?;
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                anyhow!("`docker` not found on PATH. Install Docker Desktop before running dev.")
+            }
+            _ => anyhow!("dev: run docker compose down: {e}"),
+        })?;
     if status.success() {
         Ok(())
     } else {
@@ -1947,6 +2029,28 @@ fn mint_internal_secrets<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn down_outside_module_dir_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let err = run_down(DownArgs {
+            dir: Some(temp.path().to_path_buf()),
+            volumes: false,
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("go.work"));
+    }
+
+    #[test]
+    fn down_without_compose_file_is_a_noop() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("go.work"), "go 1.22\n").unwrap();
+        run_down(DownArgs {
+            dir: Some(temp.path().to_path_buf()),
+            volumes: true,
+        })
+        .expect("no-op dev down should exit 0 when no compose file exists yet");
+    }
 
     fn install_test_publication(
         root: &Path,
