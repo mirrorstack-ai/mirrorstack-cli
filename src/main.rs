@@ -13,12 +13,18 @@ mod commands;
 mod credentials;
 mod http;
 mod scheme;
+mod update_check;
 
 fn main() -> ExitCode {
     load_dotenv();
 
     let cli = commands::Cli::parse();
-    match cli.run() {
+    let skip_update_check = cli.is_dev();
+    let result = cli.run();
+    if !skip_update_check {
+        update_check::maybe_notify();
+    }
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err:#}");

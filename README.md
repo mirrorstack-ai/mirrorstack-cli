@@ -97,6 +97,16 @@ mirrorstack apps client install --app <slug> --frozen  # same token, no --oidc n
 
 Revoke the token when it is no longer needed.
 
+## Update notice
+
+After a command finishes, the CLI checks (at most once every 24 hours,
+cached under `dirs::cache_dir()/mirrorstack-cli/update-check.json`) whether a
+newer release exists on GitHub, and if so prints one line to stderr telling
+you the latest version and how to update. It never runs during `dev`, never
+prints with `--json`, and never prints when stdout or stderr isn't a
+terminal (scripts and CI are unaffected). Set `MIRRORSTACK_NO_UPDATE_CHECK=1`
+to disable it entirely, including the network call.
+
 ## Local development
 
 Build:
