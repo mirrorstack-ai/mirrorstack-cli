@@ -22,7 +22,7 @@ use crate::api::{self, ApiError};
 use crate::http;
 
 use super::deploy::{deploy_error_hint, verify_operation_release_receipt};
-use super::{session_expired, with_spinner};
+use super::{session_expired, with_timeline_step};
 use crate::commands::release_candidate::ReleaseCandidateReceipt;
 
 /// Client-side sanity cap on the packaged (compressed) zip, mirroring the
@@ -165,51 +165,42 @@ fn ship_artifact_with_cap(
     // Only an explicit create-upload `artifact_storage_unconfigured` response
     // may select the server-gated local simulator. Missing routes, legacy
     // platforms, and a failure after upload all fail closed.
-    let prepared = with_spinner(
-        "Preparing artifact upload…",
-        || -> Result<PrepareOutcome> {
-            let upload = match api::create_module_artifact_upload(
-                api_client,
-                apps_base,
-                access_token,
-                module_id,
-                version_ref,
-            ) {
-                Ok(upload) => upload,
-                Err(error) if storage_unconfigured(&error) => {
-                    return Ok(PrepareOutcome::StorageUnconfigured);
-                }
-                // A concurrent invocation finalized these immutable bytes
-                // after our owner-state read. Return to the authoritative
-                // planner; do not send PUT or finalize from stale state.
-                Err(ApiError::Server {
-                    status: 409, code, ..
-                }) if code == CODE_ALREADY_READY => {
-                    return Ok(PrepareOutcome::Replan);
-                }
-                Err(error) if ambiguous_api_error(&error) => {
-                    return Ok(PrepareOutcome::Replan);
-                }
-                Err(error) => return Err(api_error(error)),
-            };
-            verify_artifact_upload_response(
-                &upload,
-                module_id,
-                version_id,
-                version_ref,
-                candidate,
-            )?;
-            // Presigned URLs carry their own auth, so this PUT goes out on a
-            // client with no bearer token and an upload-sized timeout.
-            let upload_client = http::client(UPLOAD_TIMEOUT)?;
-            match upload_one(&upload_client, &upload, &bytes) {
-                Ok(()) => {}
-                Err(UploadError::Ambiguous) => return Ok(PrepareOutcome::Replan),
-                Err(UploadError::Rejected(error)) => return Err(error),
+    let prepared = with_timeline_step("Artifact upload", || -> Result<PrepareOutcome> {
+        let upload = match api::create_module_artifact_upload(
+            api_client,
+            apps_base,
+            access_token,
+            module_id,
+            version_ref,
+        ) {
+            Ok(upload) => upload,
+            Err(error) if storage_unconfigured(&error) => {
+                return Ok(PrepareOutcome::StorageUnconfigured);
             }
-            Ok(PrepareOutcome::Uploaded)
-        },
-    )?;
+            // A concurrent invocation finalized these immutable bytes
+            // after our owner-state read. Return to the authoritative
+            // planner; do not send PUT or finalize from stale state.
+            Err(ApiError::Server {
+                status: 409, code, ..
+            }) if code == CODE_ALREADY_READY => {
+                return Ok(PrepareOutcome::Replan);
+            }
+            Err(error) if ambiguous_api_error(&error) => {
+                return Ok(PrepareOutcome::Replan);
+            }
+            Err(error) => return Err(api_error(error)),
+        };
+        verify_artifact_upload_response(&upload, module_id, version_id, version_ref, candidate)?;
+        // Presigned URLs carry their own auth, so this PUT goes out on a
+        // client with no bearer token and an upload-sized timeout.
+        let upload_client = http::client(UPLOAD_TIMEOUT)?;
+        match upload_one(&upload_client, &upload, &bytes) {
+            Ok(()) => {}
+            Err(UploadError::Ambiguous) => return Ok(PrepareOutcome::Replan),
+            Err(UploadError::Rejected(error)) => return Err(error),
+        }
+        Ok(PrepareOutcome::Uploaded)
+    })?;
     if prepared == PrepareOutcome::StorageUnconfigured {
         return Ok(ShipOutcome::StorageUnconfigured);
     }
@@ -217,7 +208,7 @@ fn ship_artifact_with_cap(
         return Ok(ShipOutcome::Replan);
     }
 
-    let finalized = match with_spinner("Finalizing artifact…", || {
+    let finalized = match with_timeline_step("Artifact finalization", || {
         api::finalize_module_artifact(api_client, apps_base, access_token, module_id, version_ref)
     }) {
         Ok(finalized) => finalized,

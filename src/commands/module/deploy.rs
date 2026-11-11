@@ -9,6 +9,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
+use std::time::Instant;
 
 use super::release_plan::{
     self, Action, LocalRelease, RemoteArtifact, RemoteDeploy, RemoteRelease, RemoteVersion,
@@ -30,6 +32,51 @@ struct ReleaseMetadata {
     migration_module: i64,
     changelog_warnings: Vec<String>,
     readme_truncated: bool,
+}
+
+struct CandidateTimeline {
+    active: Option<(release_candidate::BuildPhase, Instant)>,
+}
+
+impl CandidateTimeline {
+    fn new() -> Self {
+        Self { active: None }
+    }
+
+    fn report(
+        &mut self,
+        phase: release_candidate::BuildPhase,
+        status: release_candidate::BuildPhaseStatus,
+    ) {
+        match status {
+            release_candidate::BuildPhaseStatus::Started => {
+                self.active = Some((phase, Instant::now()));
+                eprintln!("  {} {}…", style("→").cyan(), phase.label());
+            }
+            release_candidate::BuildPhaseStatus::Finished
+            | release_candidate::BuildPhaseStatus::Failed => {
+                let elapsed = match self.active.take() {
+                    Some((active, started)) if active == phase => started.elapsed(),
+                    _ => std::time::Duration::ZERO,
+                };
+                match status {
+                    release_candidate::BuildPhaseStatus::Finished => eprintln!(
+                        "  {} {} ({:.1}s)",
+                        ok_mark(),
+                        phase.label(),
+                        elapsed.as_secs_f64()
+                    ),
+                    release_candidate::BuildPhaseStatus::Failed => eprintln!(
+                        "  {} {} failed ({:.1}s)",
+                        warn_prefix(),
+                        phase.label(),
+                        elapsed.as_secs_f64()
+                    ),
+                    release_candidate::BuildPhaseStatus::Started => unreachable!(),
+                }
+            }
+        }
+    }
 }
 
 trait CandidateEvidence {
@@ -152,15 +199,23 @@ pub(super) fn run(args: DeployArgs) -> Result<()> {
     let client = http::client(Duration::from_secs(15))?;
     let module = get_owned_module(&client, &apps_base, &creds.access_token, &slug)?;
 
-    let candidate = with_spinner("Preparing attested release candidate…", || {
-        release_candidate::build(CandidateRequest {
-            module_dir: &dir,
-            slug: &slug,
-            module_id: &module.id,
-            version: &version,
-            source_version_key: &raw,
+    let candidate_request = || CandidateRequest {
+        module_dir: &dir,
+        slug: &slug,
+        module_id: &module.id,
+        version: &version,
+        source_version_key: &raw,
+    };
+    let candidate = if std::io::stderr().is_terminal() {
+        let mut timeline = CandidateTimeline::new();
+        release_candidate::build_with_progress(candidate_request(), |phase, status| {
+            timeline.report(phase, status)
         })
-    })?;
+    } else {
+        with_spinner("Preparing attested release candidate…", || {
+            release_candidate::build(candidate_request())
+        })
+    }?;
     let zip_path = candidate.artifact_path();
     let metadata = collect_release_metadata(&candidate, &version)?;
 
@@ -782,7 +837,7 @@ impl ReleaseOperations for ApiReleaseOperations<'_> {
             },
         };
         guard_version_create_size(&input)?;
-        let result = with_spinner("Recording version…", || {
+        let result = with_timeline_step("Recording version", || {
             api::record_module_version(
                 self.client,
                 self.apps_base,
@@ -837,7 +892,7 @@ impl ReleaseOperations for ApiReleaseOperations<'_> {
         let version_id = self.last_version_id.as_deref().ok_or_else(|| {
             anyhow!("planner requested web capture before a version id was proven")
         })?;
-        let result = with_spinner("Verifying pinned web bundle…", || {
+        let result = with_timeline_step("Verifying pinned web bundle", || {
             api::capture_module_version_bundle(
                 self.client,
                 self.apps_base,
@@ -914,7 +969,7 @@ impl ReleaseOperations for ApiReleaseOperations<'_> {
             .last_version_id
             .as_deref()
             .ok_or_else(|| anyhow!("planner requested deploy before a version id was proven"))?;
-        let result = with_spinner("Deploying…", || {
+        let result = with_timeline_step("Provisioning release", || {
             api::set_module_deploy(
                 self.client,
                 self.apps_base,
