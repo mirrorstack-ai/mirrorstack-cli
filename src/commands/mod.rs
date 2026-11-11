@@ -46,6 +46,24 @@ pub(crate) const ENV_DISPATCH_URL: &str = "MIRRORSTACK_DISPATCH_URL";
 /// GitHub Actions OIDC audience used for app deploy-grant exchange.
 pub(crate) const ENV_OIDC_AUDIENCE: &str = "MIRRORSTACK_OIDC_AUDIENCE";
 
+static DOTENV: std::sync::OnceLock<(std::path::PathBuf, Vec<String>)> = std::sync::OnceLock::new();
+
+/// Remember the `.env` that was loaded and the keys it actually supplied.
+pub(crate) fn record_dotenv(path: std::path::PathBuf, keys: Vec<String>) {
+    let _ = DOTENV.set((path, keys));
+}
+
+/// Where `env_var`'s current value came from, or `None` when it is unset.
+pub(crate) fn env_source(env_var: &str) -> Option<String> {
+    std::env::var_os(env_var)?;
+    Some(match DOTENV.get() {
+        Some((path, keys)) if keys.iter().any(|k| k == env_var) => {
+            format!(".env file {}", path.display())
+        }
+        _ => "the process environment".to_string(),
+    })
+}
+
 /// Look up a base URL from `env_var`, falling back to `default` when unset.
 pub(crate) fn resolve_base(env_var: &str, default: &str) -> String {
     std::env::var(env_var).unwrap_or_else(|_| default.into())
@@ -96,6 +114,13 @@ enum Command {
     /// Run modules locally with supporting services. Scans go.work for
     /// monorepo mode; falls back to single-module if only main.go exists.
     Dev(dev::DevArgs),
+    /// Serve a module's review harness on localhost — its real settings or
+    /// nav surface in the console's own frame, answered from fixtures.
+    ///
+    /// No platform, no database, no container: `dev` runs the module, this
+    /// renders the page. Needs a `preview` script in the module's
+    /// web/package.json.
+    Preview(dev::preview::PreviewArgs),
 }
 
 impl Cli {
@@ -108,6 +133,7 @@ impl Cli {
             Command::Apps(args) => app::run(args),
             Command::Module(args) => module::run(args),
             Command::Dev(args) => dev::run(args),
+            Command::Preview(args) => dev::preview::run(args),
         }
     }
 }

@@ -55,6 +55,32 @@ pub fn package_bundle(build_dir: &Path) -> Result<(TempDir, PathBuf)> {
     // mkdir -p pkg/.next && cp -r .next/static pkg/.next/static
     copy_tree(&static_dir, &pkg.join(".next").join("static")).context("copy .next/static")?;
 
+    // cp -r public pkg/public — when the app has one.
+    //
+    // 🔴 NEXT'S STANDALONE OUTPUT DELIBERATELY EXCLUDES `public/`, and the
+    // omission is invisible until someone looks at the rendered page. The
+    // standalone server still SERVES /public at the site root, so a missing
+    // file is not a packaging error: the request simply falls through to the
+    // app router, which answers with the app's own 404 PAGE — status 404, but
+    // `content-type: text/html` and a full HTML body.
+    //
+    // Measured on twkpa-edu 2026-09-11, with a control:
+    //
+    //   /logo.png                  -> 404  text/html  11491 bytes
+    //   /__definitely_not_here__.png -> 404  text/html  11510 bytes
+    //
+    // Two responses of the same shape and nearly the same length, so nothing
+    // downstream can tell a dropped asset from a URL that never existed. In a
+    // browser it surfaces only as a broken <img> — which is exactly how it
+    // reached production here.
+    //
+    // Optional, not required: an app with no `public/` is perfectly valid, so
+    // this must not become a third hard-fail beside standalone and static.
+    let public_dir = build_dir.join("public");
+    if public_dir.is_dir() {
+        copy_tree(&public_dir, &pkg.join("public")).context("copy public")?;
+    }
+
     // printf '#!/bin/bash\nexec node server.js\n' > pkg/run.sh; chmod +x pkg/run.sh
     let run_sh = pkg.join("run.sh");
     fs::write(&run_sh, RUN_SH).context("write run.sh")?;
@@ -293,6 +319,7 @@ mod tests {
             "pkg",
         );
         write(dir.path(), ".next/static/chunks/app.js", "chunk");
+        write(dir.path(), "public/logo.png", "png");
 
         let (_tmp, zip_path) = package_bundle(dir.path()).expect("ok");
         assert!(zip_path.is_file());
@@ -313,6 +340,8 @@ mod tests {
                 "node_modules/",
                 "node_modules/pkg/",
                 "node_modules/pkg/index.js",
+                "public/",
+                "public/logo.png",
                 "run.sh",
                 "server.js",
             ]
@@ -322,6 +351,29 @@ mod tests {
         let mut contents = String::new();
         run_sh.read_to_string(&mut contents).unwrap();
         assert_eq!(contents, RUN_SH);
+    }
+
+    /// `public/` is OPTIONAL — the negative half of
+    /// `package_bundle_produces_expected_zip_shape`. Without this, making the
+    /// copy unconditional would still pass that test and would break every app
+    /// that has no `public/` directory.
+    #[test]
+    fn package_bundle_omits_public_when_the_app_has_none() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), ".next/standalone/server.js", "server");
+        write(dir.path(), ".next/static/chunks/app.js", "chunk");
+
+        let (_tmp, zip_path) = package_bundle(dir.path()).expect("packages without public/");
+
+        let file = File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with("public")),
+            "no public/ entry expected, got {names:?}"
+        );
     }
 
     #[cfg(unix)]

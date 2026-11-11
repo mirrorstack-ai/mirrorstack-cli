@@ -39,6 +39,16 @@ fn main() -> ExitCode {
 /// dirs up.
 fn load_dotenv() {
     if let Some(path) = find_dotenv_upward() {
+        // Record which keys the file supplies (process env wins, so only the
+        // ones not already set) so errors can say where a base URL came from.
+        if let Ok(iter) = dotenvy::from_path_iter(&path) {
+            let keys = iter
+                .flatten()
+                .map(|(k, _)| k)
+                .filter(|k| std::env::var_os(k).is_none())
+                .collect();
+            commands::record_dotenv(path.clone(), keys);
+        }
         let _ = dotenvy::from_path(&path);
     }
 }

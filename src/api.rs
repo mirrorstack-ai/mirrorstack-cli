@@ -968,6 +968,83 @@ pub fn list_app_installs(
     Err(unexpected_body_error(resp))
 }
 
+/// One installed module's live serving state, as returned by
+/// `GET /v1/dispatch/apps/{appId}/modules/status`.
+///
+/// 🔴 THIS IS THE ONLY READ-ONLY SOURCE OF A MODULE'S LIVE VERSION. The
+/// owner-scoped `/v1/modules` family exposes RECORDED and PUBLISHED versions
+/// but never the transport row, so the version a module is actually serving is
+/// reachable only here — it is an app-scoped serving fact, not a module
+/// property, because resolution runs through the app's installed version.
+/// `serving_version` comes straight off that row (`module_deploys` joined to
+/// `module_versions`), preference-ordered active → draining → disabled, so it
+/// is the semver string a re-provision takes as `--version`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppModuleStatus {
+    pub module_id: String,
+    /// True while the module is served by a live `mirrorstack dev` tunnel.
+    /// A tunnel does not replace the deploy row: both can be present, and the
+    /// tunnel wins for routing.
+    #[serde(default)]
+    pub tunnel_online: bool,
+    #[serde(default)]
+    pub local_url: String,
+    /// The version the TUNNEL session declares — present only while one is
+    /// connected, and unrelated to what is deployed.
+    #[serde(default)]
+    pub version: String,
+    /// `active` | `draining` | `disabled`, or `none` for a module that has
+    /// never been deployed. Never empty.
+    #[serde(default)]
+    pub deploy_status: String,
+    /// The semver the transport row points at. Empty when `deploy_status` is
+    /// `none`.
+    #[serde(default)]
+    pub serving_version: String,
+    #[serde(default)]
+    pub installs: u32,
+}
+
+/// GET /v1/dispatch/apps/{appId}/modules/status — every module installed in
+/// the app with its live serving state, batched in one call.
+///
+/// Scoped to app MEMBERSHIP (viewer and up), deliberately not to module
+/// ownership: an operator who can see the app can see what it is serving.
+/// `app_id` must be the app UUID. A non-member and an unknown app both answer
+/// 404, so this returns `Ok(None)` for either rather than pretending to know
+/// which.
+pub fn list_app_module_status(
+    http: &Client,
+    dispatch_base: &str,
+    access_token: &str,
+    app_id: &str,
+) -> Result<Option<Vec<AppModuleStatus>>, ApiError> {
+    let endpoint = format!(
+        "{}/v1/dispatch/apps/{}/modules/status",
+        dispatch_base.trim_end_matches('/'),
+        app_id
+    );
+
+    let resp = http
+        .get(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(Some(resp.json::<Vec<AppModuleStatus>>()?));
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(unexpected_body_error(resp))
+}
+
 /// One published version of a module, as returned by
 /// `GET /v1/modules/{moduleId}/version-history`. The changelog map the
 /// platform also returns is deliberately not modelled — the CLI lists
@@ -1158,6 +1235,14 @@ pub struct CreateAppDeployInput<'a> {
     /// (server default: `"static"`) for today's static-export deploys.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<&'a str>,
+    /// The S3 key of an ALREADY-UPLOADED standalone bundle, required when
+    /// `runtime == "ssr"`.
+    ///
+    /// 🔴 THE PLATFORM HEADS THIS KEY BEFORE PROVISIONING, so the artifact has
+    /// to be in S3 *before* the ssr deploy is created. [`presign_ssr_artifact`]
+    /// is what puts it there; see `upload_ssr_artifact`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssr_artifact_key: Option<&'a str>,
     pub files: &'a [DeployFile<'a>],
 }
 
@@ -1398,6 +1483,86 @@ pub fn create_app_deploy(
     let status = resp.status();
     if status.is_success() {
         return Ok(resp.json::<CreatedDeploy>()?);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
+/// Body for `POST /v1/apps/{appId}/deploys/ssr-artifact/presign` — declares
+/// the SSR bundle the CLI is about to upload. The platform derives the S3 key
+/// server-side from `(appID, sha256)`; the CLI never picks the key.
+#[derive(Debug, Serialize)]
+pub struct SSRArtifactPresignInput<'a> {
+    pub env: &'a str,
+    pub size_bytes: u64,
+    /// Lowercase hex SHA-256 of the zip bytes (64 chars).
+    pub sha256: &'a str,
+}
+
+/// Response from the SSR artifact presign step: a presigned S3 PUT plus the
+/// server-derived key to hand back as `CreateAppDeployInput::ssr_artifact_key`.
+// Do not derive Debug: upload_url is a bearer-like presigned credential and
+// must never become printable through an otherwise harmless debug log.
+#[derive(Deserialize)]
+pub struct SSRArtifactPresign {
+    pub upload_url: String,
+    pub key: String,
+    /// Authoritative signed request headers. Applied verbatim on the PUT —
+    /// the presign is bound to the declared length and hash, so a rebuilt
+    /// header set would simply be rejected by S3.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// RFC3339 presign expiry — informational (the PUT follows immediately).
+    #[allow(dead_code)]
+    pub expires_at: String,
+}
+
+impl std::fmt::Debug for SSRArtifactPresign {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SSRArtifactPresign")
+            .field("upload_url", &"<redacted>")
+            .field("key", &self.key)
+            .field("headers", &"<redacted>")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// POST /v1/apps/{appId}/deploys/ssr-artifact/presign — mint a presigned S3
+/// PUT for an SSR bundle, sized against the Lambda ceiling (250 MB) rather
+/// than the 25 MB static-manifest budget.
+///
+/// A platform that predates this route answers chi's PLAIN-TEXT 404, which
+/// [`envelope_error`] surfaces as [`ApiError::Unexpected`] — distinct from the
+/// JSON envelope (`ApiError::Server`, code `not_found`) a real missing app
+/// produces. [`super::commands::app::deploy`] relies on exactly that
+/// distinction to decide whether falling back is safe.
+pub fn presign_ssr_artifact(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    app_id: &str,
+    input: &SSRArtifactPresignInput,
+) -> Result<SSRArtifactPresign, ApiError> {
+    let endpoint = format!(
+        "{}/v1/apps/{}/deploys/ssr-artifact/presign",
+        apps_base.trim_end_matches('/'),
+        app_id
+    );
+
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .json(input)
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json::<SSRArtifactPresign>()?);
     }
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(ApiError::Unauthenticated);
@@ -3481,6 +3646,7 @@ mod tests {
                 env: "prod",
                 note: Some("first ship"),
                 runtime: None,
+                ssr_artifact_key: None,
                 files: &[DeployFile {
                     path: "index.html",
                     size: 5,
@@ -3529,6 +3695,7 @@ mod tests {
                 env: "prod",
                 note: None,
                 runtime: Some("ssr"),
+                ssr_artifact_key: None,
                 files: &[DeployFile {
                     path: "ssr-bundle.zip",
                     size: 9,
@@ -3563,6 +3730,7 @@ mod tests {
                 env: "prod",
                 note: None,
                 runtime: None,
+                ssr_artifact_key: None,
                 files: &[DeployFile {
                     path: "index.html",
                     size: 5,
@@ -3629,6 +3797,122 @@ mod tests {
                 assert_eq!(code, "deploy_not_ready");
             }
             other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn presign_ssr_artifact_success_sends_declaration_and_returns_key() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/v1/apps/app-uuid/deploys/ssr-artifact/presign")
+            .match_header("authorization", "Bearer AT")
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "env": "prod",
+                "size_bytes": 41_943_040u64,
+                "sha256": "bb"
+            })))
+            .with_status(200)
+            .with_body(
+                serde_json::json!({
+                    "upload_url": "https://s3.example/put?sig=1",
+                    "key": "apps/app-uuid/ssr-artifacts/bb.zip",
+                    "headers": {"x-amz-checksum-sha256": "u7s="},
+                    "expires_at": "2026-01-01T00:00:00Z"
+                })
+                .to_string(),
+            )
+            .create();
+
+        let http = crate::http::client(std::time::Duration::from_secs(5)).unwrap();
+        let presign = presign_ssr_artifact(
+            &http,
+            &server.url(),
+            "AT",
+            "app-uuid",
+            &SSRArtifactPresignInput {
+                env: "prod",
+                size_bytes: 41_943_040,
+                sha256: "bb",
+            },
+        )
+        .expect("presign ok");
+        mock.assert();
+        assert_eq!(presign.key, "apps/app-uuid/ssr-artifacts/bb.zip");
+        assert_eq!(presign.upload_url, "https://s3.example/put?sig=1");
+        assert_eq!(
+            presign
+                .headers
+                .get("x-amz-checksum-sha256")
+                .map(String::as_str),
+            Some("u7s=")
+        );
+    }
+
+    /// A platform without the route answers chi's plain-text 404, which must
+    /// surface as `Unexpected` — the caller treats that, and only that, as
+    /// "route absent" and falls back.
+    #[test]
+    fn presign_ssr_artifact_unrouted_platform_is_unexpected_not_server() {
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/v1/apps/app-uuid/deploys/ssr-artifact/presign")
+            .with_status(404)
+            .with_header("content-type", "text/plain; charset=utf-8")
+            .with_body("404 page not found\n")
+            .create();
+
+        let http = crate::http::client(std::time::Duration::from_secs(5)).unwrap();
+        let err = presign_ssr_artifact(
+            &http,
+            &server.url(),
+            "AT",
+            "app-uuid",
+            &SSRArtifactPresignInput {
+                env: "prod",
+                size_bytes: 1,
+                sha256: "bb",
+            },
+        )
+        .expect_err("unrouted platform must error");
+        match err {
+            ApiError::Unexpected { status: 404, .. } => {}
+            other => panic!("got {other:?}, want Unexpected{{status:404}}"),
+        }
+    }
+
+    /// A missing app is also a 404 but carries the envelope — it must stay
+    /// `Server`, so the caller never mistakes it for an absent route.
+    #[test]
+    fn presign_ssr_artifact_missing_app_stays_a_server_envelope() {
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("POST", "/v1/apps/app-uuid/deploys/ssr-artifact/presign")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({"error": {"code": "not_found", "message": "app not found"}})
+                    .to_string(),
+            )
+            .create();
+
+        let http = crate::http::client(std::time::Duration::from_secs(5)).unwrap();
+        let err = presign_ssr_artifact(
+            &http,
+            &server.url(),
+            "AT",
+            "app-uuid",
+            &SSRArtifactPresignInput {
+                env: "prod",
+                size_bytes: 1,
+                sha256: "bb",
+            },
+        )
+        .expect_err("missing app must error");
+        match err {
+            ApiError::Server {
+                status: 404, code, ..
+            } => assert_eq!(code, "not_found"),
+            other => panic!("got {other:?}, want Server{{code:not_found}}"),
         }
     }
 

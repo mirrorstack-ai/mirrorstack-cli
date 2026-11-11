@@ -1,5 +1,7 @@
 # MirrorStack CLI
 
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+
 Official command-line tool for the MirrorStack platform.
 
 ## Install
@@ -119,3 +121,11 @@ MIRRORSTACK_API_URL=http://localhost:8081 \
 MIRRORSTACK_WEB_URL=http://localhost:3000 \
 cargo run -- login
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+[Apache-2.0](LICENSE)

@@ -27,10 +27,12 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Args, ValueEnum};
 use console::style;
 use indicatif::{ProgressBar, ProgressStyle};
+use percent_encoding::percent_decode_str;
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
+use url::Url;
 
-use crate::api::{self, CreateAppDeployInput, DeployFile};
+use crate::api::{self, ApiError, CreateAppDeployInput, DeployFile};
 use crate::commands::{DEFAULT_APPS_API_BASE, ENV_APPS_API_URL, ok_mark, resolve_base};
 use crate::credentials::load_or_login_hint;
 use crate::http;
@@ -53,6 +55,30 @@ const MAX_FILES: usize = 500;
 /// deploys. Distinct from `MAX_TOTAL_BYTES` (the static-file-manifest
 /// cap) — do not conflate the two.
 const MAX_SSR_BUNDLE_BYTES: u64 = 250 * 1024 * 1024; // 250 MB
+
+/// Manifest path the packaged SSR bundle travels under. Only ever one file,
+/// and the platform derives the real S3 key itself.
+const SSR_BUNDLE_NAME: &str = "ssr-bundle.zip";
+
+/// The packaged SSR zip and its byte identity — the three values that always
+/// travel together once `ssr::package_bundle` has run.
+struct PackagedBundle<'a> {
+    zip_path: &'a Path,
+    size: u64,
+    sha256: &'a str,
+}
+
+impl PackagedBundle<'_> {
+    /// The single-entry manifest this bundle uploads under.
+    fn manifest_file(&self) -> ManifestFile {
+        ManifestFile {
+            rel_path: SSR_BUNDLE_NAME.to_string(),
+            abs_path: self.zip_path.to_path_buf(),
+            size: self.size,
+            sha256: self.sha256.to_string(),
+        }
+    }
+}
 
 /// Bounded fan-out for the presigned PUTs. S3 happily takes more, but 8
 /// keeps memory (one file body per in-flight PUT) and socket use small.
@@ -256,6 +282,7 @@ fn deploy_static(
                     env: &args.env,
                     note: args.note.as_deref(),
                     runtime: None,
+                    ssr_artifact_key: None,
                     files: &file_inputs,
                 },
             )
@@ -332,14 +359,26 @@ fn deploy_ssr_with_cap(
         ));
     }
 
-    let file_inputs = [DeployFile {
-        path: "ssr-bundle.zip",
-        size,
-        sha256: &sha256,
-    }];
-    // `runtime: "ssr"` tells the platform this deploy's one file is a
-    // Lambda bundle, not a static-file manifest entry — see the PR
-    // description for the request-shape assumption this rests on.
+    // An SSR deploy is order-inverted: api-platform HEADs `ssr_artifact_key`
+    // and provisions the Lambda from it INSIDE CreateDeploy, so the bundle has
+    // to be in S3 before the ssr deploy exists. `upload_ssr_artifact` puts it
+    // there and hands back the key to point at.
+    let artifact_key = upload_ssr_artifact(
+        args,
+        app,
+        creds,
+        apps_base,
+        client,
+        &PackagedBundle {
+            zip_path: &zip_path,
+            size,
+            sha256: &sha256,
+        },
+    )?;
+    // `_bundle_dir` (the temp dir backing the zip) stays alive through the
+    // upload above by still being in scope here.
+
+    // Now the object exists, so the platform can Head it and provision from it.
     let created = with_spinner("Creating deploy…", || {
         creds.with_retry(|tok| {
             api::create_app_deploy(
@@ -351,6 +390,148 @@ fn deploy_ssr_with_cap(
                     env: &args.env,
                     note: args.note.as_deref(),
                     runtime: Some("ssr"),
+                    ssr_artifact_key: Some(&artifact_key),
+                    // Empty on purpose: an ssr deploy's Lambda code lives at
+                    // ssr_artifact_key, not in the file manifest, and declaring
+                    // the bundle again would ask for a second upload of bytes
+                    // that are already in S3.
+                    files: &[],
+                },
+            )
+        })
+    })
+    .map_err(|error| creds.deploy_error(error))?;
+
+    finish_deploy(args, app, creds, apps_base, client, &created.deploy_id)
+}
+
+/// Upload the packaged SSR bundle and return the `ssr_artifact_key` the ssr
+/// CreateDeploy must name.
+///
+/// Prefers the dedicated presign route, which sizes the upload against the
+/// Lambda ceiling (250 MB). Falls back to the legacy staging create ONLY when
+/// the platform has no such route yet — see [`stage_ssr_artifact_legacy`] for
+/// what that costs.
+fn upload_ssr_artifact(
+    args: &DeployArgs,
+    app: &DeployTarget,
+    creds: &mut DeployAuth,
+    apps_base: &str,
+    client: &Client,
+    bundle: &PackagedBundle<'_>,
+) -> Result<String> {
+    let presigned = with_spinner("Preparing SSR upload…", || {
+        creds.with_retry(|tok| {
+            api::presign_ssr_artifact(
+                client,
+                apps_base,
+                tok,
+                &app.id,
+                &api::SSRArtifactPresignInput {
+                    env: &args.env,
+                    size_bytes: bundle.size,
+                    sha256: bundle.sha256,
+                },
+            )
+        })
+    });
+
+    let presigned = match presigned {
+        Ok(presigned) => presigned,
+        // 🔴 A PLATFORM WITHOUT THIS ROUTE ANSWERS 401, NOT 404. Under
+        // `/v1/apps` the platform AUTHENTICATES BEFORE IT ROUTES, so a path it
+        // does not serve is refused by the auth middleware and never reaches
+        // chi's not-found handler. Measured against production:
+        //
+        //   POST /v1/apps/<app>/deploys/zzz-not-a-route/qqq → 401 JSON token_missing
+        //   POST /v1/apps/<app>/deploys                     → 401 JSON token_missing
+        //   POST /v1/definitely-not-a-service/zzz           → 404 text/plain
+        //
+        // Only OUTSIDE the authenticated subtree does an unknown path 404.
+        // This code first shipped falling back on the plain-text 404 alone,
+        // which was verified against a bare chi router in a unit test and is
+        // simply not what the deployed stack does — every SSR deploy against a
+        // platform without the route died reporting "the OIDC deploy grant
+        // expired or was revoked", which was neither true nor actionable.
+        //
+        // So 401 is ambiguous here — "no such route" and "bad credential" are
+        // the same response — and no amount of inspecting it will say which.
+        // Rather than guess, TRY THE OTHER PATH AND LET ITS ANSWER DECIDE: a
+        // missing route means the legacy staging create succeeds, while a dead
+        // credential means it fails the same way and ITS error is the one the
+        // caller sees. Correct either way, and it cannot mistake one for the
+        // other, because it never has to tell them apart.
+        //
+        // A 404 still falls back too: it is what a platform outside the
+        // authenticated subtree would answer, and what the unit tests cover.
+        Err(ApiError::Unauthenticated) | Err(ApiError::Unexpected { status: 404, .. }) => {
+            eprintln!(
+                "  {} the platform did not accept the SSR artifact presign; trying the legacy staging upload (bundles are capped at 25 MB on that path)",
+                style("note:").yellow()
+            );
+            return stage_ssr_artifact_legacy(args, app, creds, apps_base, client, bundle);
+        }
+        Err(error) => return Err(creds.deploy_error(error)),
+    };
+
+    if presigned.upload_url.is_empty() || presigned.key.is_empty() {
+        return Err(anyhow!(
+            "SSR artifact presign returned no upload URL or key"
+        ));
+    }
+
+    let upload_client = http::client(UPLOAD_TIMEOUT)?;
+    let target = api::UploadTarget {
+        path: SSR_BUNDLE_NAME.to_string(),
+        url: presigned.upload_url,
+        headers: presigned.headers,
+    };
+    let bundle_file = bundle.manifest_file();
+    upload_all(
+        &upload_client,
+        std::slice::from_ref(&target),
+        std::slice::from_ref(&bundle_file),
+    )?;
+    Ok(presigned.key)
+}
+
+/// Legacy path for a platform without the SSR artifact presign route.
+///
+/// Presigned PUTs otherwise come only FROM a create call, so this mints a
+/// THROWAWAY STATIC deploy purely to borrow one app-scoped key, uploads the
+/// bundle to it, and never finalizes or activates it (an unfinalized deploy is
+/// inert). The cost is real and is why the route above exists: a static create
+/// runs the platform's static-manifest validation, so the bundle is silently
+/// measured against the 25 MB manifest budget instead of the 250 MB Lambda
+/// ceiling, and an oversize one is refused as a manifest violation that names
+/// neither SSR nor the real limit.
+///
+/// Delete this once every platform the CLI talks to serves the presign route.
+fn stage_ssr_artifact_legacy(
+    args: &DeployArgs,
+    app: &DeployTarget,
+    creds: &mut DeployAuth,
+    apps_base: &str,
+    client: &Client,
+    bundle: &PackagedBundle<'_>,
+) -> Result<String> {
+    let file_inputs = [DeployFile {
+        path: SSR_BUNDLE_NAME,
+        size: bundle.size,
+        sha256: bundle.sha256,
+    }];
+    let staged = with_spinner("Staging SSR bundle…", || {
+        creds.with_retry(|tok| {
+            api::create_app_deploy(
+                client,
+                apps_base,
+                tok,
+                &app.id,
+                &CreateAppDeployInput {
+                    env: &args.env,
+                    note: args.note.as_deref(),
+                    runtime: None,
+                    ssr_artifact_key: None,
                     files: &file_inputs,
                 },
             )
@@ -358,22 +539,53 @@ fn deploy_ssr_with_cap(
     })
     .map_err(|error| creds.deploy_error(error))?;
 
-    let bundle_file = ManifestFile {
-        rel_path: "ssr-bundle.zip".to_string(),
-        abs_path: zip_path,
-        size,
-        sha256,
-    };
+    let upload = staged
+        .uploads
+        .first()
+        .ok_or_else(|| anyhow!("staging deploy returned no upload for the SSR bundle"))?;
+    // Read the key back out of the platform's OWN presigned URL rather than
+    // rebuilding "apps/<app>/deploys/<id>/files/<path>" here. That layout is
+    // api-platform's private convention; a copy of it in this CLI would be a
+    // second source of truth that breaks silently the day the platform changes
+    // it, and the failure would be a 403 or a not-found blaming the artifact.
+    let artifact_key = artifact_key_from_presigned(&upload.url)?;
+
+    let bundle_file = bundle.manifest_file();
     let upload_client = http::client(UPLOAD_TIMEOUT)?;
     upload_all(
         &upload_client,
-        &created.uploads,
+        &staged.uploads,
         std::slice::from_ref(&bundle_file),
     )?;
-    // `_bundle_dir` (the temp dir backing `bundle_file.abs_path`) stays
-    // alive through the upload above by still being in scope here.
+    Ok(artifact_key)
+}
 
-    finish_deploy(args, app, creds, apps_base, client, &created.deploy_id)
+/// Extract the S3 object key from a presigned PUT URL.
+///
+/// The key is the URL path minus its leading slash, percent-decoded — S3
+/// presigns encode the key into the path, so this recovers exactly the object
+/// the platform told us to write to. Query parameters (the signature) are
+/// dropped.
+fn artifact_key_from_presigned(url: &str) -> Result<String> {
+    let parsed = Url::parse(url).with_context(|| format!("parse presigned URL {url}"))?;
+    // Decode per SEGMENT, then rejoin. `url` hands back segments still
+    // percent-encoded, and decoding the whole path in one pass would turn an
+    // encoded "/" INSIDE a segment into a separator — a different key from the
+    // one S3 signed. Segment-wise decoding cannot, because the split happened
+    // first.
+    let key = parsed
+        .path_segments()
+        .map(|segments| {
+            segments
+                .map(|segment| percent_decode_str(segment).decode_utf8_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .unwrap_or_default();
+    if key.is_empty() {
+        return Err(anyhow!("presigned URL {url} carries no object key"));
+    }
+    Ok(key)
 }
 
 /// Shared tail for both runtimes: finalize the already-uploaded deploy,
@@ -930,21 +1142,32 @@ mod tests {
         let (upload_url, captured) = spawn_upload_capture();
 
         let mut server = Server::new();
-        let _create = server
-            .mock("POST", "/v1/apps/a-1/deploys")
+        let _presign = server
+            .mock("POST", "/v1/apps/a-1/deploys/ssr-artifact/presign")
             .match_header("authorization", "Bearer AT")
-            .with_status(201)
+            .with_status(200)
             .with_body(
                 json!({
-                    "deploy_id": "d-1",
-                    "uploads": [{
-                        "path": "ssr-bundle.zip",
-                        "url": upload_url,
-                        "headers": {}
-                    }]
+                    "upload_url": upload_url,
+                    "key": "apps/a-1/ssr-artifacts/abc.zip",
+                    "headers": {},
+                    "expires_at": "2026-01-01T00:00:00Z"
                 })
                 .to_string(),
             )
+            .create();
+        // The ssr create names the key the presign returned and declares NO
+        // files — the bundle is already in S3.
+        let _create = server
+            .mock("POST", "/v1/apps/a-1/deploys")
+            .match_header("authorization", "Bearer AT")
+            .match_body(mockito::Matcher::PartialJson(json!({
+                "runtime": "ssr",
+                "ssr_artifact_key": "apps/a-1/ssr-artifacts/abc.zip",
+                "files": []
+            })))
+            .with_status(201)
+            .with_body(json!({"deploy_id": "d-1", "uploads": []}).to_string())
             .create();
         let _finalize = server
             .mock("POST", "/v1/apps/a-1/deploys/d-1/finalize")
@@ -998,6 +1221,251 @@ mod tests {
                 assert_ne!(mode & 0xF000, S_IFLNK, "{:?} is a symlink", entry.name());
             }
         }
+    }
+
+    /// A platform that predates the presign route answers chi's PLAIN-TEXT
+    /// 404. That — and only that — is safe to retry down the legacy staging
+    /// path, so CI keeps deploying through the rollout window.
+    #[test]
+    fn deploy_ssr_falls_back_when_the_platform_has_no_presign_route() {
+        let dir = TempDir::new().unwrap();
+        ssr_fixture(dir.path());
+        let (upload_url, captured) = spawn_upload_capture();
+
+        let mut server = Server::new();
+        // Exactly what an unrouted chi path returns: text/plain, no envelope.
+        let _presign = server
+            .mock("POST", "/v1/apps/a-1/deploys/ssr-artifact/presign")
+            .with_status(404)
+            .with_header("content-type", "text/plain; charset=utf-8")
+            .with_body("404 page not found\n")
+            .create();
+        // Legacy path: a STATIC staging create lends its presigned PUT ...
+        let _stage = server
+            .mock("POST", "/v1/apps/a-1/deploys")
+            // A non-empty files array is what distinguishes the legacy
+            // staging create from the ssr create on the same path.
+            .match_body(mockito::Matcher::Regex(r#""files":\[\{"#.to_string()))
+            .with_status(201)
+            .with_body(
+                json!({
+                    "deploy_id": "staging",
+                    "uploads": [{
+                        "path": "ssr-bundle.zip",
+                        "url": format!("{upload_url}/apps/a-1/deploys/staging/files/ssr-bundle.zip"),
+                        "headers": {}
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        // ... and the ssr create then names the key recovered from that URL.
+        let _create = server
+            .mock("POST", "/v1/apps/a-1/deploys")
+            // The property under test is that the key is RECOVERED from the
+            // path of the platform's own presigned URL — not rebuilt from a
+            // copy of the key convention. Matched as a suffix because the
+            // capture stub serves its URLs under its own "/upload" path.
+            .match_body(mockito::Matcher::Regex(
+                r#""runtime":"ssr","ssr_artifact_key":"[^"]*apps/a-1/deploys/staging/files/ssr-bundle\.zip""#
+                    .to_string(),
+            ))
+            .with_status(201)
+            .with_body(json!({"deploy_id": "d-1", "uploads": []}).to_string())
+            .create();
+        let _finalize = server
+            .mock("POST", "/v1/apps/a-1/deploys/d-1/finalize")
+            .with_status(200)
+            .with_body(json!({"status": "ready"}).to_string())
+            .create();
+        let _activate = server
+            .mock("POST", "/v1/apps/a-1/stages/prod/activate")
+            .with_status(200)
+            .with_body(json!({"active_deploy_id": "d-1"}).to_string())
+            .create();
+
+        let client = http::client(Duration::from_secs(15)).unwrap();
+        deploy_ssr(
+            &test_args(),
+            dir.path(),
+            &test_app(),
+            &mut test_creds(),
+            &server.url(),
+            &client,
+        )
+        .expect("deploy_ssr falls back and succeeds");
+
+        assert!(
+            !captured.lock().expect("captured mutex").is_empty(),
+            "the bundle never reached the legacy staging upload"
+        );
+    }
+
+    /// 🔴 THE REGRESSION. The deployed platform authenticates BEFORE it routes
+    /// under `/v1/apps`, so a platform without the presign route answers 401,
+    /// not chi's plain-text 404. Falling back only on the 404 made every SSR
+    /// deploy against such a platform die reporting an expired OIDC grant.
+    #[test]
+    fn deploy_ssr_falls_back_when_an_unknown_route_is_refused_by_auth_as_401() {
+        let dir = TempDir::new().unwrap();
+        ssr_fixture(dir.path());
+        let (upload_url, captured) = spawn_upload_capture();
+
+        let mut server = Server::new();
+        // Exactly what /v1/apps answers for a path it does not serve.
+        let _presign = server
+            .mock("POST", "/v1/apps/a-1/deploys/ssr-artifact/presign")
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({"error": {"code": "token_missing", "message": "authorization header required"}})
+                    .to_string(),
+            )
+            .create();
+        let _stage = server
+            .mock("POST", "/v1/apps/a-1/deploys")
+            .match_body(mockito::Matcher::Regex(r#""files":\[\{"#.to_string()))
+            .with_status(201)
+            .with_body(
+                json!({
+                    "deploy_id": "staging",
+                    "uploads": [{
+                        "path": "ssr-bundle.zip",
+                        "url": format!("{upload_url}/apps/a-1/deploys/staging/files/ssr-bundle.zip"),
+                        "headers": {}
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+        let _create = server
+            .mock("POST", "/v1/apps/a-1/deploys")
+            .match_body(mockito::Matcher::Regex(r#""runtime":"ssr""#.to_string()))
+            .with_status(201)
+            .with_body(json!({"deploy_id": "d-1", "uploads": []}).to_string())
+            .create();
+        let _finalize = server
+            .mock("POST", "/v1/apps/a-1/deploys/d-1/finalize")
+            .with_status(200)
+            .with_body(json!({"status": "ready"}).to_string())
+            .create();
+        let _activate = server
+            .mock("POST", "/v1/apps/a-1/stages/prod/activate")
+            .with_status(200)
+            .with_body(json!({"active_deploy_id": "d-1"}).to_string())
+            .create();
+
+        let client = http::client(Duration::from_secs(15)).unwrap();
+        deploy_ssr(
+            &test_args(),
+            dir.path(),
+            &test_app(),
+            &mut test_creds(),
+            &server.url(),
+            &client,
+        )
+        .expect("a 401 from an unrouted presign must fall back, not abort");
+
+        assert!(
+            !captured.lock().expect("captured mutex").is_empty(),
+            "the bundle never reached the legacy staging upload"
+        );
+    }
+
+    /// The other half of that ambiguity: when the credential really IS dead,
+    /// BOTH calls 401 and the caller must still be told so. The fallback never
+    /// has to tell the two apart — it lets the second call answer.
+    #[test]
+    fn deploy_ssr_reports_the_credential_when_the_fallback_is_refused_too() {
+        let dir = TempDir::new().unwrap();
+        ssr_fixture(dir.path());
+
+        let mut server = Server::new();
+        let _presign = server
+            .mock("POST", "/v1/apps/a-1/deploys/ssr-artifact/presign")
+            .with_status(401)
+            .with_body(
+                json!({"error": {"code": "invalid_token", "message": "invalid token"}}).to_string(),
+            )
+            .create();
+        let staging = server
+            .mock("POST", "/v1/apps/a-1/deploys")
+            // at_least(1), not exactly 1: a user credential refreshes and
+            // retries once on 401, so the count is the auth layer's business.
+            // What matters is that the fallback was ATTEMPTED at all.
+            .expect_at_least(1)
+            .with_status(401)
+            .with_body(
+                json!({"error": {"code": "invalid_token", "message": "invalid token"}}).to_string(),
+            )
+            .create();
+
+        let client = http::client(Duration::from_secs(15)).unwrap();
+        let err = deploy_ssr(
+            &test_args(),
+            dir.path(),
+            &test_app(),
+            &mut test_creds(),
+            &server.url(),
+            &client,
+        )
+        .expect_err("a dead credential must still fail");
+
+        // The staging attempt is what turns the ambiguous 401 into a verdict,
+        // so it must actually have been made.
+        staging.assert();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("session")
+                || rendered.contains("expired")
+                || rendered.contains("invalid"),
+            "the credential failure was not reported: {rendered}"
+        );
+    }
+
+    /// 🔴 THE DISCRIMINATING CASE. A missing APP is also a 404, but it carries
+    /// the JSON error envelope. Falling back on it would send a doomed deploy
+    /// down the staging path to fail several steps later blaming the artifact,
+    /// so the error must surface here and no staging create may be attempted.
+    #[test]
+    fn deploy_ssr_does_not_fall_back_when_the_app_is_not_found() {
+        let dir = TempDir::new().unwrap();
+        ssr_fixture(dir.path());
+
+        let mut server = Server::new();
+        let _presign = server
+            .mock("POST", "/v1/apps/a-1/deploys/ssr-artifact/presign")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({"error": {"code": "not_found", "message": "app not found"}}).to_string(),
+            )
+            .create();
+        // Never called: expect(0) turns a regression into a failed assertion
+        // rather than a silently different code path.
+        let staging = server
+            .mock("POST", "/v1/apps/a-1/deploys")
+            .expect(0)
+            .with_status(201)
+            .create();
+
+        let client = http::client(Duration::from_secs(15)).unwrap();
+        let err = deploy_ssr(
+            &test_args(),
+            dir.path(),
+            &test_app(),
+            &mut test_creds(),
+            &server.url(),
+            &client,
+        )
+        .expect_err("an app-not-found must not be retried as a missing route");
+
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("not_found") || rendered.contains("app not found"),
+            "error lost the platform's reason: {rendered}"
+        );
+        staging.assert();
     }
 
     #[cfg(unix)]
@@ -1138,5 +1606,41 @@ mod tests {
         assert!(message.contains("staging"), "{message}");
         assert!(message.contains("prod"), "{message}");
         assert!(!message.contains("grant-secret"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod ssr_artifact_key_tests {
+    use super::artifact_key_from_presigned;
+
+    // 🔴 THE KEY COMES FROM THE PLATFORM'S OWN PRESIGNED URL, never from a copy
+    // of its layout. api-platform builds "apps/<app>/deploys/<id>/files/<path>"
+    // privately; rebuilding that string here would be a second source of truth
+    // that breaks silently the day it changes, surfacing as a not-found on the
+    // artifact rather than as the version skew it is.
+    #[test]
+    fn reads_the_key_out_of_the_signed_path() {
+        let url = "https://bucket.s3.ap-northeast-1.amazonaws.com/apps/a722a8a8/deploys/ddab4c68/files/ssr-bundle.zip?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=deadbeef";
+        assert_eq!(
+            artifact_key_from_presigned(url).unwrap(),
+            "apps/a722a8a8/deploys/ddab4c68/files/ssr-bundle.zip"
+        );
+    }
+
+    // A percent-encoded segment must come back as the literal key S3 signed,
+    // or the Head that gates provisioning looks for an object that isn't there.
+    #[test]
+    fn decodes_encoded_segments() {
+        let url = "https://bucket.s3.amazonaws.com/apps/x/deploys/y/files/ssr%20bundle.zip?X-Amz-Signature=x";
+        assert_eq!(
+            artifact_key_from_presigned(url).unwrap(),
+            "apps/x/deploys/y/files/ssr bundle.zip"
+        );
+    }
+
+    #[test]
+    fn rejects_a_url_with_no_key() {
+        assert!(artifact_key_from_presigned("https://bucket.s3.amazonaws.com/").is_err());
+        assert!(artifact_key_from_presigned("not a url").is_err());
     }
 }
