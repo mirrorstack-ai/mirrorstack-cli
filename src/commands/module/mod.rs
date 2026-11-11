@@ -24,6 +24,7 @@ use crate::http;
 pub(crate) mod artifact;
 pub(crate) mod capabilities;
 mod changelog;
+mod client_publish;
 mod deploy;
 mod init;
 mod readme;
@@ -72,6 +73,11 @@ enum ModuleCommand {
     /// derived by the platform from the module's own identity, never
     /// supplied by the caller.
     Deploy(DeployArgs),
+    /// Publish a version's client library on its own, without re-cutting the
+    /// release. For a version the platform already holds and has NOT deployed:
+    /// the whole-release path ships the client on its way to Deploy, and this
+    /// completes a release that was interrupted after its artifact.
+    ClientPublish(client_publish::ClientPublishArgs),
     /// Re-provision a version that is ALREADY deployed, recording nothing.
     ///
     /// The platform writes a module Lambda's injected environment — its
@@ -161,6 +167,7 @@ pub fn run(args: ModuleArgs) -> Result<()> {
         ModuleCommand::Register(r) => register::run(r),
         ModuleCommand::Rename(r) => rename::run(r),
         ModuleCommand::Deploy(d) => deploy::run(d),
+        ModuleCommand::ClientPublish(c) => client_publish::run(c),
         ModuleCommand::Redeploy(r) => redeploy::run(r),
         ModuleCommand::Transports(t) => transports::run(t),
         ModuleCommand::Move(m) => version_move::run(m),

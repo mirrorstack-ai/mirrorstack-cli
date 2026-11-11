@@ -77,6 +77,8 @@ trait ReleaseOperations {
     fn record_version(&mut self) -> Result<MutationOutcome>;
     fn capture_web_bundle(&mut self) -> Result<MutationOutcome>;
     fn upload_artifact(&mut self) -> Result<MutationOutcome>;
+    /// Ship the module client for a version that is not yet deployed.
+    fn ship_client(&mut self) -> Result<()>;
     fn deploy(&mut self, mode: api::ModuleDeployMode) -> Result<MutationOutcome>;
     fn wait_before_deploy_settlement_read(&mut self, _poll: usize) {}
 }
@@ -147,6 +149,31 @@ pub(super) fn run(args: DeployArgs) -> Result<()> {
         return Ok(());
     }
 
+    // 🔴 PREFLIGHT EVERY SHIPPABLE ARTIFACT BEFORE ANY REMOTE MUTATION.
+    //
+    // record_version SEALS the version: its manifest bytes, artifact digest and
+    // web-bundle identity become immutable the instant the platform accepts it
+    // (api-platform migration 088). Every upload happens AFTER that. So a
+    // failure at any later step leaves a recorded, immutable, half-published
+    // version that can never be completed and never be re-cut — the key is
+    // simply gone.
+    //
+    // That is not hypothetical. user-core v1.0.2 and v1.0.3 were both lost this
+    // way on 2026-09-09: v1.0.2 recorded, uploaded its Go artifact, then failed
+    // because nothing had built web/dist; v1.0.3 recorded, uploaded its artifact
+    // AND its web bundle, then failed on the client upload. Pinning an app to
+    // either left that module with no console UI. Two version keys for two
+    // missing local directories, both of which were knowable before a single
+    // byte was sent.
+    //
+    // Checking here costs one stat() per artifact and converts an unrecoverable
+    // remote state into a local error that names the missing build.
+    if let Some(missing) = missing_release_inputs(&dir)? {
+        return Err(anyhow!(
+            "refusing to record {slug}@{version}: {missing}\n\n               A version is sealed the moment it is recorded, and its artifacts upload afterwards — \n               so recording now would burn this version key permanently if the upload then failed.\n               Build the missing output and rerun; nothing has been sent to the platform."
+        ));
+    }
+
     let creds = credentials::load_or_login_hint()?;
     let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
     let client = http::client(Duration::from_secs(15))?;
@@ -202,6 +229,7 @@ pub(super) fn run(args: DeployArgs) -> Result<()> {
         observed_web_url: None,
         expected_capture_url: None,
         last_deploy: None,
+        candidate_divergence: Vec::new(),
     };
     let completed = drive_release(&mut remote, local)?;
     let deploy = completed
@@ -316,6 +344,7 @@ fn drive_release(
 ) -> Result<DriveResult> {
     let mut state = operations.read_state()?;
     let mut attempts = Vec::new();
+    let mut repeated_replans = 0usize;
     for _ in 0..MAX_RELEASE_TRANSITIONS {
         let action = release_plan::plan(&local, &state)?;
         if action == Action::Done {
@@ -334,6 +363,16 @@ fn drive_release(
             Action::CaptureWebBundle => operations.capture_web_bundle()?,
             Action::UploadArtifact => operations.upload_artifact()?,
             Action::Deploy => {
+                // 🔴 THE CLIENT SHIPS HERE, NOT WITH THE ARTIFACT. It used to
+                // ride upload_artifact's success branch, which made it
+                // unreachable for any version whose artifact was ALREADY ready
+                // — a resumed or repaired release recorded its version, stored
+                // its Go zip, and then deployed with no client at all, so a
+                // consumer could never close its dev tunnel. Deploy is the one
+                // action every path passes through exactly once, and running it
+                // first means a version is never published missing a client its
+                // module declares.
+                operations.ship_client()?;
                 let mode = deploy_mode_for(&state, local.local_simulation_authorized)?;
                 operations.deploy(mode)?
             }
@@ -344,6 +383,21 @@ fn drive_release(
         }
         if outcome == MutationOutcome::StorageUnconfigured {
             local.local_simulation_authorized = true;
+        }
+        // 🔴 A REPEATED IDENTICAL FAILURE IS NOT A RACE. Replan exists so a
+        // concurrent writer can be re-read and worked around; it is not a
+        // retry budget for a deterministic server error. Three of the same
+        // action in a row means the state is not going to change, and looping
+        // to the transition cap turns a precise error into "did not converge".
+        if outcome == MutationOutcome::Replan {
+            repeated_replans += 1;
+            if repeated_replans >= 3 {
+                return Err(anyhow!(
+                    "{action:?} failed {repeated_replans} times in a row against unchanged authoritative state; this is not a race. The platform error is printed above."
+                ));
+            }
+        } else {
+            repeated_replans = 0;
         }
 
         let mut reread = operations.read_state()?;
@@ -455,6 +509,12 @@ struct ApiReleaseOperations<'a> {
     observed_web_url: Option<String>,
     expected_capture_url: Option<String>,
     last_deploy: Option<api::ModuleDeploy>,
+    /// Content fields where the recorded version diverges from this run's
+    /// attested candidate. Empty for a clean resume. Non-empty only for an
+    /// UNPUBLISHED version — the read refuses outright once it is published —
+    /// and folded into the planner's mismatch list so it routes to a
+    /// re-record instead of a refusal.
+    candidate_divergence: Vec<String>,
 }
 
 impl ApiReleaseOperations<'_> {
@@ -582,7 +642,11 @@ impl ApiReleaseOperations<'_> {
         let receipt = &state.release_receipt;
         let version = &state.version;
         RemoteRelease::Present(Box::new(RemoteVersion {
-            immutable_mismatches: immutable_metadata_mismatches(version, self.metadata),
+            immutable_mismatches: {
+                let mut all = immutable_metadata_mismatches(version, self.metadata);
+                all.extend(self.candidate_divergence.iter().cloned());
+                all
+            },
             yanked: version.yanked_at.is_some(),
             coherent: receipt.coherent,
             ready: receipt.ready,
@@ -632,6 +696,17 @@ fn mutation_error(
         | ApiError::Decode(_)
         | ApiError::Unexpected { status: 500.., .. }
         | ApiError::Server { status: 500.., .. } => {
+            // 🔴 SAY WHAT THE SERVER SAID. A 500 is treated as retryable, and
+            // that is right for a genuine transient — but it used to be
+            // treated as retryable SILENTLY. user-core v1.0.3 hit a foreign-key
+            // violation sixteen times in one run and the command printed two
+            // lines, neither of which named it; the cause was only recoverable
+            // from CloudWatch. A retry the operator cannot see is
+            // indistinguishable from a hang.
+            eprintln!(
+                "{} the platform returned an error; retrying from authoritative state: {error}",
+                warn_prefix()
+            );
             if deploy {
                 Ok(MutationOutcome::AmbiguousDeploy)
             } else {
@@ -682,6 +757,10 @@ fn present_timestamp(value: &Option<String>) -> bool {
 }
 
 impl ReleaseOperations for ApiReleaseOperations<'_> {
+    fn ship_client(&mut self) -> Result<()> {
+        self.upload_version_client()
+    }
+
     fn read_state(&mut self) -> Result<RemoteRelease> {
         let result = with_spinner("Reading owner release state…", || {
             api::get_module_release_state(
@@ -709,13 +788,25 @@ impl ReleaseOperations for ApiReleaseOperations<'_> {
             Err(ApiError::Unauthenticated) => return Err(session_expired()),
             Err(error) => return Err(error.into()),
         };
-        verify_existing_release_candidate(
+        let diverged = verify_existing_release_candidate(
             &state,
             &self.module.id,
             self.slug,
             self.version,
             self.candidate.receipt(),
         )?;
+        // A PUBLISHED version is immutable: consumers pinned those bytes, so
+        // divergence is fatal here and never reaches the planner. Unpublished,
+        // it is reported as a mismatch the planner routes to a re-record.
+        if !diverged.is_empty() && state.release_receipt.deploy.is_some() {
+            return Err(anyhow!(
+                "existing {}@{} is published and immutable; its {} does not match this attested release candidate. Bump the Versions key in main.go to ship different bytes.",
+                self.slug,
+                self.version,
+                diverged.join(", ")
+            ));
+        }
+        self.candidate_divergence = diverged;
         let actual_web_url = state
             .release_receipt
             .web
@@ -888,11 +979,6 @@ impl ReleaseOperations for ApiReleaseOperations<'_> {
                         .bold()
                 );
                 self.upload_web_bundle()?;
-                // core-v2 #742 — the client rides the same successful upload as
-                // the bundle. Ordered after it deliberately: a module with a UI
-                // but no client is common, the reverse is not, so the more
-                // common leg reports first.
-                self.upload_version_client()?;
                 Ok(MutationOutcome::Applied)
             }
             artifact::ShipOutcome::StorageUnconfigured => {
@@ -1023,13 +1109,24 @@ fn guard_version_create_size(input: &RecordModuleVersionInput<'_>) -> Result<()>
     Ok(())
 }
 
+/// Compare a recorded version against the attested candidate.
+///
+/// Returns the CONTENT fields that diverge. Identity, protocol and yanked
+/// state stay hard errors: those are never amendable and a divergence there
+/// means the caller is pointed at the wrong thing entirely.
+///
+/// 🔴 CONTENT DIVERGENCE IS NOT AN ERROR BY ITSELF. It is only an error for a
+/// PUBLISHED version. Until a version is published its recorded bytes may be
+/// replaced (api-platform migration 104), and the caller decides — this
+/// function reports, it does not rule.
 fn verify_existing_release_candidate(
     state: &api::ModuleReleaseState,
     module_id: &str,
     slug: &str,
     version: &str,
     candidate: &ReleaseCandidateReceipt,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let mut diverged: Vec<String> = Vec::new();
     let mismatch = |field: &str| {
         anyhow!(
             "existing {slug}@{version} is immutable and its {field} does not match this attested release candidate; bump the Versions key in main.go before deploying different bytes"
@@ -1058,10 +1155,12 @@ fn verify_existing_release_candidate(
     let receipt = &state.release_receipt;
     if receipt.state != "bound"
         || receipt.protocol.as_deref() != Some(candidate.protocol.as_str())
-        || receipt.source_sha256.as_deref() != Some(candidate.source_sha256.as_str())
         || !receipt.coherent
     {
-        return Err(mismatch("bound source receipt"));
+        return Err(mismatch("bound receipt shape"));
+    }
+    if receipt.source_sha256.as_deref() != Some(candidate.source_sha256.as_str()) {
+        diverged.push("bound source receipt".into());
     }
 
     let candidate_manifest = decode_manifest_evidence(
@@ -1088,7 +1187,7 @@ fn verify_existing_release_candidate(
     if stored_manifest.sha256 != candidate.manifest.sha256
         || stored_manifest.base64 != candidate.manifest.base64
     {
-        return Err(mismatch("exact manifest bytes"));
+        diverged.push("exact manifest bytes".into());
     }
     let stored_manifest_value = decode_manifest_evidence(
         &stored_manifest.sha256,
@@ -1096,14 +1195,14 @@ fn verify_existing_release_candidate(
         "stored manifest",
     )?;
     if stored_manifest_value != candidate_manifest || state.version.manifest != candidate_manifest {
-        return Err(mismatch("semantic manifest"));
+        diverged.push("semantic manifest".into());
     }
 
     match (&candidate.web, &receipt.web) {
         (None, None) => {}
         (Some(local), Some(stored))
             if local.sha256 == stored.sha256 && local.size_bytes == stored.size_bytes => {}
-        _ => return Err(mismatch("web bundle receipt")),
+        _ => diverged.push("web bundle receipt".into()),
     }
 
     let artifact = receipt
@@ -1111,17 +1210,20 @@ fn verify_existing_release_candidate(
         .as_ref()
         .ok_or_else(|| mismatch("expected artifact receipt"))?;
     if !matches!(artifact.status.as_str(), "missing" | "pending" | "ready")
-        || artifact.source_sha256.as_deref() != Some(candidate.source_sha256.as_str())
-        || artifact.manifest_sha256.as_deref() != Some(candidate.manifest.sha256.as_str())
-        || artifact.sha256 != candidate.artifact.sha256
-        || artifact.size_bytes != candidate.artifact.size_bytes
         || artifact.os != candidate.artifact.os
         || artifact.arch != candidate.artifact.arch
         || artifact.format != candidate.artifact.format
     {
-        return Err(mismatch("artifact receipt"));
+        return Err(mismatch("artifact receipt shape"));
     }
-    Ok(())
+    if artifact.source_sha256.as_deref() != Some(candidate.source_sha256.as_str())
+        || artifact.manifest_sha256.as_deref() != Some(candidate.manifest.sha256.as_str())
+        || artifact.sha256 != candidate.artifact.sha256
+        || artifact.size_bytes != candidate.artifact.size_bytes
+    {
+        diverged.push("artifact receipt".into());
+    }
+    Ok(diverged)
 }
 
 /// Prove that one operational mutation was bound to the same immutable
@@ -1435,6 +1537,31 @@ pub(super) fn deploy_error_hint(code: &str) -> &'static str {
     }
 }
 
+/// Report what a deployable release candidate is missing locally, or None when
+/// every declared surface has a built artifact.
+///
+/// Deliberately checks the SAME locators the upload steps use, so a preflight
+/// pass and a later upload cannot disagree about what exists. A module that
+/// declares no web project and no client project is complete with neither —
+/// headless modules are normal and must stay deployable.
+fn missing_release_inputs(dir: &Path) -> Result<Option<String>> {
+    let mut missing = Vec::new();
+    // Each locator returns Ok(None) for "surface not declared" and Err for
+    // "declared but not built", which is the distinction that matters here.
+    match web_bundle::locate(dir) {
+        Ok(_) => {}
+        Err(error) => missing.push(format!("web bundle — {error}")),
+    }
+    match version_client::locate(dir) {
+        Ok(_) => {}
+        Err(error) => missing.push(format!("module client — {error}")),
+    }
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(missing.join("\n  ")))
+}
+
 #[cfg(test)]
 mod release_preparation_tests {
     use super::*;
@@ -1510,6 +1637,7 @@ mod release_preparation_tests {
             observed_web_url: None,
             expected_capture_url: None,
             last_deploy: None,
+            candidate_divergence: Vec::new(),
         }
     }
 
@@ -1519,6 +1647,9 @@ mod release_preparation_tests {
         attempts: Vec<Action>,
         deploy_modes: Vec<api::ModuleDeployMode>,
         settlement_polls: Vec<usize>,
+        /// Every leg the driver ran, client legs included. `attempts` holds
+        /// planner actions only, so it cannot express where the client shipped.
+        legs: Vec<&'static str>,
     }
 
     impl FakeOperations {
@@ -1529,11 +1660,19 @@ mod release_preparation_tests {
                 attempts: Vec::new(),
                 deploy_modes: Vec::new(),
                 settlement_polls: Vec::new(),
+                legs: Vec::new(),
             }
         }
 
         fn mutate(&mut self, action: Action) -> Result<MutationOutcome> {
             self.attempts.push(action);
+            self.legs.push(match action {
+                Action::RecordVersion => "record",
+                Action::CaptureWebBundle => "capture-web",
+                Action::UploadArtifact => "upload-artifact",
+                Action::Deploy => "deploy",
+                Action::Done => "done",
+            });
             let (expected, outcome) = self
                 .outcomes
                 .pop_front()
@@ -1562,6 +1701,11 @@ mod release_preparation_tests {
 
         fn upload_artifact(&mut self) -> Result<MutationOutcome> {
             self.mutate(Action::UploadArtifact)
+        }
+
+        fn ship_client(&mut self) -> Result<()> {
+            self.legs.push("ship-client");
+            Ok(())
         }
 
         fn deploy(&mut self, mode: api::ModuleDeployMode) -> Result<MutationOutcome> {
@@ -1661,6 +1805,155 @@ mod release_preparation_tests {
             result.attempts,
             vec![Action::UploadArtifact, Action::Deploy]
         );
+    }
+
+    #[test]
+    fn the_client_ships_on_a_resumed_release_and_never_on_a_published_one() {
+        // v1.0.3's exact production shape: version recorded, Go artifact ready,
+        // web bundle pinned, NEVER deployed. Under the old wiring the client
+        // rode upload_artifact's success branch, so this path — the only one a
+        // repaired or resumed release takes — deployed with no client at all
+        // and left a consumer unable to close its dev tunnel.
+        let resumed = planner_state("ready", None);
+        let done = planner_state("ready", Some(planner_deploy("artifact", "active")));
+        let mut operations = FakeOperations::new(
+            vec![resumed, done.clone()],
+            vec![(Action::Deploy, MutationOutcome::Applied)],
+        );
+        drive_release(&mut operations, planner_local(false)).unwrap();
+        assert_eq!(
+            operations.legs,
+            vec!["ship-client", "deploy"],
+            "a resumed release must ship its client, and before it publishes"
+        );
+
+        // A fresh release ships it exactly ONCE, and still before the deploy —
+        // moving the leg must not double it up for the path that always worked.
+        let mut fresh = FakeOperations::new(
+            vec![
+                RemoteRelease::Absent,
+                planner_state("missing", None),
+                planner_state("ready", None),
+                done.clone(),
+            ],
+            vec![
+                (Action::RecordVersion, MutationOutcome::Applied),
+                (Action::UploadArtifact, MutationOutcome::Applied),
+                (Action::Deploy, MutationOutcome::Applied),
+            ],
+        );
+        drive_release(&mut fresh, planner_local(false)).unwrap();
+        assert_eq!(
+            fresh.legs,
+            vec!["record", "upload-artifact", "ship-client", "deploy"]
+        );
+
+        // CONTROL: an already-deployed version is immutable and public. The
+        // driver plans Done, so nothing ships — if this ever records a leg the
+        // change has started rewriting published releases.
+        let mut published = FakeOperations::new(vec![done], vec![]);
+        drive_release(&mut published, planner_local(false)).unwrap();
+        assert!(published.legs.is_empty(), "{:?}", published.legs);
+    }
+
+    #[test]
+    fn an_unpublished_version_may_be_amended_but_a_published_one_never() {
+        // 🔴 THE OWNER'S ASK, TWICE: "make api and cli possible to reupload
+        // again before publish to public". A version is immutable once it is
+        // PUBLISHED — once a deploy row exists — not once it is recorded.
+        //
+        // Before this, a release interrupted after recording could never be
+        // completed or corrected: the key was spent on bytes that were wrong
+        // and nothing could replace them. user-core v1.0.3 was recorded with
+        // an artifact built against an SDK that freezes its database token, so
+        // without an amend path the ONLY way to ship the fix was a fourth
+        // version key the owner had explicitly refused.
+        let mut unpublished = planner_state("ready", None);
+        let RemoteRelease::Present(version) = &mut unpublished else {
+            unreachable!()
+        };
+        version.immutable_mismatches = vec!["manifest".into()];
+
+        assert_eq!(
+            release_plan::plan(&planner_local(false), &unpublished).unwrap(),
+            Action::RecordVersion,
+            "an unpublished version with changed bytes must RE-RECORD, not refuse"
+        );
+
+        // THE CONTROL, and the boundary that must never move: the same
+        // mismatch on a PUBLISHED version is still refused outright. Consumers
+        // have pinned those bytes; replacing them changes what an existing
+        // lockfile resolves to.
+        let mut published = planner_state("ready", Some(planner_deploy("artifact", "active")));
+        let RemoteRelease::Present(version) = &mut published else {
+            unreachable!()
+        };
+        version.immutable_mismatches = vec!["manifest".into()];
+        assert!(
+            matches!(
+                release_plan::plan(&planner_local(false), &published),
+                Err(release_plan::PlanError::ImmutableMismatch { .. })
+            ),
+            "a PUBLISHED version was allowed to change its recorded bytes"
+        );
+
+        // A new artifact for an unpublished version uploads rather than
+        // erroring; the same shape published still refuses.
+        let mut swapped = planner_state("ready", None);
+        let RemoteRelease::Present(version) = &mut swapped else {
+            unreachable!()
+        };
+        version.artifact.as_mut().unwrap().sha256 = "f".repeat(64);
+        assert_eq!(
+            release_plan::plan(&planner_local(false), &swapped).unwrap(),
+            Action::UploadArtifact,
+            "an unpublished version must accept replacement artifact bytes"
+        );
+
+        let mut swapped_live = planner_state("ready", Some(planner_deploy("artifact", "active")));
+        let RemoteRelease::Present(version) = &mut swapped_live else {
+            unreachable!()
+        };
+        version.artifact.as_mut().unwrap().sha256 = "f".repeat(64);
+        assert!(
+            matches!(
+                release_plan::plan(&planner_local(false), &swapped_live),
+                Err(release_plan::PlanError::ArtifactMismatch { .. })
+            ),
+            "a PUBLISHED version was allowed to swap its artifact"
+        );
+    }
+
+    #[test]
+    fn a_repeated_identical_replan_stops_instead_of_looping_to_the_cap() {
+        // 🔴 THE FAILURE THAT TOOK AN HOUR TO DIAGNOSE. A 500 maps to Replan,
+        // and Replan is the one outcome that skips the postcondition check, so
+        // a DETERMINISTIC server error looped to MAX_RELEASE_TRANSITIONS and
+        // reported "did not converge" — naming neither the action nor the
+        // cause. user-core v1.0.3 hit a foreign-key violation sixteen times in
+        // one run; the command printed two lines and the reason was only
+        // recoverable from CloudWatch.
+        //
+        // Replan is for a concurrent writer, not a retry budget. Three of the
+        // same action against unchanged state is not a race.
+        let ready = planner_state("ready", None);
+        let mut operations = FakeOperations::new(
+            vec![ready.clone(), ready.clone(), ready.clone(), ready],
+            vec![
+                (Action::Deploy, MutationOutcome::Replan),
+                (Action::Deploy, MutationOutcome::Replan),
+                (Action::Deploy, MutationOutcome::Replan),
+            ],
+        );
+        let error = drive_release(&mut operations, planner_local(false))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("times in a row") && error.contains("not a race"),
+            "{error}"
+        );
+        // Stopped at three, not at the transition cap.
+        assert_eq!(operations.attempts.len(), 3, "{:?}", operations.attempts);
     }
 
     #[test]
@@ -1798,7 +2091,12 @@ mod release_preparation_tests {
 
     #[test]
     fn bad_remote_state_with_missing_web_performs_zero_writes() {
-        let mut mismatched = planner_state("ready", None);
+        // PUBLISHED: an artifact that disagrees with a version consumers have
+        // already pinned is still a hard stop with zero writes. Unpublished is
+        // now an amend — see an_unpublished_version_may_be_amended_but_a_
+        // published_one_never — so the refusal has to be asserted where it
+        // still applies, or this test would pass by testing nothing.
+        let mut mismatched = planner_state("ready", Some(planner_deploy("artifact", "active")));
         let RemoteRelease::Present(version) = &mut mismatched else {
             unreachable!()
         };
@@ -2321,14 +2619,20 @@ mod release_preparation_tests {
         let stored_candidate = candidate();
         let state = matching_state(&stored_candidate);
 
+        // 🔴 DETECTED AND NAMED, not refused outright. Whether divergence is
+        // fatal depends on PUBLICATION, and only read_state knows that: it
+        // errors for a published version and hands these names to the planner
+        // for an unpublished one, which re-records. What must never regress is
+        // that the divergence is SEEN — a silently accepted source change
+        // would deploy bytes the receipt does not describe.
         let mut changed_source = stored_candidate.clone();
         changed_source.source_sha256 = "d".repeat(64);
-        let source_error =
+        let diverged =
             verify_existing_release_candidate(&state, MODULE_ID, SLUG, VERSION, &changed_source)
-                .unwrap_err();
+                .expect("content divergence is reported, not an error");
         assert!(
-            source_error.to_string().contains("bound source receipt"),
-            "{source_error:#}"
+            diverged.iter().any(|f| f == "bound source receipt"),
+            "{diverged:?}"
         );
         assert_eq!(changed_source.artifact, stored_candidate.artifact);
 
@@ -2339,12 +2643,12 @@ mod release_preparation_tests {
             "description": "changed without changing the artifact fixture",
             "versions": {"v1.2.3": {"app": "0001"}}
         }));
-        let manifest_error =
+        let diverged =
             verify_existing_release_candidate(&state, MODULE_ID, SLUG, VERSION, &changed_manifest)
-                .unwrap_err();
+                .expect("content divergence is reported, not an error");
         assert!(
-            manifest_error.to_string().contains("exact manifest bytes"),
-            "{manifest_error:#}"
+            diverged.iter().any(|f| f == "exact manifest bytes"),
+            "{diverged:?}"
         );
         assert_eq!(changed_manifest.artifact, stored_candidate.artifact);
     }
@@ -2356,11 +2660,12 @@ mod release_preparation_tests {
         let mut changed = stored_candidate.clone();
         changed.web.as_mut().unwrap().sha256 = "d".repeat(64);
 
-        let error = verify_existing_release_candidate(&state, MODULE_ID, SLUG, VERSION, &changed)
-            .unwrap_err();
+        let diverged =
+            verify_existing_release_candidate(&state, MODULE_ID, SLUG, VERSION, &changed)
+                .expect("content divergence is reported, not an error");
         assert!(
-            error.to_string().contains("web bundle receipt"),
-            "{error:#}"
+            diverged.iter().any(|f| f == "web bundle receipt"),
+            "{diverged:?}"
         );
         assert_eq!(changed.artifact, stored_candidate.artifact);
     }
@@ -2376,7 +2681,7 @@ mod release_preparation_tests {
             verify_existing_release_candidate(&legacy, MODULE_ID, SLUG, VERSION, &candidate)
                 .unwrap_err()
                 .to_string()
-                .contains("bound source receipt")
+                .contains("bound receipt shape")
         );
 
         let mut incoherent = matching_state(&candidate);
@@ -2419,11 +2724,67 @@ mod release_preparation_tests {
             receipt: local_candidate,
         };
         let mut operations = test_api_operations(&client, &base, &module, &candidate, &metadata);
-        let error = operations.read_state().unwrap_err();
+        // 🔴 UNPUBLISHED: the divergence is CAPTURED, not fatal, and the
+        // planner turns it into a re-record. That is what lets a release
+        // interrupted after recording be corrected instead of burning the key.
+        operations
+            .read_state()
+            .expect("an unpublished divergence must not be fatal");
+        assert!(
+            operations
+                .candidate_divergence
+                .iter()
+                .any(|f| f == "bound source receipt"),
+            "{:?}",
+            operations.candidate_divergence
+        );
+        reread.assert();
+    }
 
+    #[test]
+    fn concurrent_version_exists_reread_rejects_a_different_candidate_once_published() {
+        // THE CONTROL FOR THE TEST ABOVE, and the boundary that must not move:
+        // the SAME divergence on a PUBLISHED version is refused outright.
+        // Consumers have pinned those bytes.
+        let stored_candidate = candidate();
+        let mut local_candidate = stored_candidate.clone();
+        local_candidate.source_sha256 = "d".repeat(64);
+
+        let mut published = matching_state_json(&stored_candidate);
+        published["release_receipt"]["deploy"] = serde_json::json!({
+            "mode": "artifact",
+            "status": "active",
+            "source_sha256": stored_candidate.source_sha256,
+            "manifest_sha256": stored_candidate.manifest.sha256,
+            "artifact_sha256": stored_candidate.artifact.sha256,
+            "lambda_version": "7",
+            "lambda_code_sha256": stored_candidate.artifact.sha256,
+            "created_at": "2026-08-31T00:00:00Z",
+            "updated_at": "2026-08-31T00:00:00Z"
+        });
+
+        let mut server = mockito::Server::new();
+        let reread = server
+            .mock(
+                "GET",
+                "/v1/modules/11111111-1111-1111-1111-111111111111/versions/1.2.3",
+            )
+            .with_status(200)
+            .with_body(published.to_string())
+            .create();
+        let client = http::client(Duration::from_secs(15)).unwrap();
+        let base = server.url();
+        let module = test_module();
+        let metadata = test_metadata();
+        let candidate = TestCandidate {
+            receipt: local_candidate,
+        };
+        let mut operations = test_api_operations(&client, &base, &module, &candidate, &metadata);
+        let error = operations.read_state().unwrap_err();
         reread.assert();
         assert!(
-            error.to_string().contains("bound source receipt"),
+            error.to_string().contains("published and immutable")
+                && error.to_string().contains("bound source receipt"),
             "{error:#}"
         );
     }
