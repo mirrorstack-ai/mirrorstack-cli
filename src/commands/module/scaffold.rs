@@ -23,6 +23,7 @@ const ROUTES_GO: &str = include_str!("../../../templates/module/internal/handler
 const I18N_EN: &str = include_str!("../../../templates/module/i18n/en-US.json.tmpl");
 const I18N_ZH: &str = include_str!("../../../templates/module/i18n/zh-TW.json.tmpl");
 const GO_MOD: &str = include_str!("../../../templates/module/go.mod.tmpl");
+const GO_SUM: &str = include_str!("../../../templates/module/go.sum.tmpl");
 const SQL_INIT: &str = include_str!("../../../templates/module/sql/app/0001_init.up.sql.tmpl");
 const GITIGNORE: &str = include_str!("../../../templates/module/.gitignore.tmpl");
 const CHANGELOG: &str = include_str!("../../../templates/module/CHANGELOG.md.tmpl");
@@ -120,6 +121,10 @@ pub(super) fn write_tree(target: &Path, inputs: &Inputs<'_>) -> Result<()> {
     write_file(target, "i18n/en-US.json", I18N_EN, inputs)?;
     write_file(target, "i18n/zh-TW.json", I18N_ZH, inputs)?;
     write_file(target, "go.mod", GO_MOD, inputs)?;
+    // Ships complete (go.mod lists every indirect, go.sum every hash) so
+    // `GOPROXY=off GOFLAGS=-mod=readonly go build ./...` works against a
+    // baked module cache with no `go mod tidy` and no network (SB-C2).
+    write_file(target, "go.sum", GO_SUM, inputs)?;
     write_file(target, "sql/app/0001_init.up.sql", SQL_INIT, inputs)?;
     write_file(target, ".gitignore", GITIGNORE, inputs)?;
     // CHANGELOG.md is hard-linted at deploy (changelog::lint) and was never
@@ -300,6 +305,25 @@ mod tests {
     }
 
     #[test]
+    fn go_sum_and_indirect_requires_match_the_sdk_pin() {
+        // The shipped go.sum / go.mod indirects are generated at one SDK
+        // release. Bumping SCAFFOLD_SDK_VERSION without regenerating them
+        // leaves a scaffold that cannot build under -mod=readonly offline.
+        let sum = render(GO_SUM, &ins("media", "Media"));
+        for tail in [" h1:", "/go.mod h1:"] {
+            let want =
+                format!("github.com/mirrorstack-ai/app-module-sdk {SCAFFOLD_SDK_VERSION}{tail}");
+            assert!(
+                sum.contains(&want),
+                "go.sum.tmpl has no `{want}` line — regenerate go.sum.tmpl and the \
+                 indirect requires in go.mod.tmpl (`go mod tidy`) for the new pin"
+            );
+        }
+        let gomod = render(GO_MOD, &ins("media", "Media"));
+        assert!(gomod.contains("// indirect"), "go.mod must list indirects");
+    }
+
+    #[test]
     fn sanitize_module_id_strips_hyphens_and_prepends_letter() {
         assert_eq!(sanitize_module_id(SAMPLE_UUID), SAMPLE_SANITIZED);
         // UUIDs that start with a digit still produce an identifier-safe ID.
@@ -390,6 +414,7 @@ mod tests {
             "i18n/en-US.json",
             "i18n/zh-TW.json",
             "go.mod",
+            "go.sum",
             "CHANGELOG.md",
             "sql/app/0001_init.up.sql",
             ".gitignore",
@@ -471,8 +496,8 @@ mod tests {
             let out = Command::new("go")
                 .args(args)
                 .current_dir(dir)
-                // -mod=mod lets `go mod tidy` write the go.sum the scaffold
-                // deliberately does not ship.
+                // -mod=mod lets `go mod tidy` and `go get @main` update the
+                // go.mod/go.sum the scaffold ships.
                 .env("GOFLAGS", "-mod=mod")
                 .output()
                 .unwrap_or_else(|e| {
@@ -491,6 +516,26 @@ mod tests {
         // fails the module's own CI on its very first commit.
         let (ok, log) = go(&target, &["fmt", "./..."]);
         assert!(ok, "gofmt failed:\n{log}");
+
+        // The shipped go.mod/go.sum must be COMPLETE as rendered: a
+        // -mod=readonly build before any `go mod tidy` is the offline
+        // contract (SB-C2). Only the module cache comes from the network here.
+        let (ok, log) = {
+            let out = Command::new("go")
+                .args(["build", "./..."])
+                .current_dir(&target)
+                .env("GOFLAGS", "-mod=readonly")
+                .output()
+                .expect("go build");
+            let mut log = String::from_utf8_lossy(&out.stdout).into_owned();
+            log.push_str(&String::from_utf8_lossy(&out.stderr));
+            (out.status.success(), log)
+        };
+        assert!(
+            ok,
+            "scaffold go.mod/go.sum are not complete at the pin — regenerate \
+             them (`go mod tidy`) when SCAFFOLD_SDK_VERSION moves:\n{log}"
+        );
         let (ok, log) = go(&target, &["mod", "tidy"]);
         assert!(ok, "go mod tidy failed at the pinned SDK:\n{log}");
 
