@@ -51,6 +51,10 @@ pub(crate) struct CandidateRequest<'a> {
     pub version: &'a str,
     /// Exact key declared in `Config.Versions`, normally `v<version>`.
     pub source_version_key: &'a str,
+    /// API-only build (plan C3): refuse a web bundle before any tool runs. A
+    /// `web/package.json`, a `web/esbuild.config.mjs`, or a manifest that
+    /// declares a UI surface is an error, never a skipped step.
+    pub api_only: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -79,6 +83,14 @@ pub(crate) struct ArtifactEvidence {
     pub os: String,
     pub arch: String,
     pub format: String,
+    /// SHA-256 of the `bootstrap` ELF before it is zipped. Only the receipt
+    /// `module build` writes carries it ([`ReleaseCandidate::build_receipt`]).
+    /// The receipt `module deploy` sends never does: the platform decodes
+    /// `release_candidate` with `DisallowUnknownFields`
+    /// (api-platform `strictDecodeOne`), so an extra field is a 400 until the
+    /// server accepts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -103,11 +115,20 @@ pub(crate) struct ReleaseCandidate {
     receipt: ReleaseCandidateReceipt,
     artifact_path: PathBuf,
     _receipt_path: PathBuf,
+    bootstrap_sha256: String,
 }
 
 impl ReleaseCandidate {
+    /// The receipt `module deploy` sends to the platform (no `bootstrap_sha256`).
     pub(crate) fn receipt(&self) -> &ReleaseCandidateReceipt {
         &self.receipt
+    }
+
+    /// The same receipt plus `bootstrap_sha256`, for `module build` to write.
+    pub(crate) fn build_receipt(&self) -> ReleaseCandidateReceipt {
+        let mut receipt = self.receipt.clone();
+        receipt.artifact.bootstrap_sha256 = Some(self.bootstrap_sha256.clone());
+        receipt
     }
 
     pub(crate) fn artifact_path(&self) -> &Path {
@@ -162,6 +183,10 @@ fn build_with(
     request: CandidateRequest<'_>,
 ) -> Result<ReleaseCandidate> {
     let source = SourceSnapshot::create(request.module_dir)?;
+    if request.api_only {
+        let view = source.fresh_view("api-only")?;
+        refuse_web_files(&view.module_dir())?;
+    }
     let go_version = check_go_floor(runner, &source)?;
     let replace_view = source.fresh_view("replace-check")?;
     let replace_go = GoEnvironment::new("replace-check")?;
@@ -181,6 +206,11 @@ fn build_with(
         request.module_id,
     )?;
     validate_manifest_identity(&manifest, request.module_id, request.slug)?;
+    if request.api_only && manifest.get("ui").is_some_and(|surface| !surface.is_null()) {
+        return Err(anyhow!(
+            "release candidate: API-only build refuses a module whose SDK manifest declares a UI surface"
+        ));
+    }
     let manifest_evidence = record_go_version(manifest_evidence, &manifest, &go_version)?;
     manifest_view
         .verify_inputs()
@@ -194,7 +224,7 @@ fn build_with(
 
     let artifact_view = source.fresh_view("artifact")?;
     let artifact_go = GoEnvironment::new("artifact")?;
-    let (artifact_dir, artifact_path, artifact_evidence) =
+    let (artifact_dir, artifact_path, artifact_evidence, bootstrap_sha256) =
         build_linux_artifact(runner, &artifact_view.module_dir(), &artifact_go)?;
     artifact_view
         .verify_inputs()
@@ -221,7 +251,21 @@ fn build_with(
         receipt,
         artifact_path,
         _receipt_path: receipt_path,
+        bootstrap_sha256,
     })
+}
+
+/// The inputs that would start a web build (the same triggers as
+/// `web_pipeline`). Checked on the staged tree, before any Go or Node runs.
+fn refuse_web_files(module_dir: &Path) -> Result<()> {
+    for name in ["web/package.json", "web/esbuild.config.mjs"] {
+        if fs::symlink_metadata(module_dir.join(name)).is_ok() {
+            return Err(anyhow!(
+                "release candidate: API-only build refuses {name}: agent-built modules ship no web bundle"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Refuse a build below [`GO_VERSION_FLOOR`] and return the version of the
@@ -743,7 +787,7 @@ fn build_linux_artifact(
     runner: &dyn ProcessRunner,
     module_dir: &Path,
     go: &GoEnvironment,
-) -> Result<(TempDir, PathBuf, ArtifactEvidence)> {
+) -> Result<(TempDir, PathBuf, ArtifactEvidence, String)> {
     let artifact_dir = tempfile::Builder::new()
         .prefix("mirrorstack-release-artifact-")
         .tempdir()
@@ -766,6 +810,10 @@ fn build_linux_artifact(
         .limits(256 * 1024, 1024 * 1024);
     run_checked(runner, &spec, "Linux/arm64 module build")?;
     artifact::assert_aarch64_elf(&bootstrap)?;
+    let bootstrap_sha256 = sha256_hex(
+        &fs::read(&bootstrap)
+            .with_context(|| format!("release candidate: read {}", bootstrap.display()))?,
+    );
     let zip = artifact::zip_bootstrap(&bootstrap)?;
     let size_bytes = artifact::packaged_size(&zip)?;
     let bytes = fs::read(&zip)
@@ -785,7 +833,9 @@ fn build_linux_artifact(
             os: "linux".to_string(),
             arch: "arm64".to_string(),
             format: "lambda-bootstrap-zip".to_string(),
+            bootstrap_sha256: None,
         },
+        bootstrap_sha256,
     ))
 }
 
@@ -1029,7 +1079,7 @@ fn sdk_module_id(value: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("release candidate: owned module id {value} is not canonical"))
 }
 
-fn normalize_module_id(value: &str) -> Option<String> {
+pub(crate) fn normalize_module_id(value: &str) -> Option<String> {
     if let Some(hex) = value.strip_prefix('m') {
         return (hex.len() == 32 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
             .then(|| hex.to_ascii_lowercase());
@@ -1074,7 +1124,8 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn write_candidate_receipt(root: &Path, receipt: &ReleaseCandidateReceipt) -> Result<PathBuf> {
+/// One JSON line, the exact bytes `module deploy` and `module build` persist.
+pub(crate) fn encode_receipt(receipt: &ReleaseCandidateReceipt) -> Result<Vec<u8>> {
     let mut bytes =
         serde_json::to_vec(receipt).context("release candidate: encode candidate receipt")?;
     bytes.push(b'\n');
@@ -1083,6 +1134,11 @@ fn write_candidate_receipt(root: &Path, receipt: &ReleaseCandidateReceipt) -> Re
             "release candidate: receipt exceeds {MAX_CANDIDATE_RECEIPT_BYTES} bytes"
         ));
     }
+    Ok(bytes)
+}
+
+fn write_candidate_receipt(root: &Path, receipt: &ReleaseCandidateReceipt) -> Result<PathBuf> {
+    let bytes = encode_receipt(receipt)?;
     let mut temporary = NamedTempFile::new_in(root)
         .context("release candidate: create atomic candidate receipt")?;
     use std::io::Write;
@@ -1482,6 +1538,7 @@ mod tests {
             module_id: MODULE_ID,
             version: "1.2.3",
             source_version_key: VERSION_KEY,
+            api_only: false,
         }
     }
 
@@ -1525,6 +1582,7 @@ mod tests {
                 os: "linux".into(),
                 arch: "arm64".into(),
                 format: "lambda-bootstrap-zip".into(),
+                bootstrap_sha256: None,
             },
         }
     }
@@ -1860,6 +1918,135 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("SDK manifest declares a UI"), "{message}");
         assert!(message.contains("no runnable one-shot"), "{message}");
+    }
+
+    fn api_only(module: &Path) -> CandidateRequest<'_> {
+        CandidateRequest {
+            api_only: true,
+            ..request(module)
+        }
+    }
+
+    /// Every `go`/`npm`/`pnpm` call the runner saw.
+    fn programs(runner: &FakeRunner) -> Vec<String> {
+        runner
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|spec| spec.program.clone())
+            .collect()
+    }
+
+    #[test]
+    fn api_only_refuses_a_web_package_before_any_tool_runs() {
+        let (_root, module) = fixture(true, true);
+        let runner = FakeRunner::default();
+        let error = build_with(&runner, api_only(&module))
+            .err()
+            .expect("a web package is refused in API-only mode");
+        let message = format!("{error:#}");
+        assert!(message.contains("API-only"), "{message}");
+        assert!(message.contains("web/package.json"), "{message}");
+        assert!(programs(&runner).is_empty(), "{:?}", programs(&runner));
+    }
+
+    #[test]
+    fn api_only_refuses_a_legacy_esbuild_web_build() {
+        let (_root, module) = fixture(false, false);
+        fs::create_dir_all(module.join("web")).unwrap();
+        fs::write(module.join("web/esbuild.config.mjs"), "export {};\n").unwrap();
+        git(module.parent().unwrap(), &["add", "."]);
+        let runner = FakeRunner::default();
+        let error = build_with(&runner, api_only(&module))
+            .err()
+            .expect("refused");
+        assert!(format!("{error:#}").contains("web/esbuild.config.mjs"));
+        assert!(programs(&runner).is_empty());
+    }
+
+    #[test]
+    fn api_only_refuses_a_declared_ui_surface_before_the_artifact_build() {
+        let (_root, module) = fixture(false, false);
+        let runner = FakeRunner {
+            manifest_declares_ui: true,
+            ..FakeRunner::default()
+        };
+        let error = build_with(&runner, api_only(&module))
+            .err()
+            .expect("refused");
+        let message = format!("{error:#}");
+        assert!(message.contains("API-only"), "{message}");
+        assert!(message.contains("UI surface"), "{message}");
+        assert!(
+            !runner
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|spec| spec.args.first().is_some_and(|arg| arg == "build")),
+            "the Linux artifact must not be built for a refused module"
+        );
+    }
+
+    #[test]
+    fn api_only_builds_a_module_with_no_web_surface() {
+        let (_root, module) = fixture(false, false);
+        let runner = FakeRunner::default();
+        let candidate = build_with(&runner, api_only(&module)).unwrap();
+        assert!(candidate.receipt.web.is_none());
+        assert!(!programs(&runner).iter().any(|program| program != "go"));
+    }
+
+    #[test]
+    fn build_receipt_bootstrap_sha256_is_the_hash_of_the_bootstrap_entry_in_the_zip() {
+        use std::io::Read;
+
+        let (_root, module) = fixture(false, false);
+        let candidate = build_with(&FakeRunner::default(), request(&module)).unwrap();
+
+        let mut archive =
+            zip::ZipArchive::new(fs::File::open(candidate.artifact_path()).unwrap()).unwrap();
+        assert_eq!(archive.len(), 1);
+        let mut entry = archive.by_name("bootstrap").unwrap();
+        let mut elf = Vec::new();
+        entry.read_to_end(&mut elf).unwrap();
+
+        let built = candidate.build_receipt();
+        assert_eq!(
+            built.artifact.bootstrap_sha256.as_deref(),
+            Some(sha256_hex(&elf).as_str())
+        );
+        // The ELF hash is not the ZIP hash: that is the point of recording it.
+        assert_ne!(
+            built.artifact.bootstrap_sha256,
+            Some(built.artifact.sha256.clone())
+        );
+        assert_eq!(built.artifact.sha256, candidate.receipt().artifact.sha256);
+    }
+
+    #[test]
+    fn deploy_receipt_never_carries_bootstrap_sha256() {
+        // api-platform decodes `release_candidate` with DisallowUnknownFields.
+        let (_root, module) = fixture(false, false);
+        let candidate = build_with(&FakeRunner::default(), request(&module)).unwrap();
+
+        let wire = serde_json::to_value(candidate.receipt()).unwrap();
+        assert!(wire["artifact"].get("bootstrap_sha256").is_none(), "{wire}");
+        let on_disk = fs::read_to_string(candidate.receipt_path()).unwrap();
+        assert!(!on_disk.contains("bootstrap_sha256"), "{on_disk}");
+
+        let built = serde_json::to_value(candidate.build_receipt()).unwrap();
+        assert_eq!(
+            built["artifact"]["bootstrap_sha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        // An older receipt without the field still parses.
+        let parsed: ReleaseCandidateReceipt = serde_json::from_value(wire).unwrap();
+        assert_eq!(&parsed, candidate.receipt());
     }
 
     #[test]

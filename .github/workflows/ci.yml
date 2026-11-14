@@ -115,3 +115,18 @@ jobs:
             --nocapture 2>&1 | tee scaffold-test.log
           grep -qE '^test result: ok\. 1 passed' scaffold-test.log \
             || { echo "::error::the scaffold build test did not run"; exit 1; }
+
+      # `module build` (cli#147) against the REAL binary and the pinned Go: an
+      # empty HOME, every platform URL on a closed port, receipt
+      # bootstrap_sha256 == the hash of the ZIP's `bootstrap` entry, and the
+      # control (`module deploy` fails at the login step). Same count grep as
+      # above: the tests carry #[ignore], so "0 passed" would be a silent green.
+      # The MEASURED line is whether two builds of one source give identical
+      # ZIP bytes; it is printed, not asserted (bootstrap_sha256 equality is).
+      - name: module build is credential-free
+        run: |
+          set -euo pipefail
+          cargo test --all-features --test module_build -- --ignored --nocapture 2>&1 | tee module-build-test.log
+          grep -qE '^test result: ok\. 2 passed' module-build-test.log \
+            || { echo "::error::the module build acceptance tests did not run"; exit 1; }
+          grep -E '^MEASURED zip_byte_identical' module-build-test.log | tee -a "$GITHUB_STEP_SUMMARY"

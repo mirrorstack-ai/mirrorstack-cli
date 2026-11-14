@@ -22,6 +22,7 @@ use crate::credentials;
 use crate::http;
 
 pub(crate) mod artifact;
+mod build;
 pub(crate) mod capabilities;
 mod changelog;
 mod deploy;
@@ -72,6 +73,14 @@ enum ModuleCommand {
     /// derived by the platform from the module's own identity, never
     /// supplied by the caller.
     Deploy(DeployArgs),
+    /// Build the release candidate WITHOUT deploying: no login, no platform
+    /// call, no upload.
+    ///
+    /// Writes `receipt.json` (the attested receipt, plus the `bootstrap_sha256`
+    /// of the ELF before it is zipped) and `bootstrap.zip` (the Lambda
+    /// artifact) into --out. The build needs only the module source and a Go
+    /// toolchain, so it runs with an empty HOME and no network to the platform.
+    Build(build::BuildArgs),
     /// Re-provision a version that is ALREADY deployed, recording nothing.
     ///
     /// The platform writes a module Lambda's injected environment — its
@@ -161,6 +170,7 @@ pub fn run(args: ModuleArgs) -> Result<()> {
         ModuleCommand::Register(r) => register::run(r),
         ModuleCommand::Rename(r) => rename::run(r),
         ModuleCommand::Deploy(d) => deploy::run(d),
+        ModuleCommand::Build(b) => build::run(b),
         ModuleCommand::Redeploy(r) => redeploy::run(r),
         ModuleCommand::Transports(t) => transports::run(t),
         ModuleCommand::Move(m) => version_move::run(m),

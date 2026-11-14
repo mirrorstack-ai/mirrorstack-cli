@@ -159,6 +159,7 @@ pub(super) fn run(args: DeployArgs) -> Result<()> {
             module_id: &module.id,
             version: &version,
             source_version_key: &raw,
+            api_only: false,
         })
     })?;
     let zip_path = candidate.artifact_path();
@@ -1888,6 +1889,7 @@ mod release_preparation_tests {
                 os: "linux".to_string(),
                 arch: "arm64".to_string(),
                 format: "lambda-bootstrap-zip".to_string(),
+                bootstrap_sha256: None,
             },
         }
     }
