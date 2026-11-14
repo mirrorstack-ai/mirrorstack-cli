@@ -119,6 +119,16 @@ pub struct InitArgs {
     /// in the current directory. Pass `.` to scaffold into the cwd directly.
     #[arg(long)]
     dir: Option<PathBuf>,
+    /// Scaffold only: no login, no platform call, no network. Needs --name
+    /// and --module-id (the platform-assigned ID is supplied, not fetched).
+    /// The scaffold ships a complete go.mod/go.sum, so a build against a
+    /// baked module cache needs no `go mod tidy`.
+    #[arg(long, requires = "module_id", conflicts_with_all = ["no_scaffold", "used"])]
+    offline: bool,
+    /// Platform-assigned module UUID to scaffold with. Only valid with
+    /// --offline.
+    #[arg(long, requires = "offline")]
+    module_id: Option<String>,
 }
 
 #[derive(Args)]

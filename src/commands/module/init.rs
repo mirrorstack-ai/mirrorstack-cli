@@ -10,6 +10,11 @@ use super::*;
 use super::register::refetch_module_id;
 
 pub(super) fn run(args: InitArgs) -> Result<()> {
+    if args.offline {
+        // Returns before credentials::load_or_login_hint below: no login,
+        // no platform call, no HTTP client.
+        return run_offline(&args);
+    }
     let theme = ColorfulTheme::default();
 
     let mut creds = credentials::load_or_login_hint()?;
@@ -140,6 +145,61 @@ pub(super) fn run(args: InitArgs) -> Result<()> {
     )
 }
 
+/// `init --offline --module-id <uuid>`: write the scaffold tree and nothing
+/// else. Never reads credentials, never builds an HTTP client, never prompts
+/// (the sandbox runs with an empty HOME and no network).
+fn run_offline(args: &InitArgs) -> Result<()> {
+    let name = args
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("--offline requires --name (it never prompts)"))?;
+    let slug = match args
+        .slug
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => s.to_string(),
+        None => derive_slug(name),
+    };
+    if !slug_valid(&slug) {
+        return Err(slug_invalid_error(&slug));
+    }
+    let module_id = args
+        .module_id
+        .as_deref()
+        .map(str::trim)
+        .ok_or_else(|| anyhow!("--offline requires --module-id"))?;
+    if !module_id_valid(module_id) {
+        return Err(anyhow!(
+            "--module-id {module_id:?} is not a UUID (expected 8-4-4-4-12 hex digits)"
+        ));
+    }
+    let target = resolve_scaffold_target(args.dir.as_deref(), &slug);
+    scaffold::ensure_target_writable(&target)?;
+    scaffold_if_requested(
+        Some(&target),
+        &scaffold::Inputs {
+            slug: &slug,
+            name,
+            module_id,
+        },
+    )
+}
+
+/// 8-4-4-4-12 hex digits. The ID ends up in `.env` and Config.ID, so a
+/// malformed one is refused here rather than at the module's first boot.
+fn module_id_valid(id: &str) -> bool {
+    let parts: Vec<&str> = id.split('-').collect();
+    parts.len() == 5
+        && parts
+            .iter()
+            .zip([8usize, 4, 4, 4, 12])
+            .all(|(p, n)| p.len() == n && p.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 /// Resolve the target dir for scaffolding. `--dir <path>` wins; otherwise
 /// default to `./<slug>/`. Pass `--dir .` to scaffold into the cwd directly.
 fn resolve_scaffold_target(dir: Option<&Path>, slug: &str) -> PathBuf {
@@ -163,10 +223,11 @@ fn print_scaffold_summary(target: &Path) {
         ok_mark(),
         style(target.display()).cyan().bold()
     );
+    // go.mod/go.sum ship complete, so no `go mod tidy` step.
     let next = if is_cwd(target) {
-        "go mod tidy && mirrorstack dev".to_string()
+        "mirrorstack dev".to_string()
     } else {
-        format!("cd {} && go mod tidy && mirrorstack dev", target.display())
+        format!("cd {} && mirrorstack dev", target.display())
     };
     eprintln!("  {} {next}", style("next:").dim());
 }
@@ -243,5 +304,18 @@ fn print_already_exists(username: &str, slug: &str, id: Option<&str>) {
     );
     if let Some(id) = id {
         eprintln!("  {} {}", style("id:").dim(), id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_id_valid_accepts_uuid_only() {
+        assert!(module_id_valid("bb8a3f8b-1234-5678-9abc-def012345678"));
+        assert!(!module_id_valid("bb8a3f8b123456789abcdef012345678"));
+        assert!(!module_id_valid("bb8a3f8b-1234-5678-9abc-def01234567g"));
+        assert!(!module_id_valid(""));
     }
 }
