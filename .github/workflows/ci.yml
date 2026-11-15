@@ -115,3 +115,14 @@ jobs:
             --nocapture 2>&1 | tee scaffold-test.log
           grep -qE '^test result: ok\. 1 passed' scaffold-test.log \
             || { echo "::error::the scaffold build test did not run"; exit 1; }
+
+      # SB-C2: `init --offline` writes a COMPLETE go.mod/go.sum, so the
+      # scaffold builds with GOPROXY=off -mod=readonly against a baked cache.
+      - name: Offline scaffold builds with GOPROXY=off
+        run: |
+          set -euo pipefail
+          cargo test --all-features --test init_offline -- --ignored --exact \
+            offline_scaffold_builds_with_goproxy_off_against_a_baked_cache \
+            --nocapture 2>&1 | tee offline-test.log
+          grep -qE '^test result: ok\. 1 passed' offline-test.log \
+            || { echo "::error::the offline scaffold test did not run"; exit 1; }
