@@ -55,6 +55,11 @@ pub(crate) struct CandidateRequest<'a> {
     /// `web/package.json`, a `web/esbuild.config.mjs`, or a manifest that
     /// declares a UI surface is an error, never a skipped step.
     pub api_only: bool,
+    /// Offline build (SB-C1b): the Go phases run with `GOPROXY=off` against
+    /// this prebuilt module cache (absolute path) instead of fetching through
+    /// the public proxy into an isolated cache. `None` keeps the public-proxy
+    /// release policy.
+    pub offline_modcache: Option<&'a Path>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -189,14 +194,14 @@ fn build_with(
     }
     let go_version = check_go_floor(runner, &source)?;
     let replace_view = source.fresh_view("replace-check")?;
-    let replace_go = GoEnvironment::new("replace-check")?;
+    let replace_go = GoEnvironment::new("replace-check", request.offline_modcache)?;
     validate_local_replaces(runner, &replace_view, &replace_go)?;
     replace_view
         .verify_inputs()
         .context("release candidate: local-replace inspection changed its frozen phase inputs")?;
 
     let manifest_view = source.fresh_view("manifest")?;
-    let manifest_go = GoEnvironment::new("manifest")?;
+    let manifest_go = GoEnvironment::new("manifest", request.offline_modcache)?;
     let (manifest_evidence, manifest) = run_manifest_probe(
         runner,
         &manifest_view.module_dir(),
@@ -223,7 +228,7 @@ fn build_with(
         .context("release candidate: web build changed its frozen canonical inputs")?;
 
     let artifact_view = source.fresh_view("artifact")?;
-    let artifact_go = GoEnvironment::new("artifact")?;
+    let artifact_go = GoEnvironment::new("artifact", request.offline_modcache)?;
     let (artifact_dir, artifact_path, artifact_evidence, bootstrap_sha256) =
         build_linux_artifact(runner, &artifact_view.module_dir(), &artifact_go)?;
     artifact_view
@@ -273,7 +278,7 @@ fn refuse_web_files(module_dir: &Path) -> Result<()> {
 /// so no silent download swaps it).
 fn check_go_floor(runner: &dyn ProcessRunner, source: &SourceSnapshot) -> Result<String> {
     let view = source.fresh_view("go-version")?;
-    let go = GoEnvironment::new("go-version")?;
+    let go = GoEnvironment::new("go-version", None)?;
     let spec = go_spec("go", view.module_dir(), &go)
         .args(["env", "GOVERSION"])
         .timeout(Duration::from_secs(30))
@@ -843,24 +848,33 @@ struct GoEnvironment {
     _root: TempDir,
     module_cache: PathBuf,
     build_cache: PathBuf,
+    /// `GOPROXY=off` against a caller-supplied module cache (SB-C1b).
+    offline: bool,
 }
 
 impl GoEnvironment {
-    fn new(phase: &str) -> Result<Self> {
+    fn new(phase: &str, offline_modcache: Option<&Path>) -> Result<Self> {
         let root = tempfile::Builder::new()
             .prefix(&format!("mirrorstack-release-go-{phase}-"))
             .tempdir()
             .with_context(|| format!("release candidate: create {phase} Go environment"))?;
-        let module_cache = root.path().join("modcache");
         let build_cache = root.path().join("buildcache");
-        fs::create_dir_all(&module_cache)
-            .context("release candidate: create isolated Go module cache")?;
+        let module_cache = match offline_modcache {
+            Some(baked) => baked.to_path_buf(),
+            None => {
+                let isolated = root.path().join("modcache");
+                fs::create_dir_all(&isolated)
+                    .context("release candidate: create isolated Go module cache")?;
+                isolated
+            }
+        };
         fs::create_dir_all(&build_cache)
             .context("release candidate: create isolated Go build cache")?;
         Ok(Self {
             _root: root,
             module_cache,
             build_cache,
+            offline: offline_modcache.is_some(),
         })
     }
 }
@@ -876,7 +890,14 @@ fn go_spec(program: &str, cwd: PathBuf, go: &GoEnvironment) -> ProcessSpec {
         .env("GOENV", "off")
         .env("GOFLAGS", "-mod=readonly")
         .env("GO111MODULE", "on")
-        .env("GOPROXY", "https://proxy.golang.org")
+        .env(
+            "GOPROXY",
+            if go.offline {
+                "off"
+            } else {
+                "https://proxy.golang.org"
+            },
+        )
         .env("GOSUMDB", "sum.golang.org")
         .env("GOPRIVATE", "")
         .env("GONOSUMDB", "")
@@ -1011,10 +1032,46 @@ fn run_checked(
     if output.success {
         return Ok(output);
     }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let hint = offline_cache_miss_hint(spec, &stderr);
     Err(anyhow!(
-        "release candidate: {label} failed:\n{}",
-        String::from_utf8_lossy(&output.stderr).trim()
+        "release candidate: {label} failed:\n{}{hint}",
+        stderr.trim()
     ))
+}
+
+/// A Go phase that ran with `GOPROXY=off` and could not resolve a dependency:
+/// say that the baked module cache lacks it, rather than leave the bare
+/// `module lookup disabled by GOPROXY=off` line.
+fn offline_cache_miss_hint(spec: &ProcessSpec, stderr: &str) -> String {
+    if spec
+        .env
+        .get(std::ffi::OsStr::new("GOPROXY"))
+        .map(|v| v.as_os_str())
+        != Some(std::ffi::OsStr::new("off"))
+    {
+        return String::new();
+    }
+    let missing = [
+        "GOPROXY=off",
+        "missing go.sum entry",
+        "no required module provides package",
+        "cannot find module providing package",
+    ]
+    .iter()
+    .any(|marker| stderr.contains(marker));
+    if !missing {
+        return String::new();
+    }
+    let cache = spec
+        .env
+        .get(std::ffi::OsStr::new("GOMODCACHE"))
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    format!(
+        "\n\nrelease candidate: offline build: a dependency is not in the module cache at {cache}. \
+         The cache is baked at the scaffold pin; add the missing module to it (and its go.sum entry to the module), or drop --offline to fetch through the public proxy."
+    )
 }
 
 fn exact_one_line(stdout: &[u8]) -> Result<&[u8]> {
@@ -1539,6 +1596,7 @@ mod tests {
             version: "1.2.3",
             source_version_key: VERSION_KEY,
             api_only: false,
+            offline_modcache: None,
         }
     }
 
@@ -2106,8 +2164,64 @@ mod tests {
     }
 
     #[test]
+    fn go_phases_use_the_public_proxy_unless_offline() {
+        let go = GoEnvironment::new("proxy-test", None).unwrap();
+        let spec = go_spec("go", PathBuf::from("."), &go);
+        assert_eq!(
+            spec.env.get(std::ffi::OsStr::new("GOPROXY")).unwrap(),
+            "https://proxy.golang.org"
+        );
+        assert_ne!(
+            spec.env.get(std::ffi::OsStr::new("GOMODCACHE")).unwrap(),
+            std::ffi::OsStr::new("/baked")
+        );
+    }
+
+    #[test]
+    fn offline_go_phases_use_the_baked_cache_and_no_proxy() {
+        let baked = tempfile::tempdir().unwrap();
+        let go = GoEnvironment::new("offline-test", Some(baked.path())).unwrap();
+        let spec = go_spec("go", PathBuf::from("."), &go);
+        assert_eq!(
+            spec.env.get(std::ffi::OsStr::new("GOPROXY")).unwrap(),
+            "off"
+        );
+        assert_eq!(
+            spec.env.get(std::ffi::OsStr::new("GOFLAGS")).unwrap(),
+            "-mod=readonly"
+        );
+        assert_eq!(
+            spec.env.get(std::ffi::OsStr::new("GOMODCACHE")).unwrap(),
+            baked.path().as_os_str()
+        );
+        // The build cache stays per-phase and isolated.
+        assert!(go.build_cache.starts_with(go._root.path()));
+    }
+
+    #[test]
+    fn an_uncached_dependency_offline_gets_a_clear_message() {
+        let baked = tempfile::tempdir().unwrap();
+        let go = GoEnvironment::new("hint-test", Some(baked.path())).unwrap();
+        let spec = go_spec("go", PathBuf::from("."), &go);
+        let hint = offline_cache_miss_hint(
+            &spec,
+            "main.go:3:8: example.com/dep@v1.0.0: module lookup disabled by GOPROXY=off",
+        );
+        assert!(hint.contains("not in the module cache"), "{hint}");
+        assert!(hint.contains(&*baked.path().to_string_lossy()), "{hint}");
+        // Unrelated failures and online builds get no offline hint.
+        assert_eq!(offline_cache_miss_hint(&spec, "syntax error"), "");
+        let online = GoEnvironment::new("hint-online", None).unwrap();
+        let online_spec = go_spec("go", PathBuf::from("."), &online);
+        assert_eq!(
+            offline_cache_miss_hint(&online_spec, "module lookup disabled by GOPROXY=off"),
+            ""
+        );
+    }
+
+    #[test]
     fn release_tool_environments_remove_ambient_build_selectors() {
-        let go = GoEnvironment::new("env-test").unwrap();
+        let go = GoEnvironment::new("env-test", None).unwrap();
         let spec = go_spec("go", PathBuf::from("."), &go);
         assert_eq!(
             spec.env.get(std::ffi::OsStr::new("GOFLAGS")).unwrap(),

@@ -127,7 +127,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo test --all-features --test module_build -- --ignored --nocapture 2>&1 | tee module-build-test.log
-          grep -qE '^test result: ok\. 2 passed' module-build-test.log \
+          grep -qE '^test result: ok\. 3 passed' module-build-test.log \
             || { echo "::error::the module build acceptance tests did not run"; exit 1; }
           grep -E '^MEASURED zip_byte_identical' module-build-test.log | tee -a "$GITHUB_STEP_SUMMARY"
 
