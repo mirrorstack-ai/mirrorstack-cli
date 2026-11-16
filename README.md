@@ -23,6 +23,7 @@ mirrorstack app module init    # Register a new module on the platform
 mirrorstack app module rename  # Safely rename a module slug without changing its ID
 mirrorstack module deploy      # Cross-compile Linux/arm64, package a bootstrap zip, and upload it
 mirrorstack module build --out ../out  # Build the same release candidate with no login or platform call: receipt.json + bootstrap.zip
+mirrorstack module build --out ../out --offline --modcache /opt/go-modcache  # Same build with GOPROXY=off against a baked module cache (no network)
 mirrorstack app web deploy     # Deploy a static build directory to app hosting
 mirrorstack module capabilities         # Which host slots exist, who fills them, what is broken
 mirrorstack module capabilities --json  # …the same index, machine-readable

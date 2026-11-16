@@ -330,3 +330,148 @@ fn api_only_build_refuses_a_web_module_and_writes_nothing() {
         "a refused build wrote output"
     );
 }
+
+/// SB-C1b: a file:// proxy that serves `example.com/dep` v1.0.0, so the
+/// fixture can depend on a real module without touching the network.
+fn write_dep_proxy(proxy: &Path) {
+    use std::io::Write;
+    let dir = proxy.join("example.com/dep/@v");
+    fs::create_dir_all(&dir).unwrap();
+    let go_mod = "module example.com/dep\n\ngo 1.23\n";
+    fs::write(dir.join("list"), "v1.0.0\n").unwrap();
+    fs::write(
+        dir.join("v1.0.0.info"),
+        r#"{"Version":"v1.0.0","Time":"2024-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    fs::write(dir.join("v1.0.0.mod"), go_mod).unwrap();
+    let mut zip = zip::ZipWriter::new(fs::File::create(dir.join("v1.0.0.zip")).unwrap());
+    let options = zip::write::SimpleFileOptions::default();
+    zip.start_file("example.com/dep@v1.0.0/go.mod", options)
+        .unwrap();
+    zip.write_all(go_mod.as_bytes()).unwrap();
+    zip.start_file("example.com/dep@v1.0.0/dep.go", options)
+        .unwrap();
+    zip.write_all(b"package dep\n\nconst Name = \"dep\"\n")
+        .unwrap();
+    zip.finish().unwrap();
+}
+
+/// The fixture module, now importing `example.com/dep`, with `go.sum` filled
+/// in and the dependency downloaded into `cache` (the "baked" module cache).
+fn dep_fixture(cache: &Path) -> (tempfile::TempDir, PathBuf) {
+    let proxy = tempfile::tempdir().unwrap();
+    write_dep_proxy(proxy.path());
+    let (root, module) = fixture(false);
+    let main = MAIN_GO.replace("\t\"os\"\n)", "\t\"os\"\n\n\t\"example.com/dep\"\n)")
+        + "\nvar _ = dep.Name\n";
+    fs::write(module.join("main.go"), main).unwrap();
+    let tidy = Command::new("go")
+        .args(["mod", "tidy"])
+        .current_dir(&module)
+        .env("GOPROXY", format!("file://{}", proxy.path().display()))
+        .env("GOMODCACHE", cache)
+        .env("GOFLAGS", "-modcacherw")
+        .env("GOSUMDB", "off")
+        .env("GOTOOLCHAIN", "local")
+        .env("GOWORK", "off")
+        .output()
+        .unwrap();
+    assert!(tidy.status.success(), "go mod tidy\n{}", text(&tidy));
+    git(root.path(), &["add", "."]);
+    git(root.path(), &["commit", "-q", "-m", "dep"]);
+    // The proxy is dropped here: only the cache can satisfy the dependency.
+    (root, module)
+}
+
+fn offline_build(home: &Path, module: &Path, out: &Path, cache: &Path) -> Output {
+    // Every proxy variable points at a closed port: a build that tried the
+    // network would fail instead of passing by accident.
+    let dead = closed_port_url();
+    cli(home, module, &dead)
+        .env("HTTP_PROXY", &dead)
+        .env("HTTPS_PROXY", &dead)
+        .args([
+            "module",
+            "build",
+            "--api-only",
+            "--offline",
+            "--module-id",
+            MODULE_ID,
+        ])
+        .arg("--modcache")
+        .arg(cache)
+        .arg("--out")
+        .arg(out)
+        .output()
+        .unwrap()
+}
+
+#[test]
+#[ignore = "needs Go >= 1.26.10; run by the scaffold CI job"]
+fn offline_build_passes_from_the_baked_cache_and_names_an_uncached_dependency() {
+    let home = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let cache = scratch.path().join("baked-modcache");
+    let (_root, module) = dep_fixture(&cache);
+
+    // Baked cache, no network: the build passes and writes both outputs.
+    let out = scratch.path().join("out");
+    let built = offline_build(home.path(), &module, &out, &cache);
+    assert!(built.status.success(), "{}", text(&built));
+    assert!(out.join("receipt.json").is_file(), "{}", text(&built));
+    assert!(out.join("bootstrap.zip").is_file(), "{}", text(&built));
+
+    // Dependency absent from the cache: a clear failure, nothing written.
+    let empty = scratch.path().join("empty-modcache");
+    fs::create_dir_all(empty.join("cache").join("download")).unwrap();
+    let out = scratch.path().join("out-missing");
+    let failed = offline_build(home.path(), &module, &out, &empty);
+    assert!(!failed.status.success(), "{}", text(&failed));
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(stderr.contains("example.com/dep"), "{}", text(&failed));
+    assert!(
+        stderr.contains("not in the baked module cache"),
+        "{}",
+        text(&failed)
+    );
+    assert!(!out.join("bootstrap.zip").exists(), "{}", text(&failed));
+}
+
+#[test]
+fn offline_refuses_a_directory_that_is_not_a_go_module_cache() {
+    let home = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let (_root, module) = fixture(false);
+    let not_a_cache = scratch.path().join("wrong-layout");
+    fs::create_dir_all(&not_a_cache).unwrap();
+    let out = scratch.path().join("out");
+    let failed = offline_build(home.path(), &module, &out, &not_a_cache);
+    assert!(!failed.status.success(), "{}", text(&failed));
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("not a Go module cache"),
+        "{}",
+        text(&failed)
+    );
+    assert!(!out.join("bootstrap.zip").exists(), "{}", text(&failed));
+}
+
+#[test]
+fn offline_requires_a_modcache_and_modcache_requires_offline() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let platform = closed_port_url();
+    for args in [&["--offline"][..], &["--modcache", "/nonexistent"][..]] {
+        let output = cli(home.path(), cwd.path(), &platform)
+            .args(["module", "build", "--out", "o"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{}", text(&output));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("required arguments"),
+            "{}",
+            text(&output)
+        );
+    }
+}

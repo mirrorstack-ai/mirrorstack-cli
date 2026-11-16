@@ -160,6 +160,7 @@ pub(super) fn run(args: DeployArgs) -> Result<()> {
             version: &version,
             source_version_key: &raw,
             api_only: false,
+            offline_modcache: None,
         })
     })?;
     let zip_path = candidate.artifact_path();

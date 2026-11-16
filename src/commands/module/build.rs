@@ -39,6 +39,14 @@ pub struct BuildArgs {
     /// declared UI surface or a declared Client. For agent-built modules.
     #[arg(long)]
     api_only: bool,
+    /// Offline build: run every Go phase with GOPROXY=off against the module
+    /// cache named by --modcache. Nothing is downloaded; a dependency missing
+    /// from the cache fails the build with a message saying so.
+    #[arg(long, requires = "modcache")]
+    offline: bool,
+    /// A prebuilt Go module cache (GOMODCACHE layout), used with --offline.
+    #[arg(long, requires = "offline", value_name = "DIR")]
+    modcache: Option<PathBuf>,
     /// Print the output paths and hashes as one JSON object on stdout.
     #[arg(long)]
     json: bool,
@@ -68,6 +76,11 @@ pub(super) fn run(args: BuildArgs) -> Result<()> {
     let version = canonical_version(&raw)?;
     let module_id = resolve_module_id(args.module_id.as_deref(), &meta)?;
     let out = prepare_out_dir(&args.out, &dir)?;
+    let modcache = args
+        .modcache
+        .as_deref()
+        .map(|cache| resolve_modcache(cache, &dir))
+        .transpose()?;
 
     let candidate = with_spinner("Building release candidate…", || {
         release_candidate::build(CandidateRequest {
@@ -77,6 +90,7 @@ pub(super) fn run(args: BuildArgs) -> Result<()> {
             version: &version,
             source_version_key: &raw,
             api_only: args.api_only,
+            offline_modcache: modcache.as_deref(),
         })
     })?;
     let outputs = write_outputs(&candidate, &out)?;
@@ -126,6 +140,35 @@ fn resolve_module_id(flag: Option<&str>, meta: &ModuleMeta) -> Result<String> {
         ));
     }
     Ok(id.to_string())
+}
+
+/// Resolve `--modcache` to an absolute directory. Refused inside the module
+/// directory: the cache would become part of the source the build attests.
+fn resolve_modcache(cache: &Path, module_dir: &Path) -> Result<PathBuf> {
+    let resolved = fs::canonicalize(cache)
+        .with_context(|| format!("--modcache {} does not exist", cache.display()))?;
+    if !resolved.is_dir() {
+        return Err(anyhow!(
+            "--modcache {} is not a directory",
+            resolved.display()
+        ));
+    }
+    if !resolved.join("cache").join("download").is_dir() {
+        return Err(anyhow!(
+            "--modcache {} is not a Go module cache (no cache/download inside); point it at the baked GOMODCACHE",
+            resolved.display()
+        ));
+    }
+    let module = fs::canonicalize(module_dir)
+        .with_context(|| format!("resolve module directory {}", module_dir.display()))?;
+    if resolved.starts_with(&module) {
+        return Err(anyhow!(
+            "--modcache {} is inside the module directory {}: the cache would change the build's source hash; pick a directory outside it",
+            resolved.display(),
+            module.display()
+        ));
+    }
+    Ok(resolved)
 }
 
 /// Create `out` and resolve it. Refused inside the module directory: the
