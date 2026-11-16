@@ -844,6 +844,34 @@ fn build_linux_artifact(
     ))
 }
 
+/// Recursively copy `src` into `dst` as plain, owner-writable files and
+/// directories. Symlinks are refused: a baked cache has none, and following one
+/// could pull bytes from outside it into the attested build.
+fn copy_dir_private(src: &Path, dst: &Path) -> Result<()> {
+    for entry in fs::read_dir(src).with_context(|| format!("read {}", src.display()))? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            fs::create_dir_all(&to)?;
+            copy_dir_private(&from, &to)?;
+        } else if kind.is_file() {
+            fs::copy(&from, &to).with_context(|| format!("copy {}", from.display()))?;
+            let mut perms = fs::metadata(&to)?.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            fs::set_permissions(&to, perms)?;
+        } else {
+            return Err(anyhow!(
+                "{} is a symlink or special file; a baked module cache holds only files and directories",
+                from.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 struct GoEnvironment {
     _root: TempDir,
     module_cache: PathBuf,
@@ -859,15 +887,21 @@ impl GoEnvironment {
             .tempdir()
             .with_context(|| format!("release candidate: create {phase} Go environment"))?;
         let build_cache = root.path().join("buildcache");
-        let module_cache = match offline_modcache {
-            Some(baked) => baked.to_path_buf(),
-            None => {
-                let isolated = root.path().join("modcache");
-                fs::create_dir_all(&isolated)
-                    .context("release candidate: create isolated Go module cache")?;
-                isolated
-            }
-        };
+        // Every phase gets its OWN module cache. A baked cache is copied in, never
+        // used in place: the manifest phase runs the module's own code (`go run .`),
+        // which could otherwise rewrite extracted dependency sources in a shared
+        // cache that a later phase (or build) compiles into the attested artifact.
+        let module_cache = root.path().join("modcache");
+        fs::create_dir_all(&module_cache)
+            .context("release candidate: create isolated Go module cache")?;
+        if let Some(baked) = offline_modcache {
+            copy_dir_private(baked, &module_cache).with_context(|| {
+                format!(
+                    "release candidate: copy the baked module cache {} into the {phase} Go environment",
+                    baked.display()
+                )
+            })?;
+        }
         fs::create_dir_all(&build_cache)
             .context("release candidate: create isolated Go build cache")?;
         Ok(Self {
@@ -1057,20 +1091,19 @@ fn offline_cache_miss_hint(spec: &ProcessSpec, stderr: &str) -> String {
         "missing go.sum entry",
         "no required module provides package",
         "cannot find module providing package",
+        "go: downloading",
+        "verifying module",
+        "checksum mismatch",
+        "SECURITY ERROR",
     ]
     .iter()
     .any(|marker| stderr.contains(marker));
     if !missing {
         return String::new();
     }
-    let cache = spec
-        .env
-        .get(std::ffi::OsStr::new("GOMODCACHE"))
-        .map(|v| v.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    format!(
-        "\n\nrelease candidate: offline build: a dependency is not in the module cache at {cache}. \
-         The cache is baked at the scaffold pin; add the missing module to it (and its go.sum entry to the module), or drop --offline to fetch through the public proxy."
+    String::from(
+        "\n\nrelease candidate: offline build: a dependency is not in the baked module cache (--modcache). \
+         The cache is baked at the scaffold pin; add the missing module to it (and its go.sum entry to the module), or drop --offline to fetch through the public proxy.",
     )
 }
 
@@ -2171,10 +2204,6 @@ mod tests {
             spec.env.get(std::ffi::OsStr::new("GOPROXY")).unwrap(),
             "https://proxy.golang.org"
         );
-        assert_ne!(
-            spec.env.get(std::ffi::OsStr::new("GOMODCACHE")).unwrap(),
-            std::ffi::OsStr::new("/baked")
-        );
     }
 
     #[test]
@@ -2192,10 +2221,52 @@ mod tests {
         );
         assert_eq!(
             spec.env.get(std::ffi::OsStr::new("GOMODCACHE")).unwrap(),
-            baked.path().as_os_str()
+            go.module_cache.as_os_str()
         );
+        // The baked cache is copied, never used in place.
+        assert_ne!(go.module_cache, baked.path());
         // The build cache stays per-phase and isolated.
         assert!(go.build_cache.starts_with(go._root.path()));
+    }
+
+    #[test]
+    fn offline_phases_get_a_private_copy_of_the_baked_cache() {
+        let baked = tempfile::tempdir().unwrap();
+        let dep = baked.path().join("example.com").join("dep@v1.0.0");
+        fs::create_dir_all(&dep).unwrap();
+        fs::write(dep.join("dep.go"), "package dep\n").unwrap();
+        let first = GoEnvironment::new("copy-a", Some(baked.path())).unwrap();
+        let second = GoEnvironment::new("copy-b", Some(baked.path())).unwrap();
+        for go in [&first, &second] {
+            assert_ne!(go.module_cache, baked.path());
+            assert_eq!(
+                fs::read_to_string(go.module_cache.join("example.com/dep@v1.0.0/dep.go")).unwrap(),
+                "package dep\n"
+            );
+        }
+        // A phase rewriting its dependency source reaches neither the baked
+        // cache nor another phase's copy.
+        fs::write(
+            first.module_cache.join("example.com/dep@v1.0.0/dep.go"),
+            "package evil\n",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dep.join("dep.go")).unwrap(),
+            "package dep\n"
+        );
+        assert_eq!(
+            fs::read_to_string(second.module_cache.join("example.com/dep@v1.0.0/dep.go")).unwrap(),
+            "package dep\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_baked_cache_with_a_symlink_is_refused() {
+        let baked = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("/etc/hosts", baked.path().join("link")).unwrap();
+        assert!(GoEnvironment::new("symlink", Some(baked.path())).is_err());
     }
 
     #[test]
@@ -2207,8 +2278,7 @@ mod tests {
             &spec,
             "main.go:3:8: example.com/dep@v1.0.0: module lookup disabled by GOPROXY=off",
         );
-        assert!(hint.contains("not in the module cache"), "{hint}");
-        assert!(hint.contains(&*baked.path().to_string_lossy()), "{hint}");
+        assert!(hint.contains("not in the baked module cache"), "{hint}");
         // Unrelated failures and online builds get no offline hint.
         assert_eq!(offline_cache_miss_hint(&spec, "syntax error"), "");
         let online = GoEnvironment::new("hint-online", None).unwrap();

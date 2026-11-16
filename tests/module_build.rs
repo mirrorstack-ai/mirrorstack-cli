@@ -424,14 +424,32 @@ fn offline_build_passes_from_the_baked_cache_and_names_an_uncached_dependency() 
 
     // Dependency absent from the cache: a clear failure, nothing written.
     let empty = scratch.path().join("empty-modcache");
-    fs::create_dir_all(&empty).unwrap();
+    fs::create_dir_all(empty.join("cache").join("download")).unwrap();
     let out = scratch.path().join("out-missing");
     let failed = offline_build(home.path(), &module, &out, &empty);
     assert!(!failed.status.success(), "{}", text(&failed));
     let stderr = String::from_utf8_lossy(&failed.stderr);
     assert!(stderr.contains("example.com/dep"), "{}", text(&failed));
     assert!(
-        stderr.contains("not in the module cache"),
+        stderr.contains("not in the baked module cache"),
+        "{}",
+        text(&failed)
+    );
+    assert!(!out.join("bootstrap.zip").exists(), "{}", text(&failed));
+}
+
+#[test]
+fn offline_refuses_a_directory_that_is_not_a_go_module_cache() {
+    let home = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let (_root, module) = fixture(false);
+    let not_a_cache = scratch.path().join("wrong-layout");
+    fs::create_dir_all(&not_a_cache).unwrap();
+    let out = scratch.path().join("out");
+    let failed = offline_build(home.path(), &module, &out, &not_a_cache);
+    assert!(!failed.status.success(), "{}", text(&failed));
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("not a Go module cache"),
         "{}",
         text(&failed)
     );

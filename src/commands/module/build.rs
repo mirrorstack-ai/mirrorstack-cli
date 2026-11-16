@@ -153,6 +153,12 @@ fn resolve_modcache(cache: &Path, module_dir: &Path) -> Result<PathBuf> {
             resolved.display()
         ));
     }
+    if !resolved.join("cache").join("download").is_dir() {
+        return Err(anyhow!(
+            "--modcache {} is not a Go module cache (no cache/download inside); point it at the baked GOMODCACHE",
+            resolved.display()
+        ));
+    }
     let module = fs::canonicalize(module_dir)
         .with_context(|| format!("resolve module directory {}", module_dir.display()))?;
     if resolved.starts_with(&module) {
