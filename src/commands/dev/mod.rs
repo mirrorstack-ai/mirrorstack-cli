@@ -106,7 +106,7 @@ pub struct DevArgs {
     #[arg(long)]
     dir: Option<PathBuf>,
     /// Open WSS tunnels so deployed callers can reach local modules. Declared
-    /// module clients are built and published automatically; --share is not
+    /// module clients are built and published automatically; --shared is not
     /// required for them.
     #[arg(long)]
     tunnel: bool,
@@ -131,11 +131,17 @@ pub struct DevArgs {
     /// inferred here and is not guessed.
     #[arg(long, value_name = "APP_UUID")]
     cron_app: Option<String>,
-    /// Publish each module's built web bundle to the CDN so REMOTE viewers of
-    /// a prod dev-tunnel can load it. Only meaningful with --tunnel; in
-    /// local-only mode the bundle already serves from localhost and this has
-    /// no effect (a warning says so). Off by default — today's behavior.
+    /// Make the dev tunnel reachable by every member of the chosen app —
+    /// not just this sandbox or dev device. The chosen app is an app where
+    /// the module's route-local switch is on (Dev tab). A remote end user
+    /// also needs the module's web bundle, so --shared publishes each
+    /// module's built web bundle to the CDN too. Only meaningful with
+    /// --tunnel; in local-only mode this has no effect (a warning says so).
+    /// Off by default — today's behavior.
     #[arg(long)]
+    shared: bool,
+    /// Deprecated alias for --shared, kept for one release.
+    #[arg(long, hide = true)]
     share: bool,
     /// Watch module sources and rebuild/restart on change (used with
     /// --all). On by default so the compose runner hot-reloads; pass
@@ -374,7 +380,32 @@ fn read_workspace_metadata(
     })
 }
 
+/// `--shared` effective flag: true if either `--shared` or its deprecated
+/// `--share` alias was given.
+fn effective_shared(args: &DevArgs) -> bool {
+    args.shared || args.share
+}
+
+/// `--shared` (and its `--share` alias) only mean something for a prod
+/// dev-tunnel: a remote viewer can't reach the dev's localhost, so the
+/// tunnel must be scoped to the app and the bundle must go to the CDN. In
+/// local-only mode the browser IS on the dev's machine and the localhost
+/// bundle serves fine, so this warns rather than errors.
+fn shared_needs_tunnel_warning(shared: bool, tunnel: bool) -> bool {
+    shared && !tunnel
+}
+
 fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
+    // --share is --shared's hidden alias for one release (see DevArgs); print
+    // the migration notice once, up front, regardless of --tunnel.
+    if args.share {
+        eprintln!(
+            "{} --share is now --shared; --share will be removed in a later release.",
+            warn_prefix()
+        );
+    }
+    let shared = effective_shared(args);
+
     // A workspace has one compose project and one bind-mounted control plane.
     // Hold this through compose teardown so concurrent outer invocations can
     // never consume each other's tunnel/client markers or credentials.
@@ -426,13 +457,9 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         ));
     }
 
-    // --share only means something for a prod dev-tunnel: a remote viewer
-    // can't reach the dev's localhost, so the bundle must go to the CDN. In
-    // local-only mode the browser IS on the dev's machine and the localhost
-    // bundle serves fine — sharing would be dead work. Warn, don't error.
-    if args.share && !args.tunnel {
+    if shared_needs_tunnel_warning(shared, args.tunnel) {
         eprintln!(
-            "{} --share has no effect without --tunnel: local-only dev serves the bundle from localhost.",
+            "{} --shared has no effect without --tunnel: local-only dev serves the bundle from localhost.",
             warn_prefix()
         );
     }
@@ -503,7 +530,13 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
 
     // Register tunnels before compose so auth failures surface early.
     if args.tunnel {
-        let opened = open_tunnels(root, &ready, args.local_url.as_deref(), &internal_secrets)?;
+        let opened = open_tunnels(
+            root,
+            &ready,
+            args.local_url.as_deref(),
+            &internal_secrets,
+            shared,
+        )?;
         teardown.opened_tunnels = Some(opened);
 
         // `open_tunnels` builds sessions and targets together, so zip is aligned.
@@ -527,7 +560,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
                         local_url: &target.local_url,
                         module_dir: &target.module_dir,
                         watch: args.watch,
-                        share: args.share,
+                        share: shared,
                     },
                     release_session::SessionCredentials {
                         token_file: &target.token_file,
@@ -599,18 +632,18 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         .context("dev: write capability-check marker for inner runner")?;
     }
 
-    // With --share on a live tunnel, spin up the host-side bundle watcher.
+    // With --shared on a live tunnel, spin up the host-side bundle watcher.
     // It's the only process holding the user access token (credentials.json,
     // never mounted into the runner) AND able to read each module's built
     // web/dist/index.js (via the compose bind mount) AND aware of the tunnel
     // session registration whose bundleUrl the confirm step updates — so the
     // upload belongs here, not in the container (see share.rs). Best-effort:
     // a share failure never blocks the tunnel.
-    teardown.share = if args.tunnel && args.share {
+    teardown.share = if args.tunnel && shared {
         let targets = build_share_targets(root, &ready, args.watch);
         if targets.is_empty() {
             eprintln!(
-                "{} --share: no module ships a web bundle — nothing to share",
+                "{} --shared: no module ships a web bundle — nothing to share",
                 warn_prefix()
             );
             None
@@ -1745,6 +1778,7 @@ fn open_tunnels(
     modules: &[workspace::WorkspaceModule],
     local_url_base: Option<&str>,
     internal_secrets: &HashMap<String, String>,
+    shared: bool,
 ) -> Result<OpenedTunnels> {
     let mut creds = credentials::load_or_login_hint()?;
     let dispatch_base = resolve_base(ENV_DISPATCH_URL, DEFAULT_DISPATCH_BASE);
@@ -1811,6 +1845,7 @@ fn open_tunnels(
                     // own fetch and the first heartbeat carries it. A RECONNECT
                     // does carry the real hash — see `supervisor`.
                     manifest_hash: None,
+                    shared,
                 },
             )
             .await
@@ -1841,6 +1876,7 @@ fn open_tunnels(
             style(&module_local_url).dim(),
             style(&session.handle.session_id).dim()
         );
+        print_reach_line(&session.handle.shared);
 
         targets.push(supervisor::TunnelTarget {
             slug: slug.to_string(),
@@ -1849,6 +1885,7 @@ fn open_tunnels(
             module_dir: m.abs_dir.clone(),
             token_file: platform_token_file(root, &slug),
             internal_secret: internal_secret.clone(),
+            shared,
         });
         sessions.push(session);
     }
@@ -1860,6 +1897,23 @@ fn open_tunnels(
         dispatch_base,
         creds,
     })
+}
+
+/// Print who can reach this module's tunnel, from the register ack's
+/// `shared` field (see [`tunnel::RegisterAck`]). `None` means the platform
+/// predates scoping entirely, so the CLI can't vouch for the reach and says
+/// so instead of guessing.
+fn print_reach_line(ack_shared: &Option<bool>) {
+    match ack_shared {
+        Some(false) => eprintln!("  reachable by: you only (not shared)"),
+        Some(true) => {
+            eprintln!("  reachable by: every member of the apps with route-local on (shared)")
+        }
+        None => eprintln!(
+            "{} this platform does not scope tunnels; assume every member of the app can reach it.",
+            warn_prefix()
+        ),
+    }
 }
 
 /// Access tokens are short (15 min per the platform's TokenConfig).
@@ -2360,6 +2414,46 @@ var _ = mirrorstack.Config{
         assert!(!capability_check_skipped(false, Some("0")));
         assert!(!capability_check_skipped(false, Some("false")));
         assert!(!capability_check_skipped(false, Some("FALSE")));
+    }
+
+    fn test_dev_args() -> DevArgs {
+        DevArgs {
+            dir: None,
+            tunnel: false,
+            local_url: None,
+            all: false,
+            cron_app: None,
+            shared: false,
+            share: false,
+            watch: true,
+            skip_capability_check: false,
+        }
+    }
+
+    #[test]
+    fn shared_flag_alone_is_effective() {
+        let mut args = test_dev_args();
+        args.shared = true;
+        assert!(effective_shared(&args));
+    }
+
+    #[test]
+    fn deprecated_share_alias_also_sets_effective_shared() {
+        let mut args = test_dev_args();
+        args.share = true;
+        assert!(effective_shared(&args));
+    }
+
+    #[test]
+    fn neither_flag_is_not_shared() {
+        assert!(!effective_shared(&test_dev_args()));
+    }
+
+    #[test]
+    fn shared_without_tunnel_warns() {
+        assert!(shared_needs_tunnel_warning(true, false));
+        assert!(!shared_needs_tunnel_warning(true, true));
+        assert!(!shared_needs_tunnel_warning(false, false));
     }
 
     #[test]
