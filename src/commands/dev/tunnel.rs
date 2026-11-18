@@ -245,6 +245,17 @@ pub(super) struct RegisterPayload<'a> {
     /// only when present so older dispatch builds keep round-tripping register.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_hash: Option<String>,
+    /// `--shared`: ask the platform to make this tunnel reachable by every
+    /// member of the chosen app (route-local switch on), not just this
+    /// sandbox/dev device. `false` is the default (today's behavior) and is
+    /// never serialized, so older dispatch builds keep round-tripping the
+    /// register frame unchanged.
+    #[serde(skip_serializing_if = "is_false")]
+    pub shared: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,6 +269,13 @@ pub(super) struct RegisterAck {
     /// client retry on any failure rather than expiry-driven refresh.
     #[allow(dead_code)]
     pub expires_at: String,
+    /// Whether the platform scoped this tunnel to every member of the chosen
+    /// app (`Some(true)`) or to just this sandbox/dev device (`Some(false)`).
+    /// `None` on a platform that predates scoping — the CLI then warns that
+    /// it cannot vouch for who can reach the tunnel. `#[serde(default)]`
+    /// because older dispatch builds omit the key entirely.
+    #[serde(default)]
+    pub shared: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -362,6 +380,9 @@ type RegisterResult<T> = std::result::Result<T, RegisterError>;
 pub(super) struct TunnelHandle {
     pub session_id: String,
     pub service_token: String,
+    /// The register ack's reach scope — see [`RegisterAck::shared`]. `None`
+    /// on a detached test handle, same as an ack with no `shared` field.
+    pub shared: Option<bool>,
     shutdown: Arc<Notify>,
 }
 
@@ -387,6 +408,7 @@ impl TunnelHandle {
             TunnelHandle {
                 session_id: session_id.to_string(),
                 service_token: service_token.to_string(),
+                shared: None,
                 shutdown: shutdown.clone(),
             },
             shutdown,
@@ -486,6 +508,7 @@ pub(super) async fn open(
         handle: TunnelHandle {
             session_id: ack.session_id,
             service_token: ack.service_token,
+            shared: ack.shared,
             shutdown,
         },
         exit: exit_rx,
@@ -1191,6 +1214,7 @@ mod tests {
             version: "0.1.0",
             internal_secret: None,
             manifest_hash: None,
+            shared: false,
         };
         let s = serde_json::to_string(&p).unwrap();
         assert!(s.contains("\"module_id\":\"m_abc\""));
@@ -1199,6 +1223,8 @@ mod tests {
         assert!(!s.contains("internal_secret"));
         // manifest_hash is None at register time — also skipped.
         assert!(!s.contains("manifest_hash"));
+        // shared defaults to false and is skipped, same as internal_secret.
+        assert!(!s.contains("shared"));
     }
 
     #[test]
@@ -1209,9 +1235,47 @@ mod tests {
             version: "0.1.0",
             internal_secret: Some("s3cret"),
             manifest_hash: None,
+            shared: false,
         };
         let s = serde_json::to_string(&p).unwrap();
         assert!(s.contains("\"internal_secret\":\"s3cret\""));
+    }
+
+    #[test]
+    fn register_payload_emits_shared_true_when_set() {
+        let p = RegisterPayload {
+            module_id: "m_abc",
+            local_url: "http://localhost:8080",
+            version: "0.1.0",
+            internal_secret: None,
+            manifest_hash: None,
+            shared: true,
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        assert!(s.contains("\"shared\":true"));
+    }
+
+    #[test]
+    fn register_ack_parses_with_shared_field() {
+        let ack: RegisterAck = serde_json::from_value(serde_json::json!({
+            "session_id": "sess_1",
+            "service_token": "stk_1",
+            "expires_at": "2026-08-06T00:00:00Z",
+            "shared": true,
+        }))
+        .unwrap();
+        assert_eq!(ack.shared, Some(true));
+    }
+
+    #[test]
+    fn register_ack_parses_without_shared_field() {
+        let ack: RegisterAck = serde_json::from_value(serde_json::json!({
+            "session_id": "sess_1",
+            "service_token": "stk_1",
+            "expires_at": "2026-08-06T00:00:00Z",
+        }))
+        .unwrap();
+        assert_eq!(ack.shared, None);
     }
 
     #[test]
@@ -1703,6 +1767,7 @@ mod tests {
             version: "0.0.0-test",
             internal_secret: Some("sec"),
             manifest_hash: None,
+            shared: false,
         }
     }
 

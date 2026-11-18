@@ -481,6 +481,7 @@ mod tests {
                 os: "linux".to_string(),
                 arch: "arm64".to_string(),
                 format: "lambda-bootstrap-zip".to_string(),
+                bootstrap_sha256: None,
             },
         }
     }
