@@ -20,6 +20,9 @@ const RECEIPT_FILE: &str = "receipt.json";
 const ARTIFACT_FILE: &str = "bootstrap.zip";
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack module build --out ../build-out\n  mirrorstack module build --out ../build-out --api-only --module-id <module-id>"
+)]
 pub struct BuildArgs {
     /// Module directory containing main.go. Defaults to cwd.
     #[arg(long)]
