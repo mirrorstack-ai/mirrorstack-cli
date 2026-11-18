@@ -136,6 +136,9 @@ pub(super) struct TunnelTarget {
     pub token_file: PathBuf,
     /// Reused verbatim for this module on every re-register.
     pub internal_secret: String,
+    /// `--shared`, carried verbatim into every reconnect's register frame so
+    /// a reconnect never silently drops back to the unscoped default.
+    pub shared: bool,
 }
 
 /// Live supervision state for one module, shared between its supervisor thread
@@ -565,6 +568,7 @@ fn attempt_reconnect(
                         version: env!("CARGO_PKG_VERSION"),
                         internal_secret: Some(&target.internal_secret),
                         manifest_hash,
+                        shared: target.shared,
                     },
                 ),
             )
@@ -989,6 +993,7 @@ mod tests {
             module_dir: dir.to_path_buf(),
             token_file: dir.join(format!("ms-platform-token-{slug}")),
             internal_secret: format!("secret-{slug}"),
+            shared: false,
         }
     }
 
