@@ -23,6 +23,8 @@ mirrorstack whoami --json      # …the same identity, machine-readable
 mirrorstack app module init    # Register a new module on the platform
 mirrorstack app module rename  # Safely rename a module slug without changing its ID
 mirrorstack module deploy      # Cross-compile Linux/arm64, package a bootstrap zip, and upload it
+mirrorstack module build --out ../out  # Build the same release candidate with no login or platform call: receipt.json + bootstrap.zip
+mirrorstack module build --out ../out --offline --modcache /opt/go-modcache  # Same build with GOPROXY=off against a baked module cache (no network)
 mirrorstack app web deploy     # Deploy a static build directory to app hosting
 mirrorstack module capabilities         # Which host slots exist, who fills them, what is broken
 mirrorstack module capabilities --json  # …the same index, machine-readable
@@ -34,6 +36,9 @@ mirrorstack apps client install --app my-app                    # Install every 
 mirrorstack apps client install --app my-app --frozen           # CI: install exactly the manifest, fail on drift
 mirrorstack apps client install --app my-app --dev              # Keep reinstalling as tunnels publish new revisions
 mirrorstack apps client install --app my-app --oidc --frozen    # CI, no login: authenticate with the job's GitHub Actions identity
+mirrorstack dev --tunnel                                        # Dev tunnel reachable from your sandbox/dev device only
+mirrorstack dev --tunnel --shared                                # ...reachable by every member of an app with this module's route-local switch on; also publishes the web bundle to the CDN
+mirrorstack dev --tunnel --share                                 # Deprecated alias for --shared; will be removed in a later release
 mirrorstack --help             # Show help
 mirrorstack --version          # Show CLI version
 ```
