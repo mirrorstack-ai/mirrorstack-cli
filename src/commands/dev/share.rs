@@ -82,6 +82,32 @@ const MISSING_BUNDLE: &str = "__missing-bundle__";
 /// abort it. Matches the deploy path's upload-sized client.
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Opt-in probe for #78 ("--share does not re-publish after an in-container
+/// rebuild"). `share_once` is silent on every no-op path, so "the host never
+/// saw the rebuild", "the hash gate swallowed it" and "no session" all look
+/// identical from outside. With `MIRRORSTACK_SHARE_TRACE=1` every scan prints
+/// what the host read (size, age of the file, hash) and which branch it took.
+const TRACE_ENV: &str = "MIRRORSTACK_SHARE_TRACE";
+
+fn trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| trace_flag(std::env::var(TRACE_ENV).ok().as_deref()))
+}
+
+fn trace_flag(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some(v) if !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+}
+
+fn short(hash: &str) -> &str {
+    &hash[..hash.len().min(12)]
+}
+
+fn trace(slug: &str, message: impl FnOnce() -> String) {
+    if trace_enabled() {
+        eprintln!("[share-trace] [{slug}] {}", message());
+    }
+}
+
 /// One tunneled module the watcher shares. `dist` is the absolute path to
 /// the built bundle on the host (bind-mount view of the container's output);
 /// `module_id` is the catalog id the tunnel registered under (same value
@@ -483,6 +509,20 @@ fn share_once(
         }
     };
 
+    trace(&target.slug, || {
+        let age = std::fs::metadata(&target.dist)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| format!("{}s old", d.as_secs()))
+            .unwrap_or_else(|| "mtime unknown".to_string());
+        format!(
+            "read {} bytes ({age}) from {}",
+            bytes.len(),
+            target.dist.display()
+        )
+    });
+
     if bytes.len() as u64 > MAX_BUNDLE_BYTES {
         // Warn once per oversize state, not every tick.
         if state.last_warned.as_deref() != Some("__oversize__") {
@@ -502,10 +542,27 @@ fn share_once(
     // Unchanged since the last confirmed upload → no-op (the common
     // no-op-save case stays free).
     if state.last_uploaded.as_deref() == Some(hash.as_str()) {
+        trace(&target.slug, || {
+            format!("sha {} == last published — nothing to do", short(&hash))
+        });
         return;
     }
 
+    // Always on (one line per real content change, not per tick): the first
+    // question in #78 is "did the host see the rebuild at all?", and until now
+    // only a successful publish answered it.
+    eprintln!(
+        "{} [{}] web bundle changed on disk ({} bytes, sha {}) — publishing",
+        ok_mark(),
+        style(&target.slug).cyan(),
+        bytes.len(),
+        short(&hash)
+    );
+
     let Some(session) = context.sessions.current(&target.slug) else {
+        trace(&target.slug, || {
+            "no current tunnel session — skipping".to_string()
+        });
         if state.last_warned.as_deref() != Some("__missing-session__") {
             eprintln!(
                 "{} [{}] no current tunnel session — web bundle cannot be confirmed",
@@ -580,6 +637,9 @@ fn share_once(
             // for the same still-failing bytes; leaving `last_uploaded`
             // unchanged means the next tick retries (recovers from a
             // transient error without needing another edit).
+            trace(&target.slug, || {
+                format!("upload of sha {} failed: {e}", short(&hash))
+            });
             if state.last_warned.as_deref() != Some(hash.as_str()) {
                 eprintln!(
                     "{} [{}] share upload failed ({e}); bundle still serves over the relay, will retry",
@@ -1051,6 +1111,66 @@ mod tests {
                 .to_string()
                 .contains("did not echo the current exact descriptor"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn trace_flag_is_opt_in() {
+        assert!(!trace_flag(None));
+        assert!(!trace_flag(Some("")));
+        assert!(!trace_flag(Some("0")));
+        assert!(!trace_flag(Some("false")));
+        assert!(trace_flag(Some("1")));
+        assert!(trace_flag(Some("true")));
+    }
+
+    #[test]
+    fn share_once_reaches_upload_when_rebuild_changes_the_hash() {
+        // The #78 claim is that a rebuild never reaches the publisher. Pin the
+        // inverse at the unit level: with `last_uploaded` holding the OLD
+        // hash and different bytes on disk, the scan must get past the hash
+        // gate and attempt an upload (apps_base is unroutable, so the attempt
+        // fails and records the NEW hash in `last_warned`, leaving
+        // `last_uploaded` on the old one so the next tick retries).
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("web/dist")).unwrap();
+        let dist = tmp.path().join("web/dist/index.js");
+        let old_bytes = b"export default {}";
+        let new_bytes = b"export default { rebuilt: true }";
+        std::fs::write(&dist, new_bytes).unwrap();
+
+        let api_client = http::client(Duration::from_secs(5)).unwrap();
+        let upload_client = http::client(Duration::from_secs(5)).unwrap();
+        let mut creds = Credentials {
+            access_token: "AT".into(),
+            refresh_token: "RT".into(),
+            expires_at: std::time::SystemTime::now() + Duration::from_secs(3600),
+        };
+        let target = ShareTarget {
+            slug: "media".into(),
+            module_id: "m-1".into(),
+            dist,
+        };
+        let mut state = TargetState {
+            last_uploaded: Some(sha256_hex(old_bytes)),
+            ..Default::default()
+        };
+        share_once_test(
+            &api_client,
+            &upload_client,
+            "http://127.0.0.1:1",
+            &mut creds,
+            &target,
+            &mut state,
+        );
+        assert_eq!(
+            state.last_warned.as_deref(),
+            Some(sha256_hex(new_bytes).as_str()),
+            "a changed hash must reach the upload step"
+        );
+        assert_eq!(
+            state.last_uploaded.as_deref(),
+            Some(sha256_hex(old_bytes).as_str())
         );
     }
 
