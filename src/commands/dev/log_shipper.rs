@@ -230,7 +230,7 @@ mod tests {
         let e = parse_line(r#"{"level":"error","message":"boom"}"#, false);
         assert_eq!(e.level, "error");
         assert_eq!(e.msg, "boom");
-        assert_eq!(e.ts, "");
+        assert_eq!(e.ts.len(), 8, "time-less JSON line is stamped on arrival");
         assert_eq!(e.app_id, "");
     }
 
