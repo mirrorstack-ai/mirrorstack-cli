@@ -26,6 +26,18 @@ pub struct LogEntry {
     /// Omitted from the wire when empty.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub app_id: String,
+    /// Access-line detail from the SDK's `request` log (`method`/`path`/
+    /// `status`/`duration_ms`); each omitted from the wire when absent, so
+    /// plain lines keep the {ts,level,msg} shape. Keys match the dispatch
+    /// ring Entry JSON.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -39,7 +51,8 @@ pub type LogSink = Sender<LogEntry>;
 /// parse_line turns a raw output line into a LogEntry. The SDK emits structured
 /// JSON (slog) — extract its level/msg/time/app_id; any other line (a third-party
 /// print, a panic, the SDK's own stderr diagnostics) falls back to the stream:
-/// stderr → warn, stdout → info, with the raw line as the message.
+/// stderr → warn, stdout → info, with the raw line as the message, stamped with
+/// the time it was read (the line carries none of its own).
 pub fn parse_line(raw: &str, is_stderr: bool) -> LogEntry {
     if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(raw)
         && obj.contains_key("level")
@@ -59,25 +72,54 @@ pub fn parse_line(raw: &str, is_stderr: bool) -> LogEntry {
             .get("time")
             .and_then(|v| v.as_str())
             .map(short_time)
-            .unwrap_or_default();
+            .unwrap_or_else(now_hms);
         let app_id = obj
             .get("app_id")
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
+        let str_field = |k: &str| obj.get(k).and_then(|v| v.as_str()).map(str::to_string);
         return LogEntry {
             ts,
             level,
             msg,
             app_id,
+            method: str_field("method"),
+            path: str_field("path"),
+            status: obj
+                .get("status")
+                .and_then(|v| v.as_u64())
+                .and_then(|n| u16::try_from(n).ok()),
+            duration_ms: obj.get("duration_ms").and_then(|v| v.as_u64()),
         };
     }
     LogEntry {
-        ts: String::new(),
+        ts: now_hms(),
         level: default_level(is_stderr),
         msg: raw.to_string(),
         app_id: String::new(),
+        method: None,
+        path: None,
+        status: None,
+        duration_ms: None,
     }
+}
+
+/// now_hms is the current UTC clock as HH:MM:SS — the same shape short_time
+/// yields — for lines that arrive without a timestamp of their own (a panic, a
+/// third-party print, the SDK's stderr diagnostics).
+fn now_hms() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+        % 86_400;
+    format!(
+        "{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60
+    )
 }
 
 fn default_level(is_stderr: bool) -> String {
@@ -183,7 +225,7 @@ mod tests {
         let e = parse_line(r#"{"level":"error","message":"boom"}"#, false);
         assert_eq!(e.level, "error");
         assert_eq!(e.msg, "boom");
-        assert_eq!(e.ts, "");
+        assert_eq!(e.ts.len(), 8); // no time in the line: stamped on read
         assert_eq!(e.app_id, "");
     }
 
@@ -196,6 +238,43 @@ mod tests {
         let err = parse_line("go: cannot find module", true);
         assert_eq!(err.level, "warn");
         assert_eq!(err.msg, "go: cannot find module");
+    }
+
+    #[test]
+    fn non_json_lines_are_stamped_with_a_clock_time() {
+        for is_stderr in [true, false] {
+            let e = parse_line("go: cannot find module", is_stderr);
+            let b = e.ts.as_bytes();
+            assert_eq!(e.ts.len(), 8, "ts = {:?}", e.ts);
+            assert!(b[2] == b':' && b[5] == b':', "ts = {:?}", e.ts);
+            assert!(e.method.is_none() && e.status.is_none());
+        }
+        // a JSON line with no time of its own is stamped too
+        let e = parse_line(r#"{"level":"info","msg":"x"}"#, false);
+        assert_eq!(e.ts.len(), 8);
+    }
+
+    #[test]
+    fn access_line_carries_request_detail() {
+        let raw = r#"{"time":"2026-06-30T12:48:21.123Z","level":"INFO","msg":"request","app_id":"a1","method":"POST","path":"/v1/x","status":502,"duration_ms":37}"#;
+        let e = parse_line(raw, false);
+        assert_eq!(e.ts, "12:48:21");
+        assert_eq!(e.method.as_deref(), Some("POST"));
+        assert_eq!(e.path.as_deref(), Some("/v1/x"));
+        assert_eq!(e.status, Some(502));
+        assert_eq!(e.duration_ms, Some(37));
+        let wire = serde_json::to_value(&e).unwrap();
+        assert_eq!(wire["status"], 502);
+        assert_eq!(wire["duration_ms"], 37);
+
+        // plain lines keep the {ts,level,msg} shape on the wire
+        let plain = serde_json::to_value(parse_line("hello", false)).unwrap();
+        let keys: Vec<_> = plain.as_object().unwrap().keys().cloned().collect();
+        assert!(
+            !keys
+                .iter()
+                .any(|k| ["method", "path", "status", "duration_ms"].contains(&k.as_str()))
+        );
     }
 
     #[test]
