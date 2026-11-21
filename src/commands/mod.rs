@@ -113,7 +113,7 @@ enum Command {
     Module(module::ModuleArgs),
     /// Run modules locally with supporting services. Scans go.work for
     /// monorepo mode; falls back to single-module if only main.go exists.
-    Dev(dev::DevArgs),
+    Dev(dev::DevCli),
     /// Serve a module's review harness on localhost — its real settings or
     /// nav surface in the console's own frame, answered from fixtures.
     ///
