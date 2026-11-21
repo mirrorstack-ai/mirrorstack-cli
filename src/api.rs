@@ -1216,6 +1216,47 @@ pub fn update_install_version(
     })
 }
 
+/// POST /v1/apps/{appRef}/modules/{moduleId}/resync — force the platform to
+/// re-read the module's current manifest and re-project its facts
+/// (contributions, capabilities) into the app, without moving the install's
+/// version pin or touching its deploy status.
+///
+/// This is the repair for a manifest that changed after install: today the
+/// platform projects a module's contribution payload into its host only at
+/// install time, so a dev-mounted module that gains or changes a
+/// contribution keeps serving the old payload to its host through a hot
+/// rebuild and even a full tunnel restart. `app_ref` is an app id or slug
+/// (the platform resolves either); `module_id` is the raw platform UUID.
+pub fn resync_app_module(
+    http: &Client,
+    apps_base: &str,
+    access_token: &str,
+    app_ref: &str,
+    module_id: &str,
+) -> Result<(), ApiError> {
+    let endpoint = format!(
+        "{}/v1/apps/{}/modules/{}/resync",
+        apps_base.trim_end_matches('/'),
+        app_ref,
+        module_id
+    );
+
+    let resp = http
+        .post(&endpoint)
+        .bearer_auth(access_token)
+        .header("Accept", "application/json")
+        .send()?;
+
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(ApiError::Unauthenticated);
+    }
+    Err(envelope_error(resp))
+}
+
 /// One file of an app deploy's manifest, as POSTed to the platform.
 #[derive(Debug, Serialize)]
 pub struct DeployFile<'a> {
@@ -4541,6 +4582,79 @@ mod tests {
                     allow_downgrade: false,
                 },
             ),
+            Err(ApiError::Unauthenticated)
+        ));
+    }
+
+    #[test]
+    fn resync_app_module_is_bodyless_and_succeeds_on_2xx() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/app-1/modules/mod-uuid/resync")
+            .match_header("authorization", "Bearer AT")
+            .match_body("")
+            .with_status(200)
+            .create();
+
+        resync_app_module(&test_client(), &server.url(), "AT", "app-1", "mod-uuid").expect("ok");
+    }
+
+    #[test]
+    fn resync_app_module_surfaces_structured_server_error() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/app-1/modules/mod-uuid/resync")
+            .with_status(404)
+            .with_body(
+                r#"{"error":{"code":"not_found","message":"module is not installed in this app"}}"#,
+            )
+            .create();
+
+        let err = resync_app_module(&test_client(), &server.url(), "AT", "app-1", "mod-uuid")
+            .unwrap_err();
+        match err {
+            ApiError::Server { status, code, .. } => {
+                assert_eq!(status, 404);
+                assert_eq!(code, "not_found");
+            }
+            other => panic!("expected Server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resync_app_module_surfaces_untyped_5xx_as_unexpected() {
+        // api-platform#743: the endpoint currently 500s for every module with
+        // no structured body. The CLI must still report it loudly rather than
+        // panicking on a JSON decode or swallowing the failure.
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/app-1/modules/mod-uuid/resync")
+            .with_status(500)
+            .with_body("internal server error")
+            .create();
+
+        let err = resync_app_module(&test_client(), &server.url(), "AT", "app-1", "mod-uuid")
+            .unwrap_err();
+        match err {
+            ApiError::Unexpected { status, body } => {
+                assert_eq!(status, 500);
+                assert!(body.contains("internal server error"));
+            }
+            other => panic!("expected Unexpected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resync_app_module_401_is_unauthenticated() {
+        let mut server = Server::new();
+        let _m = server
+            .mock("POST", "/v1/apps/app-1/modules/mod-uuid/resync")
+            .with_status(401)
+            .with_body(r#"{"error":{"code":"token_expired","message":"expired"}}"#)
+            .create();
+
+        assert!(matches!(
+            resync_app_module(&test_client(), &server.url(), "bad", "app-1", "mod-uuid"),
             Err(ApiError::Unauthenticated)
         ));
     }
