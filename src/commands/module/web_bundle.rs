@@ -93,7 +93,7 @@ pub(crate) fn ship(
     // The presigned URL carries its own auth, so this PUT goes out on a
     // client with no bearer token and an upload-sized timeout.
     let upload_client = http::client(UPLOAD_TIMEOUT)?;
-    put(&upload_client, &upload.url, &bytes)?;
+    put(&upload_client, &upload.url, bytes)?;
 
     match api::finalize_module_web_bundle(
         api_client,
@@ -164,7 +164,6 @@ fn api_error(error: ApiError) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     fn server(status: u16, code: &str) -> ApiError {
         ApiError::Server {
