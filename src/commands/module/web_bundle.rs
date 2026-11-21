@@ -10,18 +10,13 @@
 //! someone else's device reach a LOCAL module while the tunnel is up; its
 //! objects are dev-scoped and reaped. A deploy ships its own bytes.
 
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use reqwest::blocking::Client;
 
 use crate::api::{self, ApiError};
 use crate::http;
-
-/// Conventional build output every module's web project writes, and the same
-/// relative path `mirrorstack dev` watches and `--share` uploads.
-pub(crate) const WEB_BUNDLE_REL: &str = "web/dist/index.js";
 
 /// Matches `maxModuleBundleBytes` in api-platform's module_bundle.go. Checked
 /// here so an oversize bundle fails before a credential is minted rather than
@@ -53,43 +48,21 @@ pub(crate) enum WebBundleOutcome {
     AlreadyRecorded,
 }
 
-/// Where the module's built bundle lives.
-///
-/// 🔴 THE TWO ABSENCES ARE NOT THE SAME. A module with no `web/` directory
-/// ships no UI and must deploy cleanly — returning an error there would break
-/// every headless module. A module that HAS a web project but no built bundle
-/// is a different thing entirely: its UI silently would not ship, which is the
-/// failure this whole path exists to prevent, so that one is fatal and names
-/// the file.
-pub(crate) fn locate(dir: &Path) -> Result<Option<PathBuf>> {
-    let path = dir.join(WEB_BUNDLE_REL);
-    if path.is_file() {
-        return Ok(Some(path));
-    }
-    if !dir.join("web").is_dir() {
-        return Ok(None);
-    }
-    Err(anyhow!(
-        "no web bundle at {} — the module has a web project but nothing built it. Its UI ships from this file, and a version records the bundle it was cut with, so deploying now would publish a module that cannot render.",
-        path.display()
-    ))
-}
-
-/// Upload the built bundle for `version_ref` and promote it.
+/// Upload the bundle the release candidate built from its frozen snapshot for
+/// `version_ref` and promote it. The bytes come from the candidate, never from
+/// the live checkout's `web/dist`, so a CI run with no tunnel and no prebuilt
+/// dist ships exactly the UI the receipt was cut with.
 pub(crate) fn ship(
     api_client: &Client,
     apps_base: &str,
     access_token: &str,
     module_id: &str,
     version_ref: &str,
-    bundle_path: &Path,
+    bytes: &[u8],
 ) -> Result<WebBundleOutcome> {
-    let bytes =
-        std::fs::read(bundle_path).with_context(|| format!("read {}", bundle_path.display()))?;
     if bytes.is_empty() {
         return Err(anyhow!(
-            "web bundle at {} is empty — the platform refuses a zero-byte bundle",
-            bundle_path.display()
+            "web bundle is empty — the platform refuses a zero-byte bundle"
         ));
     }
     if bytes.len() as u64 > MAX_WEB_BUNDLE_BYTES {
@@ -199,51 +172,6 @@ mod tests {
             code: code.to_string(),
             message: "x".to_string(),
         }
-    }
-
-    // 🔴 THE THREE STATES MUST NOT COLLAPSE INTO TWO. A headless module and a
-    // module whose bundle was never built both "have no bundle", but treating
-    // them alike either breaks every headless deploy or silently publishes a
-    // UI module that cannot render.
-    #[test]
-    fn locate_separates_headless_from_unbuilt_from_built() {
-        // Headless: no web/ at all — deploys cleanly, ships nothing.
-        let headless = tempfile::tempdir().unwrap();
-        assert_eq!(locate(headless.path()).unwrap(), None);
-
-        // Has a web project, nothing built: fatal, and the error names the
-        // file, because "build your web project" is not actionable on its own
-        // in a 14-module workspace.
-        let unbuilt = tempfile::tempdir().unwrap();
-        fs::create_dir_all(unbuilt.path().join("web/src")).unwrap();
-        let err = locate(unbuilt.path()).unwrap_err().to_string();
-        assert!(
-            err.contains(WEB_BUNDLE_REL),
-            "error did not name the path: {err}"
-        );
-
-        // Built: the control. Without it, a `locate` that always failed would
-        // satisfy the assertion above.
-        let built = tempfile::tempdir().unwrap();
-        fs::create_dir_all(built.path().join("web/dist")).unwrap();
-        fs::write(
-            built.path().join(WEB_BUNDLE_REL),
-            b"export function mount(){}",
-        )
-        .unwrap();
-        assert_eq!(
-            locate(built.path()).unwrap(),
-            Some(built.path().join(WEB_BUNDLE_REL))
-        );
-    }
-
-    #[test]
-    fn a_directory_is_not_a_bundle() {
-        let tmp = tempfile::tempdir().unwrap();
-        // is_file() is the check, not exists(): a directory at the bundle path
-        // would otherwise read as a built bundle and fail later, on the PUT.
-        fs::create_dir_all(tmp.path().join(WEB_BUNDLE_REL)).unwrap();
-        assert!(locate(tmp.path()).is_err());
     }
 
     #[test]
