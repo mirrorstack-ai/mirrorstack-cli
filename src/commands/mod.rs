@@ -124,6 +124,15 @@ enum Command {
 }
 
 impl Cli {
+    /// Whether this invocation is `dev`, which runs an interactive local
+    /// supervisor rather than a one-shot command. The once-a-day update
+    /// notice only ever fires after a command finishes, and `dev` doesn't
+    /// meaningfully "finish" until the developer stops it — so it is
+    /// excluded rather than deferred.
+    pub fn is_dev(&self) -> bool {
+        matches!(self.command, Command::Dev(_))
+    }
+
     pub fn run(self) -> Result<()> {
         match self.command {
             Command::Login(args) => login::run(args),
