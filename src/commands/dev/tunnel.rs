@@ -39,7 +39,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use url::Url;
 use uuid_lite::uuid_v4_string;
 
-use super::super::warn_prefix;
+use super::super::{ok_mark, warn_prefix};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<WsStream, Message>;
@@ -652,6 +652,10 @@ async fn tunnel_loop(
     let mut pong_seen = false;
     let mut inbound_since_ping = false;
     let mut silent_beats: u32 = 0;
+    // The manifest hash this tunnel last beat with, so a change can be told to
+    // the developer (api-platform#107: the platform re-projects contributions
+    // on a hash change, and a developer should not have to know that).
+    let mut last_hash: Option<String> = None;
     // Relay replies (`rpc.resp`/`rpc.err`) funnel back through this channel
     // rather than being sent directly from the spawned relay task: a
     // `SplitSink` can't be shared/sent across concurrent tasks, and `sink`
@@ -698,6 +702,9 @@ async fn tunnel_loop(
                     ctx.internal_secret.as_deref(),
                 )
                 .await;
+                if let Some(line) = manifest_change_notice(&mut last_hash, hash.as_deref()) {
+                    println!("{} {line}", ok_mark());
+                }
                 let ping = Frame::new(FrameType::Ping, ping_payload(hash.as_deref()));
                 if let Ok(body) = serde_json::to_string(&ping)
                     && let Err(e) = sink.send(Message::Text(body)).await
@@ -780,6 +787,34 @@ async fn tunnel_loop(
                     Some(Ok(Message::Frame(_))) => {}
                 }
             }
+        }
+    }
+}
+
+/// What to tell the developer when the module's manifest hash moved between
+/// two heartbeats, or `None` when there is nothing to say.
+///
+/// The FIRST successful read only seeds `last` (the register frame already
+/// carried it), and a failed read (`None`) never clears it — a flapping local
+/// endpoint must not turn the next good read into a phantom "change". On a real
+/// change the platform's dispatch records it and the applications service
+/// re-projects the module's contributions into every app mounted on this tunnel
+/// on its next pass, so the line says how long that takes.
+fn manifest_change_notice(last: &mut Option<String>, now: Option<&str>) -> Option<String> {
+    let now = now.filter(|h| !h.is_empty())?;
+    match last.as_deref() {
+        Some(prev) if prev == now => None,
+        Some(_) => {
+            *last = Some(now.to_string());
+            Some(
+                "manifest changed — the platform is re-projecting this module's contributions \
+                 into the apps mounted on this tunnel (live within about a minute)"
+                    .to_string(),
+            )
+        }
+        None => {
+            *last = Some(now.to_string());
+            None
         }
     }
 }
@@ -1282,6 +1317,29 @@ mod tests {
     fn ping_payload_wraps_hash_when_present() {
         let p = ping_payload(Some("sha256:abc")).unwrap();
         assert_eq!(p, serde_json::json!({ "manifest_hash": "sha256:abc" }));
+    }
+
+    #[test]
+    fn manifest_notice_stays_quiet_until_the_hash_really_moves() {
+        let mut last = None;
+        // First read seeds; unchanged, absent and empty reads say nothing.
+        assert!(manifest_change_notice(&mut last, Some("sha256:a")).is_none());
+        assert!(manifest_change_notice(&mut last, Some("sha256:a")).is_none());
+        assert!(manifest_change_notice(&mut last, None).is_none());
+        assert!(manifest_change_notice(&mut last, Some("")).is_none());
+        assert_eq!(
+            last.as_deref(),
+            Some("sha256:a"),
+            "a failed read must not clear the baseline"
+        );
+        // A real change speaks once, then is the new baseline.
+        let line =
+            manifest_change_notice(&mut last, Some("sha256:b")).expect("changed hash must notify");
+        assert!(line.contains("re-projecting"), "{line}");
+        assert!(manifest_change_notice(&mut last, Some("sha256:b")).is_none());
+        // A flap (read fails, then the SAME hash returns) is not a change.
+        assert!(manifest_change_notice(&mut last, None).is_none());
+        assert!(manifest_change_notice(&mut last, Some("sha256:b")).is_none());
     }
 
     #[test]
