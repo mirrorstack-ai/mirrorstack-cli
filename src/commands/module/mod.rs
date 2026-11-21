@@ -44,6 +44,9 @@ use super::{
 };
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack module init\n  mirrorstack module capabilities --json"
+)]
 pub struct ModuleArgs {
     #[command(subcommand)]
     command: ModuleCommand,
@@ -104,6 +107,9 @@ enum ModuleCommand {
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack module init\n  mirrorstack module init --name Media --slug media --yes"
+)]
 pub struct InitArgs {
     /// Module name (human-readable). When omitted, prompts interactively.
     #[arg(long)]
@@ -141,6 +147,9 @@ pub struct InitArgs {
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack module register\n  mirrorstack module register --dir ./workspace --yes"
+)]
 pub struct RegisterArgs {
     /// Working directory containing go.work. Defaults to cwd.
     #[arg(long)]
@@ -156,6 +165,9 @@ pub struct RegisterArgs {
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack module deploy\n  mirrorstack module deploy --module media --status active"
+)]
 pub struct DeployArgs {
     /// Module slug. Defaults to Config.Slug parsed from ./main.go.
     #[arg(long)]

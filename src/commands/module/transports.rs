@@ -37,6 +37,9 @@ use crate::commands::{
 use crate::{credentials, http};
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack module transports --app my-app\n  mirrorstack module transports --app my-app --json"
+)]
 pub struct TransportsArgs {
     /// The app whose installed modules to report, as its UUID or slug.
     #[arg(long)]

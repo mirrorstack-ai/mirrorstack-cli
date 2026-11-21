@@ -1,0 +1,24 @@
+# __MS_NAME__
+
+This is a MirrorStack module (slug `__MS_SLUG__`), scaffolded by
+`mirrorstack module init`. It is a standalone Go service declared via the
+`app-module-sdk` and installed into apps on the MirrorStack platform.
+
+## Local commands
+
+- `mirrorstack dev` — run this module (and any siblings in the same
+  workspace) locally with supporting services.
+- `mirrorstack preview` — serve this module's review harness on localhost,
+  if `web/package.json` declares a `preview` script.
+- `go test ./...` — run the module's Go tests.
+
+## Shipping a change
+
+This file does not cover deploying. When you're ready, run
+`mirrorstack module deploy` yourself.
+
+## More context
+
+For the conventions this module follows (declare/ vs internal/handlers/,
+capability contributions, versioning), see the `mirrorstack-module` skill in
+`mirrorstack-ai/mirrorstack-skills` at `skills/mirrorstack-module/SKILL.md`.
