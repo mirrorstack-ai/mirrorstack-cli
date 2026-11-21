@@ -121,9 +121,16 @@ pub(crate) struct ReleaseCandidate {
     artifact_path: PathBuf,
     _receipt_path: PathBuf,
     bootstrap_sha256: String,
+    /// The web bundle built from the frozen snapshot (None: no web surface).
+    web_bundle: Option<Vec<u8>>,
 }
 
 impl ReleaseCandidate {
+    /// The bundle the one-shot build produced, for `module deploy` to upload.
+    pub(crate) fn web_bundle(&self) -> Option<&[u8]> {
+        self.web_bundle.as_deref()
+    }
+
     /// The receipt `module deploy` sends to the platform (no `bootstrap_sha256`).
     pub(crate) fn receipt(&self) -> &ReleaseCandidateReceipt {
         &self.receipt
@@ -222,7 +229,7 @@ fn build_with(
         .context("release candidate: SDK manifest probe changed its frozen phase inputs")?;
 
     let web_view = source.fresh_web_view()?;
-    let web = build_web(runner, &web_view, &request, &manifest)?;
+    let built_web = build_web(runner, &web_view, &request, &manifest)?;
     web_view
         .verify_inputs()
         .context("release candidate: web build changed its frozen canonical inputs")?;
@@ -239,6 +246,10 @@ fn build_with(
         "release candidate: live source changed during manifest/web/artifact preparation",
     )?;
 
+    let (web_bundle, web) = match built_web {
+        Some(BuiltWeb { bytes, evidence }) => (Some(bytes), evidence),
+        None => (None, None),
+    };
     let receipt = ReleaseCandidateReceipt {
         protocol: CANDIDATE_PROTOCOL.to_string(),
         module_id: request.module_id.to_string(),
@@ -257,6 +268,7 @@ fn build_with(
         artifact_path,
         _receipt_path: receipt_path,
         bootstrap_sha256,
+        web_bundle,
     })
 }
 
@@ -566,12 +578,22 @@ fn parse_manifest_output(
     ))
 }
 
+/// The bundle the one-shot build produced from the frozen snapshot, plus the
+/// tunnel evidence when (and only when) a conforming `--share` session
+/// confirmed the same bytes. `module deploy` uploads `bytes` — never whatever
+/// the live checkout holds in `web/dist` — so a headless CI run with no
+/// tunnel and no prebuilt `dist` still ships the UI it was cut with.
+struct BuiltWeb {
+    bytes: Vec<u8>,
+    evidence: Option<WebEvidence>,
+}
+
 fn build_web(
     runner: &dyn ProcessRunner,
     view: &BuildView,
     request: &CandidateRequest<'_>,
     manifest: &serde_json::Value,
-) -> Result<Option<WebEvidence>> {
+) -> Result<Option<BuiltWeb>> {
     let module_dir = view.module_dir();
     let web_dir = module_dir.join("web");
     let Some(pipeline) = web_pipeline(&web_dir, false) else {
@@ -670,10 +692,16 @@ fn build_web(
     // gets uploaded — a release never ships whatever happened to be sitting in
     // web/dist.
     let Ok(session) = load_for_module(request.module_dir, request.slug) else {
-        return Ok(None);
+        return Ok(Some(BuiltWeb {
+            bytes,
+            evidence: None,
+        }));
     };
     if session.watch || !session.share || !module_ids_equal(&session.module_id, request.module_id) {
-        return Ok(None);
+        return Ok(Some(BuiltWeb {
+            bytes,
+            evidence: None,
+        }));
     }
     let Some(ConfirmedWeb {
         session_id,
@@ -681,7 +709,10 @@ fn build_web(
         size_bytes,
     }) = session.web
     else {
-        return Ok(None);
+        return Ok(Some(BuiltWeb {
+            bytes,
+            evidence: None,
+        }));
     };
     // A conforming session that confirmed DIFFERENT bytes than this build just
     // produced means the tunnel is serving something else. Shipping while that
@@ -693,10 +724,14 @@ fn build_web(
             bytes.len()
         ));
     }
-    Ok(Some(WebEvidence {
+    let evidence = WebEvidence {
         session_id,
         sha256,
         size_bytes: bytes.len() as u64,
+    };
+    Ok(Some(BuiltWeb {
+        bytes,
+        evidence: Some(evidence),
     }))
 }
 
@@ -1975,6 +2010,28 @@ mod tests {
         let _session = session(root.path(), &module, false);
         let candidate = build_with(&FakeRunner::default(), request(&module)).unwrap();
         assert!(candidate.receipt.web.is_some());
+    }
+
+    // 🔴 HEADLESS CI: no tunnel, no session file, no prebuilt web/dist. The
+    // candidate must still carry the bundle it built from the frozen snapshot
+    // (that is what `module deploy` uploads), and declare no web evidence.
+    #[test]
+    fn headless_release_with_no_session_carries_the_built_bundle_without_evidence() {
+        let (_root, module) = fixture(true, false);
+        assert!(!module.join("web/dist").exists());
+        let candidate = build_with(&FakeRunner::default(), request(&module))
+            .expect("a release needs no tunnel session");
+        assert!(candidate.receipt.web.is_none());
+        assert_eq!(candidate.web_bundle(), Some(WEB_BYTES));
+        // Building from the snapshot never wrote into the live checkout.
+        assert!(!module.join("web/dist").exists());
+    }
+
+    #[test]
+    fn module_without_a_web_surface_carries_no_bundle() {
+        let (_root, module) = fixture(false, false);
+        let candidate = build_with(&FakeRunner::default(), request(&module)).unwrap();
+        assert!(candidate.web_bundle().is_none());
     }
 
     #[test]

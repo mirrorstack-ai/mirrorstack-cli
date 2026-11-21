@@ -36,6 +36,8 @@ trait CandidateEvidence {
     fn receipt(&self) -> &ReleaseCandidateReceipt;
     fn verify_live_source(&self) -> Result<()>;
     fn verify_artifact(&self) -> Result<()>;
+    /// Bytes of the web bundle built from the frozen snapshot, if any.
+    fn web_bundle(&self) -> Option<&[u8]>;
 }
 
 impl CandidateEvidence for ReleaseCandidate {
@@ -49,6 +51,10 @@ impl CandidateEvidence for ReleaseCandidate {
 
     fn verify_artifact(&self) -> Result<()> {
         ReleaseCandidate::verify_artifact(self)
+    }
+
+    fn web_bundle(&self) -> Option<&[u8]> {
+        ReleaseCandidate::web_bundle(self)
     }
 }
 
@@ -528,7 +534,7 @@ impl ApiReleaseOperations<'_> {
     }
 
     fn upload_web_bundle(&mut self) -> Result<()> {
-        let Some(bundle_path) = web_bundle::locate(self.module_dir)? else {
+        let Some(bundle) = self.candidate.web_bundle() else {
             // No web surface at all — nothing to ship, and that is normal.
             return Ok(());
         };
@@ -538,7 +544,7 @@ impl ApiReleaseOperations<'_> {
             self.access_token,
             &self.module.id,
             self.version,
-            &bundle_path,
+            bundle,
         )? {
             web_bundle::WebBundleOutcome::Shipped {
                 url,
@@ -1465,6 +1471,10 @@ mod release_preparation_tests {
 
         fn verify_artifact(&self) -> Result<()> {
             Ok(())
+        }
+
+        fn web_bundle(&self) -> Option<&[u8]> {
+            None
         }
     }
 
