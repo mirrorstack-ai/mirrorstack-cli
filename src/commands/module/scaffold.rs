@@ -20,6 +20,8 @@ const MAIN_GO: &str = include_str!("../../../templates/module/main.go.tmpl");
 const DECLARE_GO: &str = include_str!("../../../templates/module/declare/register.go.tmpl");
 const MCP_GO: &str = include_str!("../../../templates/module/internal/handlers/mcp.go.tmpl");
 const ROUTES_GO: &str = include_str!("../../../templates/module/internal/handlers/routes.go.tmpl");
+const DECLARE_TEST_GO: &str =
+    include_str!("../../../templates/module/declare/declare_test.go.tmpl");
 const I18N_EN: &str = include_str!("../../../templates/module/i18n/en-US.json.tmpl");
 const I18N_ZH: &str = include_str!("../../../templates/module/i18n/zh-TW.json.tmpl");
 const GO_MOD: &str = include_str!("../../../templates/module/go.mod.tmpl");
@@ -116,6 +118,7 @@ pub(super) fn write_tree(target: &Path, inputs: &Inputs<'_>) -> Result<()> {
 
     write_file(target, "main.go", MAIN_GO, inputs)?;
     write_file(target, "declare/register.go", DECLARE_GO, inputs)?;
+    write_file(target, "declare/declare_test.go", DECLARE_TEST_GO, inputs)?;
     write_file(target, "internal/handlers/routes.go", ROUTES_GO, inputs)?;
     write_file(target, "internal/handlers/mcp.go", MCP_GO, inputs)?;
     write_file(target, "i18n/en-US.json", I18N_EN, inputs)?;
@@ -409,6 +412,7 @@ mod tests {
         for rel in [
             "main.go",
             "declare/register.go",
+            "declare/declare_test.go",
             "internal/handlers/routes.go",
             "internal/handlers/mcp.go",
             "i18n/en-US.json",

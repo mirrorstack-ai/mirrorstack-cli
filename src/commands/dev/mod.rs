@@ -100,10 +100,27 @@ const PASSTHROUGH_ENV: [&str; 16] = [
     "MS_PLATFORM_ASSERTION_PUBLIC_KEY",
 ];
 
+#[derive(clap::Subcommand)]
+pub enum DevCommand {
+    /// Stop the dev stack (`docker compose down`). Data volumes are kept
+    /// unless --volumes is given.
+    Down(DownArgs),
+}
+
+#[derive(Args)]
+pub struct DownArgs {
+    /// Also remove named volumes: wipes the dev Postgres data, so the next
+    /// `mirrorstack dev` boots a fresh database.
+    #[arg(long, short = 'v')]
+    volumes: bool,
+}
+
 #[derive(Args)]
 pub struct DevArgs {
+    #[command(subcommand)]
+    command: Option<DevCommand>,
     /// Working directory containing go.work.
-    #[arg(long)]
+    #[arg(long, global = true)]
     dir: Option<PathBuf>,
     /// Open WSS tunnels so deployed callers can reach local modules. Declared
     /// module clients are built and published automatically; --shared is not
@@ -113,6 +130,12 @@ pub struct DevArgs {
     /// Base URL for tunnel routing. Default: http://localhost.
     #[arg(long)]
     local_url: Option<String>,
+    /// Pick a free host port for the runner instead of failing when 9080 is
+    /// taken, and register the tunnel's local_url with that port. The chosen
+    /// port reaches compose as `MS_DEV_PORT` (publish it as
+    /// `"${MS_DEV_PORT:-9080}:8080"`). Cannot be combined with --local-url.
+    #[arg(long, conflicts_with = "local_url")]
+    auto_port: bool,
     /// Run all registered modules directly (used inside Docker runner).
     #[arg(long)]
     all: bool,
@@ -330,6 +353,10 @@ pub fn run(args: DevArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| std::env::current_dir().expect("cwd"));
 
+    if let Some(DevCommand::Down(down)) = &args.command {
+        return run_down(&cwd, down.volumes);
+    }
+
     if !cwd.join("go.work").exists() {
         return Err(anyhow!(
             "{} has no go.work. Run from a module workspace or pass --dir.",
@@ -451,11 +478,29 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         );
     }
 
+    for dir in modules_missing_from_go_work(root, &all_modules) {
+        eprintln!(
+            "{} {dir} has a go.mod but is not in go.work — add ./{dir} to run it",
+            warn_prefix()
+        );
+    }
+
     if ready.is_empty() {
         return Err(anyhow!(
             "no registered modules to run. Run `mirrorstack app module register` first."
         ));
     }
+
+    // --auto-port: resolve the host port once, before anything registers a
+    // local_url, so the tunnel and compose agree on it.
+    let auto_port = if args.auto_port {
+        let port = pick_free_port(DEFAULT_MODULE_PORT)?;
+        eprintln!("{} --auto-port: runner on host port {port}", ok_mark());
+        Some(port)
+    } else {
+        None
+    };
+    let auto_local_url = auto_port.map(|p| format!("{DEFAULT_LOCAL_URL}:{p}"));
 
     if shared_needs_tunnel_warning(shared, args.tunnel) {
         eprintln!(
@@ -533,7 +578,7 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
         let opened = open_tunnels(
             root,
             &ready,
-            args.local_url.as_deref(),
+            args.local_url.as_deref().or(auto_local_url.as_deref()),
             &internal_secrets,
             shared,
         )?;
@@ -682,6 +727,9 @@ fn run_outer(root: &Path, args: &DevArgs) -> Result<()> {
     // reads each module's `.secret/ms-internal-secret-<slug>` file.
     if args.skip_capability_check {
         compose.env("MS_SKIP_CAPABILITY_CHECK", "1");
+    }
+    if let Some(port) = auto_port {
+        compose.env("MS_DEV_PORT", port.to_string());
     }
 
     let mut compose_child = compose.spawn().map_err(|e| match e.kind() {
@@ -1374,10 +1422,129 @@ fn supervise_module(spec: ModuleSpec) {
     }
 }
 
-/// Kill a child process and reap it (kill alone would leave a zombie).
+/// How long a child gets after SIGTERM before it is SIGKILLed.
+const TERMINATE_GRACE: Duration = Duration::from_secs(5);
+
+/// Stop a child process and reap it: SIGTERM first so a module's
+/// `signal.Notify` shutdown hooks run and in-flight DB writes finish, then
+/// SIGKILL if it is still alive after [`TERMINATE_GRACE`]. Windows has no
+/// SIGTERM, so it kills straight away.
 fn kill_wait(c: &mut Child) {
+    terminate_wait(c, TERMINATE_GRACE);
+}
+
+fn terminate_wait(c: &mut Child, grace: Duration) {
+    #[cfg(unix)]
+    {
+        // SAFETY: plain kill(2) on a pid this process spawned and has not yet
+        // reaped, so it cannot have been recycled.
+        let sent = unsafe { libc::kill(c.id() as libc::pid_t, libc::SIGTERM) } == 0;
+        if sent {
+            let deadline = Instant::now() + grace;
+            while Instant::now() < deadline {
+                match c.try_wait() {
+                    Ok(Some(_)) => return,
+                    Ok(None) => thread::sleep(Duration::from_millis(50)),
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = grace;
     let _ = c.kill();
     let _ = c.wait();
+}
+
+/// `mirrorstack dev down [--volumes]`: the explicit teardown. Ctrl-C already
+/// runs the data-preserving form; --volumes is the clean-slate form.
+fn run_down(root: &Path, volumes: bool) -> Result<()> {
+    if find_compose_file(root).is_none() {
+        eprintln!(
+            "{} no docker-compose.yml in {} — nothing to stop (run from the module workspace or pass --dir)",
+            warn_prefix(),
+            root.display()
+        );
+        return Ok(());
+    }
+    let status = Command::new("docker")
+        .args(compose_down_args(volumes))
+        .current_dir(root)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => {
+                anyhow!(
+                    "`docker` not found on PATH. Install Docker Desktop before running dev down."
+                )
+            }
+            _ => anyhow!("dev down: run docker compose down: {e}"),
+        })?;
+    if !status.success() {
+        return Err(anyhow!("docker compose down exited with {status}"));
+    }
+    eprintln!(
+        "{} dev stack stopped{}",
+        ok_mark(),
+        if volumes { " and volumes removed" } else { "" }
+    );
+    Ok(())
+}
+
+fn compose_down_args(volumes: bool) -> Vec<&'static str> {
+    let mut args = vec!["compose", "down", "--remove-orphans"];
+    if volumes {
+        args.push("--volumes");
+    }
+    args
+}
+
+fn find_compose_file(root: &Path) -> Option<PathBuf> {
+    [
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+    ]
+    .iter()
+    .map(|name| root.join(name))
+    .find(|p| p.is_file())
+}
+
+/// First free TCP port at or above `preferred`'s own slot: `preferred` itself
+/// when it is free (so the common case stays 9080), otherwise an OS-assigned
+/// ephemeral one. Binds the wildcard address because that is what Docker
+/// publishes on.
+fn pick_free_port(preferred: u16) -> Result<u16> {
+    use std::net::TcpListener;
+    if TcpListener::bind(("0.0.0.0", preferred)).is_ok() {
+        return Ok(preferred);
+    }
+    let listener = TcpListener::bind(("0.0.0.0", 0)).context("dev: find a free port")?;
+    Ok(listener.local_addr().context("dev: read free port")?.port())
+}
+
+/// Directories next to `go.work` that hold a `go.mod` but are not `use`d by
+/// it. Drift here is silent otherwise: a module merged without its go.work
+/// entry just never appears in the list (video-core, users-roles).
+fn modules_missing_from_go_work(root: &Path, used: &[workspace::WorkspaceModule]) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut missing: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().join("go.mod").is_file())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.') && name != "node_modules")
+        .filter(|name| {
+            !used
+                .iter()
+                .any(|m| m.dir == Path::new(name) || m.abs_dir == root.join(name))
+        })
+        .collect();
+    missing.sort();
+    missing
 }
 
 /// Stop the compose project through Docker so the `compose up` frontend can
@@ -2416,8 +2583,104 @@ var _ = mirrorstack.Config{
         assert!(!capability_check_skipped(false, Some("FALSE")));
     }
 
+    #[test]
+    fn compose_down_args_keep_volumes_unless_asked() {
+        assert_eq!(
+            compose_down_args(false),
+            ["compose", "down", "--remove-orphans"]
+        );
+        assert_eq!(
+            compose_down_args(true),
+            ["compose", "down", "--remove-orphans", "--volumes"]
+        );
+    }
+
+    #[test]
+    fn down_without_a_compose_file_is_a_hint_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(find_compose_file(tmp.path()).is_none());
+        assert!(run_down(tmp.path(), true).is_ok());
+        std::fs::write(tmp.path().join("compose.yaml"), "services: {}\n").unwrap();
+        assert!(find_compose_file(tmp.path()).is_some());
+    }
+
+    #[test]
+    fn dev_down_parses_volumes_flag() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(flatten)]
+            dev: DevArgs,
+        }
+        let cli = Cli::try_parse_from(["x", "down", "--volumes"]).unwrap();
+        assert!(matches!(
+            cli.dev.command,
+            Some(DevCommand::Down(DownArgs { volumes: true }))
+        ));
+        let cli = Cli::try_parse_from(["x", "--dir", "/tmp", "down"]).unwrap();
+        assert!(matches!(
+            cli.dev.command,
+            Some(DevCommand::Down(DownArgs { volumes: false }))
+        ));
+        assert!(Cli::try_parse_from(["x", "--auto-port", "--local-url", "http://a"]).is_err());
+    }
+
+    #[test]
+    fn pick_free_port_skips_a_taken_port() {
+        let held = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let taken = held.local_addr().unwrap().port();
+        let picked = pick_free_port(taken).unwrap();
+        assert_ne!(picked, taken);
+        assert_ne!(picked, 0);
+    }
+
+    #[test]
+    fn modules_missing_from_go_work_names_unused_go_mod_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        for d in ["a", "video-core", "node_modules", ".hidden", "docs"] {
+            std::fs::create_dir(tmp.path().join(d)).unwrap();
+        }
+        for d in ["a", "video-core", "node_modules", ".hidden"] {
+            std::fs::write(tmp.path().join(d).join("go.mod"), "module x\n").unwrap();
+        }
+        let used = vec![workspace::WorkspaceModule {
+            dir: PathBuf::from("a"),
+            abs_dir: tmp.path().join("a"),
+        }];
+        assert_eq!(
+            modules_missing_from_go_work(tmp.path(), &used),
+            ["video-core"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_wait_lets_sigterm_handlers_run_then_escalates() {
+        // Handles TERM and exits 0 → must not be SIGKILLed.
+        let mut graceful = Command::new("sh")
+            .args(["-c", "trap 'exit 0' TERM; while :; do sleep 0.05; done"])
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        terminate_wait(&mut graceful, Duration::from_secs(5));
+        assert_eq!(graceful.try_wait().unwrap().unwrap().code(), Some(0));
+
+        // Ignores TERM → escalates to SIGKILL after the grace.
+        let mut stubborn = Command::new("sh")
+            .args(["-c", "trap '' TERM; while :; do sleep 0.05; done"])
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let start = Instant::now();
+        terminate_wait(&mut stubborn, Duration::from_millis(400));
+        assert!(start.elapsed() >= Duration::from_millis(400));
+        assert!(stubborn.try_wait().unwrap().is_some());
+    }
+
     fn test_dev_args() -> DevArgs {
         DevArgs {
+            command: None,
+            auto_port: false,
             dir: None,
             tunnel: false,
             local_url: None,
