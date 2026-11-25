@@ -1,0 +1,16 @@
+package declare
+
+import "testing"
+
+// Test stub: `go test ./...` has something to run from the first scaffold, and
+// this is the place to start. Pure-data declarations (permissions, settings,
+// nav) are cheap to pin here; per-request behaviour belongs in
+// internal/handlers next to the route it exercises.
+
+func TestPermissionNamesAreStable(t *testing.T) {
+	// Permission names are stored in installs' role grants. Renaming one is a
+	// breaking change, so a rename must show up as a deliberate test edit.
+	if PermRead != "read" {
+		t.Fatalf("PermRead = %q, want %q", PermRead, "read")
+	}
+}
