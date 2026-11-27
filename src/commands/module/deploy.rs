@@ -153,6 +153,12 @@ pub(super) fn run(args: DeployArgs) -> Result<()> {
         return Ok(());
     }
 
+    // 🔴 Local preconditions BEFORE any remote state is touched: the first API
+    // write records an immutable version, so an unbuilt client discovered after
+    // it (the old order) burned the version. The web bundle is frozen into the
+    // candidate below, which is also built before the first write.
+    version_client::preflight(&dir)?;
+
     let creds = credentials::load_or_login_hint()?;
     let apps_base = resolve_base(ENV_APPS_API_URL, DEFAULT_APPS_API_BASE);
     let client = http::client(Duration::from_secs(15))?;

@@ -58,6 +58,22 @@ pub(crate) fn locate(dir: &Path) -> Result<Option<PathBuf>> {
     ))
 }
 
+/// Every LOCAL precondition of the client leg, run before the first API write.
+///
+/// 🔴 A deploy records an immutable version and uploads the artifact BEFORE it
+/// reaches `ship`, so a client that is missing, empty or unpackable discovered
+/// there burns the version permanently (video-core 1.0.9, 09-17). Locating and
+/// packaging the client here makes that failure happen while nothing has been
+/// recorded. `ship` packages again; the packer is deterministic, so this proves
+/// the same bytes it will upload.
+pub(crate) fn preflight(dir: &Path) -> Result<()> {
+    if let Some(output_dir) = locate(dir)? {
+        package_client(&output_dir)
+            .with_context(|| format!("package client at {}", output_dir.display()))?;
+    }
+    Ok(())
+}
+
 /// Package the built client and ship it for `version_ref`.
 pub(crate) fn ship(
     api_client: &Client,
@@ -147,4 +163,42 @@ fn storage_unconfigured(error: &ApiError) -> bool {
 /// A platform that predates these routes answers 404 for the route itself.
 fn endpoints_missing(error: &ApiError) -> bool {
     matches!(error, ApiError::Unexpected { status: 404, .. })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn preflight_passes_when_the_module_has_no_client() {
+        let tmp = tempfile::tempdir().unwrap();
+        preflight(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn preflight_refuses_a_client_project_with_nothing_built() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("client/src")).unwrap();
+        let err = preflight(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("no built client"), "{err}");
+    }
+
+    #[test]
+    fn preflight_refuses_an_unpackable_client_dist() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("client/dist")).unwrap();
+        fs::write(tmp.path().join("client/dist/index.js"), "export {}").unwrap();
+        // index.d.ts missing: package_client refuses, and so must preflight.
+        assert!(preflight(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn preflight_accepts_a_complete_client_dist() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("client/dist")).unwrap();
+        fs::write(tmp.path().join("client/dist/index.js"), "export {}").unwrap();
+        fs::write(tmp.path().join("client/dist/index.d.ts"), "export {}").unwrap();
+        preflight(tmp.path()).unwrap();
+    }
 }
