@@ -112,7 +112,8 @@ enum Command {
     /// Manage developer modules and inspect their capability surface.
     Module(module::ModuleArgs),
     /// Run modules locally with supporting services. Scans go.work for
-    /// monorepo mode; falls back to single-module if only main.go exists.
+    /// monorepo mode; requires go.work today (single-module fallback is
+    /// tracked separately).
     Dev(dev::DevArgs),
     /// Serve a module's review harness on localhost — its real settings or
     /// nav surface in the console's own frame, answered from fixtures.
@@ -135,5 +136,103 @@ impl Cli {
             Command::Dev(args) => dev::run(args),
             Command::Preview(args) => dev::preview::run(args),
         }
+    }
+}
+
+/// Error and hint text name `` `mirrorstack <subcommand...>` `` strings as a
+/// guide back to the right invocation. Nothing checks those strings against
+/// the actual clap tree, so a renamed or removed subcommand leaves behind a
+/// hint pointing at a command that no longer exists.
+#[cfg(test)]
+mod command_reference_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).expect("read_dir") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Pull `mirrorstack <words>` paths out of backtick-quoted text, stopping
+    /// at the first flag, placeholder, or trailing punctuation so
+    /// `--from <old-slug>` or `deploy{yes}` don't get swallowed into the path.
+    fn command_paths_in(text: &str) -> Vec<Vec<String>> {
+        let mut found = Vec::new();
+        for (i, segment) in text.split('`').enumerate() {
+            if i % 2 == 0 {
+                continue; // outside a backtick span
+            }
+            let mut words = segment.split_whitespace();
+            if words.next() != Some("mirrorstack") {
+                continue;
+            }
+            let mut path = Vec::new();
+            for word in words {
+                let clean_len = word
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                    .unwrap_or(word.len());
+                let token = &word[..clean_len];
+                if token.is_empty() || token.starts_with('-') {
+                    break;
+                }
+                path.push(token.to_string());
+                if clean_len != word.len() {
+                    break;
+                }
+            }
+            found.push(path);
+        }
+        found
+    }
+
+    fn resolves(path: &[String]) -> bool {
+        let root = Cli::command();
+        let mut cmd = &root;
+        for part in path {
+            match cmd
+                .get_subcommands()
+                .find(|sc| sc.get_name() == part || sc.get_all_aliases().any(|a| a == part))
+            {
+                Some(next) => cmd = next,
+                None => return false,
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn every_hinted_mirrorstack_command_exists() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        collect_rs_files(&manifest_dir.join("src"), &mut files);
+
+        let mut broken = Vec::new();
+        for file in files {
+            let text = fs::read_to_string(&file).expect("read source file");
+            for path in command_paths_in(&text) {
+                if !resolves(&path) {
+                    broken.push(format!(
+                        "{}: `mirrorstack {}`",
+                        file.display(),
+                        path.join(" ")
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            broken.is_empty(),
+            "hint/error text names a command that does not exist in the clap tree:\n{}",
+            broken.join("\n")
+        );
     }
 }
