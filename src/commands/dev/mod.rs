@@ -116,6 +116,9 @@ pub struct DownArgs {
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack dev\n  mirrorstack dev --tunnel\n  mirrorstack dev --all --watch=false"
+)]
 pub struct DevArgs {
     #[command(subcommand)]
     command: Option<DevCommand>,

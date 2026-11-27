@@ -24,6 +24,9 @@ use crate::{credentials, http};
 use super::{sanitize_module_id, slug_valid};
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack module rename --to new-slug\n  mirrorstack module rename --from old-slug --to new-slug --yes"
+)]
 pub struct RenameArgs {
     /// New module slug.
     #[arg(long)]

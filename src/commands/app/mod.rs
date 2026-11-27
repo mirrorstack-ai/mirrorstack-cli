@@ -24,6 +24,9 @@ mod deploy_auth;
 mod ssr;
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack apps create --name Media --yes\n  mirrorstack apps web deploy --dir ./out"
+)]
 pub struct AppArgs {
     #[command(subcommand)]
     command: AppCommand,
@@ -44,6 +47,7 @@ enum AppCommand {
 }
 
 #[derive(Args)]
+#[command(after_help = "Examples:\n  mirrorstack apps client install --app my-app")]
 pub struct ClientArgs {
     #[command(subcommand)]
     command: ClientCommand,
@@ -57,6 +61,7 @@ enum ClientCommand {
 }
 
 #[derive(Args)]
+#[command(after_help = "Examples:\n  mirrorstack apps web deploy --dir ./out")]
 pub struct WebArgs {
     #[command(subcommand)]
     command: WebCommand,
@@ -72,6 +77,9 @@ enum WebCommand {
 }
 
 #[derive(Args)]
+#[command(
+    after_help = "Examples:\n  mirrorstack apps create --name Media --yes\n  mirrorstack apps create --name Media --slug media"
+)]
 struct CreateArgs {
     /// Application name (human-readable).
     #[arg(long)]

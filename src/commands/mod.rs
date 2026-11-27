@@ -137,3 +137,42 @@ impl Cli {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    /// Recurse into every subcommand, asserting that every VISIBLE leaf
+    /// (one with no further subcommands) carries an `Examples:` block in its
+    /// long `--help`. `__oauth-deliver` is hidden (an internal OS callback
+    /// relay, never run by a human or agent) and is skipped along with any
+    /// other hidden command.
+    fn check_examples(cmd: &clap::Command, path: &mut Vec<String>) {
+        if cmd.is_hide_set() {
+            return;
+        }
+        path.push(cmd.get_name().to_string());
+        let subcommands: Vec<&clap::Command> = cmd.get_subcommands().collect();
+        if subcommands.is_empty() {
+            let help = cmd.clone().render_long_help().to_string();
+            assert!(
+                help.contains("Examples:"),
+                "`{}` is missing an Examples: block in --help",
+                path.join(" ")
+            );
+        }
+        for sub in subcommands {
+            check_examples(sub, path);
+        }
+        path.pop();
+    }
+
+    #[test]
+    fn every_visible_leaf_command_has_examples() {
+        let cmd = super::Cli::command();
+        let mut path = vec![cmd.get_name().to_string()];
+        for sub in cmd.get_subcommands() {
+            check_examples(sub, &mut path);
+        }
+    }
+}
