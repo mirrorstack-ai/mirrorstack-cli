@@ -25,6 +25,9 @@ use crate::http;
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 const CODE_CLIENT_UNCONFIGURED: &str = "version_client_unsupported";
 
+/// Conventional build output every module's client project writes.
+pub(crate) const CLIENT_DIST_REL: &str = "client/dist";
+
 /// What happened to the version's client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum VersionClientOutcome {
@@ -45,7 +48,7 @@ pub(crate) enum VersionClientOutcome {
 /// silently not ship, and a consumer pinning that version would get
 /// `not_published` forever. That one is fatal and names the directory.
 pub(crate) fn locate(dir: &Path) -> Result<Option<PathBuf>> {
-    let out = dir.join("client/dist");
+    let out = dir.join(CLIENT_DIST_REL);
     if out.is_dir() {
         return Ok(Some(out));
     }
