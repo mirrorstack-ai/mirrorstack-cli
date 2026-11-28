@@ -13,11 +13,11 @@ mod module;
 pub(crate) mod release_candidate;
 mod whoami;
 
-/// Default api-platform account-service base. Account remains under its
-/// `/account` mapping while Applications is exposed on root `/v1/*` routes and
-/// Dispatch remains under `/dispatch`. Override per-invocation with
-/// `MIRRORSTACK_API_URL` (or via `.env`).
-pub(crate) const DEFAULT_API_BASE: &str = "https://api.mirrorstack.ai/account";
+/// Default api-platform account-service base: the root address. Every v1 route
+/// is reached at `https://api.mirrorstack.ai/v1/...` (the `/account` mapping
+/// still answers the same paths, but no client needs it). Override
+/// per-invocation with `MIRRORSTACK_API_URL` (or via `.env`).
+pub(crate) const DEFAULT_API_BASE: &str = "https://api.mirrorstack.ai";
 
 /// Default api-platform applications-service host. Modules and apps live
 /// on a separate Lambda from the account service, but in prod both are
@@ -29,11 +29,12 @@ pub(crate) const DEFAULT_APPS_API_BASE: &str = "https://api.mirrorstack.ai";
 /// Default web-account host. Override with `MIRRORSTACK_WEB_URL`.
 pub(crate) const DEFAULT_WEB_BASE: &str = "https://account.mirrorstack.ai";
 
-/// Default api-platform dispatch-service host. The dispatch Lambda is
-/// reached under the same `api.mirrorstack.ai` hostname in prod via
-/// path-routed ingress. Local dev uses port 8083 — set via `.env`.
-/// Override with `MIRRORSTACK_DISPATCH_URL`.
-pub(crate) const DEFAULT_DISPATCH_BASE: &str = "https://api.mirrorstack.ai/dispatch";
+/// Default api-platform dispatch-service host: the root address. Callers
+/// append the `/v1/dispatch/...` twin routes (`api::tunnel_token`,
+/// `api::list_app_module_status`), which the root path-routes to the dispatch
+/// Lambda. Local dev uses port 8083 — set via `.env`. Override with
+/// `MIRRORSTACK_DISPATCH_URL`.
+pub(crate) const DEFAULT_DISPATCH_BASE: &str = "https://api.mirrorstack.ai";
 
 /// Default GitHub Actions OIDC audience. Override with
 /// `MIRRORSTACK_OIDC_AUDIENCE`.
@@ -134,6 +135,25 @@ impl Cli {
             Command::Module(args) => module::run(args),
             Command::Dev(args) => dev::run(args),
             Command::Preview(args) => dev::preview::run(args),
+        }
+    }
+}
+
+#[cfg(test)]
+mod default_base_tests {
+    use super::*;
+
+    /// Every default API base is the bare root address: callers append their
+    /// own unchanged `/v1/...` path, so a path-bearing base (`/account`,
+    /// `/dispatch`) would silently double a mount prefix.
+    #[test]
+    fn default_bases_are_the_root_address() {
+        for base in [
+            DEFAULT_API_BASE,
+            DEFAULT_APPS_API_BASE,
+            DEFAULT_DISPATCH_BASE,
+        ] {
+            assert_eq!(base, "https://api.mirrorstack.ai");
         }
     }
 }
