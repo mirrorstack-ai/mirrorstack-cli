@@ -7,6 +7,7 @@ use console::{StyledObject, style};
 
 mod app;
 mod dev;
+mod doctor;
 mod login;
 mod logout;
 mod module;
@@ -107,6 +108,10 @@ enum Command {
     Logout(logout::LogoutArgs),
     /// Print the currently signed-in user.
     Whoami(whoami::WhoamiArgs),
+    /// Check this machine for the missing tools, sign-in, or version
+    /// problems that otherwise surface as late errors inside `dev` or
+    /// `module deploy`.
+    Doctor(doctor::DoctorArgs),
     /// Manage applications on the platform.
     #[command(visible_alias = "app")]
     Apps(app::AppArgs),
@@ -131,6 +136,7 @@ impl Cli {
             Command::OauthDeliver { url } => crate::scheme::deliver(&url),
             Command::Logout(args) => logout::run(args),
             Command::Whoami(args) => whoami::run(args),
+            Command::Doctor(args) => doctor::run(args),
             Command::Apps(args) => app::run(args),
             Command::Module(args) => module::run(args),
             Command::Dev(args) => dev::run(args),
